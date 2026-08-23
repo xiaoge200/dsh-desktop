@@ -26,6 +26,31 @@ fn show_main_window(app: &AppHandle) {
     }
 }
 
+/// 更新托盘 tooltip（FR-07：服务运行/降级状态提示）
+fn update_tray_tooltip(app: &AppHandle) {
+    let state = app.state::<AppState>();
+    let phase = state.phase();
+    let port = state.port();
+    let degraded = state.supervisor.lock().unwrap().is_degraded();
+    let zh = is_zh_locale();
+    let tooltip: String = if phase == BootPhase::Ready {
+        if degraded {
+            if zh { "DSH 工作台：服务多次启动失败".into() } else { "DSH Workspace: service failed repeatedly".into() }
+        } else if port > 0 {
+            if zh { format!("DSH 工作台：运行中（端口 {port}）") } else { format!("DSH Workspace: running (port {port})") }
+        } else {
+            if zh { "DSH 工作台：正在启动…".into() } else { "DSH Workspace: starting…".into() }
+        }
+    } else if phase == BootPhase::Error {
+        if zh { "DSH 工作台：遇到问题，请重试".into() } else { "DSH Workspace: something went wrong".into() }
+    } else {
+        if zh { "DSH 工作台：正在启动…".into() } else { "DSH Workspace: starting…".into() }
+    };
+    if let Some(tray) = app.tray_by_id("main-tray") {
+        let _ = tray.set_tooltip(Some(&tooltip));
+    }
+}
+
 /// 显示设置窗口（隐藏后再次打开仍有效——窗口关闭时是隐藏而非销毁）
 fn show_settings_window(app: &AppHandle) {
     if let Some(w) = app.get_webview_window("settings") {
@@ -127,6 +152,7 @@ fn fail(app: &AppHandle, state: &AppState, message: impl Into<String>, detail: &
     state.set_error(message.into());
     let msg = state.error().unwrap_or_default();
     emit_progress(app, BootPhase::Error, &msg);
+    update_tray_tooltip(app);
     log::error!("boot failed: {detail}");
 }
 
@@ -266,6 +292,7 @@ fn boot(app: AppHandle) {
     state.clear_error();
     let port = state.port();
     log::info!("READY http://127.0.0.1:{port}");
+    update_tray_tooltip(&app);
     let _ = app.emit(
         "boot://ready",
         serde_json::json!({ "url": format!("http://127.0.0.1:{port}") }),
