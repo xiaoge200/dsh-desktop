@@ -48,6 +48,32 @@ fn open_settings(app: AppHandle) {
     show_settings_window(&app);
 }
 
+/// 主界面右键菜单（由注入到 DSH 页面的 contextmenu 监听调用）
+#[tauri::command]
+fn open_context_menu(app: AppHandle) -> Result<(), String> {
+    use tauri::menu::{ContextMenu, Menu as CtxMenu, MenuItem as CtxMenuItem};
+
+    let zh = is_zh_locale();
+    let (s_settings, s_restart, s_quit) = if zh {
+        ("设置", "重启服务", "退出")
+    } else {
+        ("Settings", "Restart service", "Quit")
+    };
+    let settings_i = CtxMenuItem::with_id(&app, "ctx-settings", s_settings, true, None::<&str>)
+        .map_err(|e| e.to_string())?;
+    let restart_i = CtxMenuItem::with_id(&app, "ctx-restart", s_restart, true, None::<&str>)
+        .map_err(|e| e.to_string())?;
+    let quit_i = CtxMenuItem::with_id(&app, "ctx-quit", s_quit, true, None::<&str>)
+        .map_err(|e| e.to_string())?;
+    let menu = CtxMenu::with_items(&app, &[&settings_i, &restart_i, &quit_i])
+        .map_err(|e| e.to_string())?;
+
+    if let Some(w) = app.get_webview_window("main") {
+        menu.popup(w.as_ref().window()).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
 /// 把阶段映射为白话文案（前端也有映射，这里用于日志）
 fn phase_text(p: BootPhase) -> &'static str {
     match p {
@@ -594,14 +620,9 @@ pub fn run() {
                 })
                 .build(app)?;
 
-            // 窗口菜单栏（标题栏下方原生菜单）：设置 / 重启服务 / 退出
-            // （主界面设置入口，NFR-10 按系统语言显示）
-            use tauri::menu::{Menu as WinMenu, MenuItem as WinMenuItem};
-            let win_settings = WinMenuItem::with_id(app, "menu-settings", s_settings, true, None::<&str>)?;
-            let win_restart = WinMenuItem::with_id(app, "menu-restart", s_restart, true, None::<&str>)?;
-            let win_quit = WinMenuItem::with_id(app, "menu-quit", s_quit, true, None::<&str>)?;
-            let win_menu = WinMenu::with_items(app, &[&win_settings, &win_restart, &win_quit])?;
-            let _ = app.set_menu(win_menu);
+            // 右键菜单（主界面设置入口）：DSH 页面上右键弹出原生菜单
+            // 设置 / 重启服务 / 退出——菜单在 open_context_menu 时按需构建
+            // （无常驻菜单栏，符合"右击"入口）
 
             // 启动 boot（后台线程）
             let app_handle = app.handle().clone();
@@ -611,10 +632,10 @@ pub fn run() {
             Ok(())
         })
         .on_menu_event(|app, event| match event.id.as_ref() {
-            "menu-settings" => {
+            "ctx-settings" => {
                 show_settings_window(app);
             }
-            "menu-restart" => {
+            "ctx-restart" => {
                 let handle = app.clone();
                 std::thread::spawn(move || {
                     let state = handle.state::<AppState>();
@@ -633,13 +654,13 @@ pub fn run() {
                     match sup.restart(&state.node_path(), &dsh_bin, &state.workspace_dir(), 3080, &extra) {
                         Ok(port) => {
                             state.set_port(port);
-                            log::info!("menu restart -> 127.0.0.1:{port}");
+                            log::info!("ctx restart -> 127.0.0.1:{port}");
                         }
-                        Err(e) => log::error!("menu restart failed: {e}"),
+                        Err(e) => log::error!("ctx restart failed: {e}"),
                     }
                 });
             }
-            "menu-quit" => {
+            "ctx-quit" => {
                 let handle = app.clone();
                 std::thread::spawn(move || {
                     let state = handle.state::<AppState>();
@@ -649,6 +670,29 @@ pub fn run() {
                 });
             }
             _ => {}
+        })
+        .on_page_load(|webview, payload| {
+            // 主界面右键入口：DSH 页面加载完成后挂接 contextmenu 监听，
+            // 右键弹出原生菜单（设置/重启服务/退出）——无任何常驻 UI
+            if let tauri::webview::PageLoadEvent::Finished = payload.event() {
+                if payload.url().scheme() == "http" && webview.label() == "main" {
+                    let script = r#"
+(function () {
+  if (window.__dshCtxInstalled) return;
+  window.__dshCtxInstalled = true;
+  document.addEventListener('contextmenu', function (e) {
+    e.preventDefault();
+    try {
+      if (window.__TAURI__ && window.__TAURI__.core) {
+        window.__TAURI__.core.invoke('open_context_menu');
+      }
+    } catch (err) { console.error('context menu failed', err); }
+  }, true);
+})();
+"#;
+                    let _ = webview.eval(script);
+                }
+            }
         })
         .on_window_event(|window, event| {
             // 关闭窗口 → 隐藏（不销毁、不退出），以便再次从托盘/菜单打开
@@ -676,7 +720,8 @@ pub fn run() {
             open_workspace_dir,
             get_config,
             set_config,
-            open_settings
+            open_settings,
+            open_context_menu
         ])
         .run(tauri::generate_context!())
         .expect("error while running dsh-desktop");
