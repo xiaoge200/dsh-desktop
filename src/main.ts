@@ -1,6 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { BOOT_STRINGS, detectLang, tr } from "./i18n";
 
 interface BootProgress {
   phase: string;
@@ -34,51 +35,56 @@ const els = {
   welcomeBtn: document.querySelector("#welcome-btn") as HTMLButtonElement,
 };
 
+// 语言（NFR-10）：中文环境显示中文，其余英文
+const lang = detectLang();
+const dict = BOOT_STRINGS[lang];
+const T = (k: string) => tr(dict, k);
+
 // 阶段 → 白话标题 + 进度百分比
 const PHASE_TEXT: Record<string, { title: string; message: string; pct: number }> = {
   "node-check": {
-    title: "正在准备程序…",
-    message: "检查运行环境，很快就好。",
+    title: T("正在准备程序…"),
+    message: T("检查运行环境，很快就好。"),
     pct: 15,
   },
   "dsh-install": {
-    title: "正在准备首次使用…",
-    message: "下载所需组件，请稍候。第一次会慢一点，之后打开就快了。",
+    title: T("正在准备首次使用…"),
+    message: T("下载所需组件，请稍候。第一次会慢一点，之后打开就快了。"),
     pct: 45,
   },
   "service-start": {
-    title: "正在启动…",
-    message: "启动本地服务，马上就好。",
+    title: T("正在启动…"),
+    message: T("启动本地服务，马上就好。"),
     pct: 75,
   },
   ready: {
-    title: "准备完成",
-    message: "即将打开工作台。",
+    title: T("准备完成"),
+    message: T("即将打开工作台。"),
     pct: 100,
   },
   error: {
-    title: "遇到了一点问题",
+    title: T("遇到了一点问题"),
     message: "",
     pct: 0,
   },
 };
 
 function showError(message: string, detail?: string) {
-  els.title.textContent = "遇到了一点问题";
+  els.title.textContent = T("遇到了一点问题");
   els.errorBox.classList.remove("hidden");
   els.progressTrack.classList.add("hidden");
   els.errorMessage.textContent = message;
   if (detail) {
     els.techDetail.textContent = detail;
   } else {
-    els.techDetail.textContent = "（无技术详情）";
+    els.techDetail.textContent = T("（无技术详情）");
   }
 }
 
 function setPhase(phase: string, message?: string) {
   const t = PHASE_TEXT[phase] ?? {
-    title: "正在启动…",
-    message: message ?? "请稍候。",
+    title: T("正在启动…"),
+    message: message ?? T("请稍候。"),
     pct: 10,
   };
   els.title.textContent = t.title;
@@ -98,10 +104,17 @@ let pendingUrl: string | null = null;
 
 function showWelcome(url: string) {
   pendingUrl = url;
-  els.title.textContent = "准备完成";
+  els.title.textContent = T("准备完成");
   els.message.classList.add("hidden");
   els.progressTrack.classList.add("hidden");
   els.welcomeBox.classList.remove("hidden");
+  // 引导文案（FR-16 + NFR-10）
+  const welcomeHeading = els.welcomeBox.querySelector("h2");
+  const welcomeText = els.welcomeBox.querySelector(".welcome-text");
+  const welcomeBtnText = els.welcomeBtn;
+  if (welcomeHeading) welcomeHeading.textContent = T("欢迎使用 DSH 工作台");
+  if (welcomeText) welcomeText.textContent = T("这就是你的 AI 工作台，直接开始对话即可。\n所有内容都保存在这台电脑上，随时可用。");
+  welcomeBtnText.textContent = T("开始使用");
 }
 
 function bindActions() {

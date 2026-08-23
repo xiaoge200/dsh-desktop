@@ -28,6 +28,27 @@ fn phase_text(p: BootPhase) -> &'static str {
     }
 }
 
+/// 系统语言是否为中文（NFR-10：托盘菜单等原生 UI 文案）
+fn is_zh_locale() -> bool {
+    std::env::var("LANG")
+        .or_else(|_| std::env::var("LC_ALL"))
+        .map(|v| v.to_lowercase().starts_with("zh"))
+        .unwrap_or_else(|_| {
+            // Windows 上无 LANG；读注册表区域设置（尽力而为）
+            #[cfg(windows)]
+            {
+                use winapi::um::winnls::GetUserDefaultUILanguage;
+                let lang = unsafe { GetUserDefaultUILanguage() };
+                // 0x0804 = 简体中文，0x0404 = 繁体中文（台湾），0x0C04 = 繁体中文（香港）
+                lang == 0x0804 || lang == 0x0404 || lang == 0x0C04
+            }
+            #[cfg(not(windows))]
+            {
+                false
+            }
+        })
+}
+
 fn emit_progress(app: &AppHandle, phase: BootPhase, message: &str) {
     let _ = app.emit(
         "boot://progress",
@@ -474,13 +495,19 @@ pub fn run() {
                 }
             }
 
-            // 托盘
+            // 托盘（NFR-10：按系统语言显示菜单文案）
             use tauri::menu::{Menu, MenuItem};
             use tauri::tray::TrayIconBuilder;
-            let show_i = MenuItem::with_id(app, "show", "打开界面", true, None::<&str>)?;
-            let settings_i = MenuItem::with_id(app, "settings", "设置", true, None::<&str>)?;
-            let restart_i = MenuItem::with_id(app, "restart", "重启服务", true, None::<&str>)?;
-            let quit_i = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
+            let zh = is_zh_locale();
+            let (s_show, s_settings, s_restart, s_quit) = if zh {
+                ("打开界面", "设置", "重启服务", "退出")
+            } else {
+                ("Open", "Settings", "Restart service", "Quit")
+            };
+            let show_i = MenuItem::with_id(app, "show", s_show, true, None::<&str>)?;
+            let settings_i = MenuItem::with_id(app, "settings", s_settings, true, None::<&str>)?;
+            let restart_i = MenuItem::with_id(app, "restart", s_restart, true, None::<&str>)?;
+            let quit_i = MenuItem::with_id(app, "quit", s_quit, true, None::<&str>)?;
             let menu = Menu::with_items(app, &[&show_i, &settings_i, &restart_i, &quit_i])?;
             let _tray = TrayIconBuilder::with_id("main-tray")
                 .icon(app.default_window_icon().unwrap().clone())

@@ -26,7 +26,7 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 open = "5"
 
 [target.'cfg(windows)'.dependencies]
-winapi = { version = "0.3", features = ["processthreadsapi", "wincon", "handleapi", "synchapi"] }
+winapi = { version = "0.3", features = ["processthreadsapi", "wincon", "handleapi", "synchapi", "winnls"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
