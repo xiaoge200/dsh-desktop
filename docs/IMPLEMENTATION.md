@@ -9,6 +9,7 @@
 |---|---|---|
 | M0 可行性验证 | ✅ | 内置 Node 24 + dsh 基线可启动 `dsh web`，HTTP 200 |
 | M1 Windows MVP | ✅ | Tauri v2 壳、基线准备、服务托管、WebView 内嵌、托盘、单实例、日志、白话错误 UI |
+| M1+ 打磨 | ✅ | 设置窗口（开机自启/服务状态/版本信息/目录入口）、托盘「重启服务」、CHANGELOG |
 | M2 更新与分发 | 🚧 | DSH 自动更新 ✅；Tauri updater 代码+密钥+签名链路 ✅；更新服务器端点待配置（发布时） |
 | M3 跨平台 | 🚧 | CI 三平台矩阵已配置（.github/workflows/build-release.yml）；macOS/Linux 真机验证待 CI 首跑 |
 | M4 打磨发布 | ⏳ | 待内测 |
@@ -53,6 +54,14 @@
 ### 6. 日志中文显示乱码（控制台）
 - 日志文件为 UTF-8；PowerShell `Get-Content` 默认按 GBK 解码导致显示乱码。
 - 不影响功能；排查时用 `Get-Content -Encoding UTF8` 或 VSCode 打开。
+
+### 7. updater 插件配置字段
+- 现象：`plugins.updater.windows.installMode: "currentUser"` 导致启动 panic
+  （"unknown variant `currentUser`, expected basicUi/quiet/passive"）。
+- 原因：NSIS 的 `installMode` 是 `bundle.windows.nsis` 的字段；updater 插件的
+  `windows.installMode` 是**安装 UI 模式**，不是 per-user 开关。
+- 解决：per-user 安装只配置 `bundle.windows.nsis.installMode: "currentUser"`，
+  updater 插件不设 windows 段。
 
 ## 运行环境事实
 
