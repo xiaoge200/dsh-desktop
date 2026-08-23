@@ -138,7 +138,8 @@ fn boot(app: AppHandle) {
     let preferred_port = if cfg_port > 0 { cfg_port } else { 3080u16 };
     let port = {
         let mut sup = state.supervisor.lock().unwrap();
-        match sup.start(&state.node_path(), &dsh_bin, &state.workspace_dir(), preferred_port) {
+        let extra = state.dsh_extra_args.lock().unwrap().clone();
+        match sup.start(&state.node_path(), &dsh_bin, &state.workspace_dir(), preferred_port, &extra) {
             Ok(p) => p,
             Err(e) => {
                 drop(sup);
@@ -156,7 +157,8 @@ fn boot(app: AppHandle) {
         // 尝试重启一次（可能是端口竞态等瞬时问题）
         log::warn!("service not healthy after 30s; restarting once");
         let mut sup = state.supervisor.lock().unwrap();
-        match sup.restart(&state.node_path(), &dsh_bin, &state.workspace_dir(), preferred_port) {
+        let extra = state.dsh_extra_args.lock().unwrap().clone();
+        match sup.restart(&state.node_path(), &dsh_bin, &state.workspace_dir(), preferred_port, &extra) {
             Ok(p) => {
                 state.set_port(p);
                 drop(sup);
@@ -251,7 +253,8 @@ fn restart_service(app: AppHandle, state: State<'_, AppState>) -> Result<(), Str
         .join("lib")
         .join("bin.js");
     let mut sup = state.supervisor.lock().unwrap();
-    match sup.restart(&state.node_path(), &dsh_bin, &state.workspace_dir(), 3080) {
+    let extra = state.dsh_extra_args.lock().unwrap().clone();
+    match sup.restart(&state.node_path(), &dsh_bin, &state.workspace_dir(), 3080, &extra) {
         Ok(port) => {
             state.set_port(port);
             if sup.wait_ready(Duration::from_secs(30)) {
@@ -429,6 +432,7 @@ pub fn run() {
             error_message: std::sync::Mutex::new(None),
             supervisor: std::sync::Mutex::new(Supervisor::new()),
             config: std::sync::Mutex::new(config::ConfigStore::new(std::path::Path::new(""))),
+            dsh_extra_args: std::sync::Mutex::new(Vec::new()),
         })
         .setup(move |app| {
             // 配置存储（appData/config.json）
@@ -446,6 +450,28 @@ pub fn run() {
                 let state = app.state::<AppState>();
                 state.set_log_file(log_path);
                 log::info!("dsh-desktop starting; platform={}", std::env::consts::OS);
+
+                // 高级入口（FR-15）：解析 `--dsh-args "<参数>"` 透传给 dsh
+                // 支持两种形式：`--dsh-args --patch a.yml` 或 `--dsh-args="--patch a.yml"`
+                let mut extra: Vec<String> = Vec::new();
+                let mut iter = std::env::args().skip(1);
+                while let Some(a) = iter.next() {
+                    if let Some(v) = a.strip_prefix("--dsh-args=") {
+                        for part in v.split_whitespace() {
+                            extra.push(part.to_string());
+                        }
+                    } else if a == "--dsh-args" {
+                        if let Some(v) = iter.next() {
+                            for part in v.split_whitespace() {
+                                extra.push(part.to_string());
+                            }
+                        }
+                    }
+                }
+                if !extra.is_empty() {
+                    *state.dsh_extra_args.lock().unwrap() = extra.clone();
+                    log::info!("dsh extra args: {:?}", extra);
+                }
             }
 
             // 托盘
@@ -490,7 +516,8 @@ pub fn run() {
                                 .join("lib")
                                 .join("bin.js");
                             let mut sup = state.supervisor.lock().unwrap();
-                            match sup.restart(&state.node_path(), &dsh_bin, &state.workspace_dir(), 3080) {
+                            let extra = state.dsh_extra_args.lock().unwrap().clone();
+                            match sup.restart(&state.node_path(), &dsh_bin, &state.workspace_dir(), 3080, &extra) {
                                 Ok(port) => {
                                     state.set_port(port);
                                     log::info!("tray restart -> 127.0.0.1:{port}");

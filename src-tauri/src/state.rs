@@ -43,6 +43,8 @@ pub struct AppState {
     pub supervisor: Mutex<Supervisor>,
     /// 用户配置（设置页）
     pub config: Mutex<ConfigStore>,
+    /// 高级用户透传的 dsh CLI 参数（FR-15，`--dsh-args` 启动参数）
+    pub dsh_extra_args: Mutex<Vec<String>>,
 }
 
 impl AppState {

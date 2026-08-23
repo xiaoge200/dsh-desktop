@@ -92,14 +92,15 @@ impl Supervisor {
         }
     }
 
-    /// 启动服务：node <dsh>/lib/bin.js web --no-open --port <port>
-    /// 返回实际使用的端口（0 表示启动失败）。
+    /// 启动服务：node <dsh>/lib/bin.js web --no-open --port <port> [extra_args...]
+    /// 返回实际使用的端口（0 表示启动失败）。extra_args 为高级用户透传的 dsh 参数（FR-15）。
     pub fn start(
         &mut self,
         node: &Path,
         dsh_bin: &Path,
         workspace: &Path,
         preferred_port: u16,
+        extra_args: &[String],
     ) -> Result<u16, String> {
         self.stop();
 
@@ -136,6 +137,9 @@ impl Supervisor {
             .arg("--port")
             .arg(port.to_string())
             .current_dir(normalize_for_node(workspace));
+        for a in extra_args {
+            cmd.arg(a);
+        }
         if let Some(f) = stdout_file {
             cmd.stdout(f);
         } else {
@@ -241,13 +245,13 @@ impl Supervisor {
     }
 
     /// 重启服务：先记录崩溃，若未超限则重启。
-    pub fn restart(&mut self, node: &Path, dsh_bin: &Path, workspace: &Path, preferred_port: u16) -> Result<u16, String> {
+    pub fn restart(&mut self, node: &Path, dsh_bin: &Path, workspace: &Path, preferred_port: u16, extra_args: &[String]) -> Result<u16, String> {
         if !self.allow_restart() {
             log::warn!("service exceeded restart limit; degraded mode");
             return Err("服务多次启动失败".into());
         }
         log::warn!("restarting service");
-        self.start(node, dsh_bin, workspace, preferred_port)
+        self.start(node, dsh_bin, workspace, preferred_port, extra_args)
     }
 
     /// 停止服务并清理进程树。
