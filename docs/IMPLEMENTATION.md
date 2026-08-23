@@ -63,6 +63,18 @@
 - 解决：per-user 安装只配置 `bundle.windows.nsis.installMode: "currentUser"`，
   updater 插件不设 windows 段。
 
+### 8. pipe 未读取导致 dsh 进程卡死（重要）
+- 现象：supervisor 用 `Stdio::piped()` 接管 dsh 输出但从不读取；dsh 持续输出
+  日志（HMR、工具调用），管道缓冲（~64KB）填满后 dsh 的 write 永久阻塞 → 服务卡死。
+- 解决：改为直接重定向到 `appData/logs/service.log`（每次启动截断），
+  同时落实 FR-09（服务日志落盘）。实测 service.log 内容正确。
+- 教训：spawn 子进程后不读取输出，必须重定向到文件或启动读取线程。
+
+### 9. 进程退出清理
+- 托盘「退出」先 `supervisor.stop()`（杀进程树）再 `app.exit(0)`，避免残留。
+- 强杀（任务管理器/Stop-Process -Force）无法触发 Rust Drop，残留属操作系统边界；
+  下次启动端口自动更换兜底。
+
 ## 运行环境事实
 
 - 内置 Node：24.9.0（含 npm 11.6.0），resources/node/win-x64，约 98MB。
