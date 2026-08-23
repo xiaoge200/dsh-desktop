@@ -43,6 +43,8 @@ pub struct Supervisor {
     restarts: Mutex<Vec<Instant>>,
     /// 是否已进入降级态（超过重启上限）
     degraded: Mutex<bool>,
+    /// 服务日志目录（stdout/stderr 落盘，FR-09）
+    log_dir: Mutex<Option<PathBuf>>,
 }
 
 const MAX_RESTARTS: usize = 3;
@@ -56,7 +58,13 @@ impl Supervisor {
             port: AtomicU32::new(0),
             restarts: Mutex::new(Vec::new()),
             degraded: Mutex::new(false),
+            log_dir: Mutex::new(None),
         }
+    }
+
+    /// 设置服务日志目录（启动前调用；stdout/stderr 会落盘到 <dir>/service.log）
+    pub fn set_log_dir(&self, dir: PathBuf) {
+        *self.log_dir.lock().unwrap() = Some(dir);
     }
 
     pub fn port(&self) -> u16 {
@@ -100,15 +108,44 @@ impl Supervisor {
             return Err("无法确定可用端口".into());
         }
 
+        // stdout/stderr 落盘（FR-09）：不 pipe——pipe 且不读取会导致缓冲填满后
+        // dsh 的 write 永久阻塞（服务卡死）。直接重定向到 service.log（每次启动截断）。
+        let mut stdout_file: Option<std::fs::File> = None;
+        let mut stderr_file: Option<std::fs::File> = None;
+        if let Some(dir) = self.log_dir.lock().unwrap().clone() {
+            if let Err(e) = std::fs::create_dir_all(&dir) {
+                log::warn!("create service log dir: {e}");
+            }
+            let log_path = dir.join("service.log");
+            let open = || std::fs::OpenOptions::new().create(true).truncate(true).write(true).open(&log_path);
+            match open() {
+                Ok(f) => {
+                    let _ = f.set_len(0);
+                    stdout_file = Some(f);
+                    // stderr 复用同一文件：单独再开一个句柄（同为截断写）
+                    stderr_file = open().ok();
+                }
+                Err(e) => log::warn!("open service log: {e}"),
+            }
+        }
+
         let mut cmd = Command::new(normalize_for_node(node));
         cmd.arg(normalize_for_node(dsh_bin))
             .arg("web")
             .arg("--no-open")
             .arg("--port")
             .arg(port.to_string())
-            .current_dir(normalize_for_node(workspace))
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+            .current_dir(normalize_for_node(workspace));
+        if let Some(f) = stdout_file {
+            cmd.stdout(f);
+        } else {
+            cmd.stdout(Stdio::null());
+        }
+        if let Some(f) = stderr_file {
+            cmd.stderr(f);
+        } else {
+            cmd.stderr(Stdio::null());
+        }
 
         // 进程组：便于退出时清理整棵进程树
         #[cfg(unix)]

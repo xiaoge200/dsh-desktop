@@ -90,6 +90,9 @@ fn boot(app: AppHandle) {
     state.set_runtime_dir(runtime_dir.clone());
     state.set_workspace_dir(workspace_dir);
 
+    // 服务日志目录（FR-09：dsh stdout/stderr 落盘）
+    state.supervisor.lock().unwrap().set_log_dir(app_data.join("logs"));
+
     let installer_js = resource_dir.join("installer").join("install-dsh.mjs");
     let baseline_dir = resource_dir.join("dsh-baseline");
     let install_out = match node::run_prepare(&state.node_path(), &installer_js, &runtime_dir, &baseline_dir) {
