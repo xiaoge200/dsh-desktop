@@ -275,14 +275,16 @@ fn boot(app: AppHandle) {
     let bg_node = state.node_path();
     let bg_installer = installer_js;
     let bg_runtime = runtime_dir;
-    let auto_update = state.config.lock().unwrap().get().auto_update_dsh;
+    let cfg = state.config.lock().unwrap().get();
+    let auto_update = cfg.auto_update_dsh;
+    let registry_source = cfg.registry_source;
     std::thread::spawn(move || {
         if !auto_update {
             log::info!("bg update: auto-update disabled by user");
             return;
         }
         // 先检查是否有新版本
-        let check = match node::run_check(&bg_node, &bg_installer, &bg_runtime) {
+        let check = match node::run_check(&bg_node, &bg_installer, &bg_runtime, &registry_source) {
             Ok(o) => o,
             Err(e) => {
                 log::warn!("bg update check failed: {e}");
@@ -302,7 +304,7 @@ fn boot(app: AppHandle) {
         }
         // 有新版：后台自动安装（提示式改自动：仅失败时才提示）
         log::info!("bg update: new version available, installing");
-        match node::run_update(&bg_node, &bg_installer, &bg_runtime) {
+        match node::run_update(&bg_node, &bg_installer, &bg_runtime, &registry_source) {
             Ok(o) => log::info!("bg update result: {}", o.lines().last().unwrap_or("?")),
             Err(e) => log::warn!("bg update failed: {e}"),
         }

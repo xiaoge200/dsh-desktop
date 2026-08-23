@@ -326,8 +326,8 @@ async function main() {
     case "check": {
       // 后台：仅查询最新版本
       const registries = [
-        { label: "npmjs", url: opts.registry || DEFAULT_REGISTRY },
-        { label: "npmmirror", url: opts.mirror || DEFAULT_MIRROR },
+        { label: opts.registry ? "custom" : "npmjs", url: opts.registry || DEFAULT_REGISTRY },
+        { label: opts.mirror ? "custom" : "npmmirror", url: opts.mirror || DEFAULT_MIRROR },
       ];
       let latest = null, latestSource = null;
       for (const r of registries) {
@@ -351,8 +351,8 @@ async function main() {
     case "update": {
       // 后台：安装/更新到最新版；带回滚（R7/R10：失败保留旧版本可用）
       const registries = [
-        { label: "npmjs", url: opts.registry || DEFAULT_REGISTRY },
-        { label: "npmmirror", url: opts.mirror || DEFAULT_MIRROR },
+        { label: opts.registry ? "custom" : "npmjs", url: opts.registry || DEFAULT_REGISTRY },
+        { label: opts.mirror ? "custom" : "npmmirror", url: opts.mirror || DEFAULT_MIRROR },
       ];
       let latest = null, latestSource = null;
       for (const r of registries) {

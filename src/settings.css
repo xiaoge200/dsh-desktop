@@ -149,6 +149,35 @@ h1 {
   cursor: default;
 }
 
+/* 高级区（FR-14） */
+.advanced summary {
+  cursor: pointer;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--muted);
+  margin-bottom: 4px;
+  user-select: none;
+}
+
+.num-input {
+  width: 110px;
+  padding: 7px 10px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--card);
+  color: var(--text);
+  font-size: 13px;
+}
+
+.select {
+  padding: 7px 10px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--card);
+  color: var(--text);
+  font-size: 13px;
+}
+
 /* 开关 */
 .switch {
   position: relative;

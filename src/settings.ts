@@ -29,6 +29,7 @@ interface AppConfig {
   auto_update_dsh: boolean;
   auto_update_app: boolean;
   port: number;
+  registry_source: string;
 }
 
 const $ = <T extends HTMLElement = HTMLElement>(id: string) => document.querySelector(id) as T;
@@ -45,6 +46,10 @@ const els = {
   logPath: $("#log-path"),
   openWorkspaceBtn: $("#open-workspace-btn") as HTMLButtonElement,
   openLogBtn: $("#open-log-btn") as HTMLButtonElement,
+  portInput: $("#port-input") as HTMLInputElement,
+  registrySelect: $("#registry-select") as HTMLSelectElement,
+  advancedSaveBtn: $("#advanced-save-btn") as HTMLButtonElement,
+  advancedSaveState: $("#advanced-save-state"),
 };
 
 let configCache: AppConfig | null = null;
@@ -70,6 +75,9 @@ async function loadSettings() {
     // 自动更新开关
     configCache = await invoke<AppConfig>("get_config");
     els.autoUpdate.checked = configCache.auto_update_dsh;
+    // 高级区：端口 + 更新源
+    els.portInput.value = configCache.port > 0 ? String(configCache.port) : "0";
+    els.registrySelect.value = configCache.registry_source || "auto";
   } catch (e) {
     setRowText(els.serviceState, T("读取失败"));
     console.error("load settings failed", e);
@@ -84,6 +92,32 @@ function bind() {
       console.error("autostart toggle failed", e);
       els.autostart.checked = !els.autostart.checked;
       alert(lang === "zh" ? "切换开机启动失败，请稍后再试。" : "Failed to change startup setting. Please try again.");
+    }
+  });
+
+  // 高级区保存（端口 + 更新源）
+  els.advancedSaveBtn.addEventListener("click", async () => {
+    if (!configCache) return;
+    const raw = els.portInput.value.trim();
+    let port = Number(raw);
+    if (raw === "" || Number.isNaN(port) || port < 0 || port > 65535) {
+      alert(lang === "zh" ? "端口需为 0–65535 的数字。" : "Port must be a number between 0 and 65535.");
+      return;
+    }
+    port = Math.trunc(port);
+    const next = {
+      ...configCache,
+      port,
+      registry_source: els.registrySelect.value,
+    };
+    try {
+      await invoke("set_config", { config: next });
+      configCache = next;
+      setRowText(els.advancedSaveState, lang === "zh" ? "已保存（重启后生效）" : "Saved (applies after restart)");
+      setTimeout(() => setRowText(els.advancedSaveState, ""), 3000);
+    } catch (e) {
+      console.error("advanced save failed", e);
+      alert(lang === "zh" ? "保存失败，请稍后再试。" : "Failed to save. Please try again.");
     }
   });
 

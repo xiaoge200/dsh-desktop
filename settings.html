@@ -54,6 +54,34 @@
       </section>
 
       <section class="card">
+        <details class="advanced">
+          <summary data-i18n="高级">高级</summary>
+          <div class="row">
+            <div class="row-text">
+              <span class="label" data-i18n="本地端口">本地端口</span>
+              <span class="hint" data-i18n="端口提示">端口被占用时会自动更换；0 表示自动</span>
+            </div>
+            <input type="number" id="port-input" class="num-input" min="0" max="65535" placeholder="3080" />
+          </div>
+          <div class="row">
+            <div class="row-text">
+              <span class="label" data-i18n="更新源">更新源</span>
+              <span class="hint" data-i18n="更新源提示">国内网络建议选择国内镜像</span>
+            </div>
+            <select id="registry-select" class="select">
+              <option value="auto" data-i18n="自动">自动</option>
+              <option value="npmjs" data-i18n="官方源">官方源</option>
+              <option value="npmmirror" data-i18n="国内镜像">国内镜像</option>
+            </select>
+          </div>
+          <div class="row actions">
+            <button class="btn" id="advanced-save-btn" data-i18n="保存">保存</button>
+            <span class="hint" id="advanced-save-state"></span>
+          </div>
+        </details>
+      </section>
+
+      <section class="card">
         <h2 data-i18n="关于">关于</h2>
         <div class="about-row"><span class="label" data-i18n="应用版本">应用版本</span><span id="app-version">-</span></div>
         <div class="about-row"><span class="label" data-i18n="DSH 版本">DSH 版本</span><span id="dsh-version">-</span></div>

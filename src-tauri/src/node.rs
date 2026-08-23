@@ -90,21 +90,47 @@ pub fn run_prepare(
 }
 
 /// 用内置 Node 运行 install-dsh.mjs 的 check 模式（后台：仅查询最新版）
-pub fn run_check(node: &Path, installer_js: &Path, target: &Path) -> Result<String, String> {
-    run_installer(node, installer_js, &[
+/// `source` 可选："npmjs" / "npmmirror" / 其他（自动）
+pub fn run_check(node: &Path, installer_js: &Path, target: &Path, source: &str) -> Result<String, String> {
+    let mut args = vec![
         "check".to_string(),
         "--target".to_string(),
         normalize_for_node(target).to_string_lossy().to_string(),
-    ])
+    ];
+    args.extend(registry_args(source));
+    run_installer(node, installer_js, &args)
 }
 
 /// 用内置 Node 运行 install-dsh.mjs 的 update 模式（后台：安装/更新到最新版）
-pub fn run_update(node: &Path, installer_js: &Path, target: &Path) -> Result<String, String> {
-    run_installer(node, installer_js, &[
+/// `source` 可选："npmjs" / "npmmirror" / 其他（自动）
+pub fn run_update(node: &Path, installer_js: &Path, target: &Path, source: &str) -> Result<String, String> {
+    let mut args = vec![
         "update".to_string(),
         "--target".to_string(),
         normalize_for_node(target).to_string_lossy().to_string(),
-    ])
+    ];
+    args.extend(registry_args(source));
+    run_installer(node, installer_js, &args)
+}
+
+/// 根据用户选择的更新源构造 registry 参数（默认自动=不传，由安装器探测）
+fn registry_args(source: &str) -> Vec<String> {
+    match source {
+        "npmjs" => vec![
+            "--registry".to_string(),
+            "https://registry.npmjs.org".to_string(),
+            "--mirror".to_string(),
+            "https://registry.npmjs.org".to_string(),
+        ],
+        "npmmirror" => vec![
+            "--registry".to_string(),
+            "https://registry.npmmirror.com".to_string(),
+            "--mirror".to_string(),
+            "https://registry.npmmirror.com".to_string(),
+        ],
+        // auto 或未知：不传，安装器内部 npmjs 优先、失败切 npmmirror
+        _ => vec![],
+    }
 }
 
 /// 用内置 Node 运行 install-dsh.mjs；返回 stdout 全文（调用方解析末行 JSON）

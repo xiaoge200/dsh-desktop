@@ -14,6 +14,8 @@ pub struct AppConfig {
     pub auto_update_app: bool,
     /// 自定义端口（0 = 自动，默认 3080 优先）
     pub port: u16,
+    /// 更新源（"auto" 自动探测 / "npmjs" 官方 / "npmmirror" 国内镜像）
+    pub registry_source: String,
 }
 
 impl Default for AppConfig {
@@ -22,6 +24,7 @@ impl Default for AppConfig {
             auto_update_dsh: true,
             auto_update_app: true,
             port: 3080,
+            registry_source: "auto".to_string(),
         }
     }
 }
