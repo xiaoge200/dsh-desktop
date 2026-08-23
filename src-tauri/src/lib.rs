@@ -179,8 +179,21 @@ fn boot(app: AppHandle) {
     match node::smoke(&node_path) {
         Ok(v) => log::info!("node ok: {v}"),
         Err(e) => {
-            fail(&app, &state, "程序文件损坏，请重新安装。", &format!("node smoke: {e}"));
-            return;
+            // FR-12 自修复：瞬时故障自动重试一次（如被杀软临时拦截）
+            log::warn!("node smoke failed (retrying once): {e}");
+            std::thread::sleep(Duration::from_millis(800));
+            match node::smoke(&node_path) {
+                Ok(v) => log::info!("node ok (after retry): {v}"),
+                Err(e2) => {
+                    fail(
+                        &app,
+                        &state,
+                        "程序文件损坏，请重新安装本应用。",
+                        &format!("node smoke failed twice: {e} / {e2}"),
+                    );
+                    return;
+                }
+            }
         }
     }
     state.set_node_path(node_path);
