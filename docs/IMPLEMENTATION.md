@@ -10,6 +10,8 @@
 | M0 可行性验证 | ✅ | 内置 Node 24 + dsh 基线可启动 `dsh web`，HTTP 200 |
 | M1 Windows MVP | ✅ | Tauri v2 壳、基线准备、服务托管、WebView 内嵌、托盘、单实例、日志、白话错误 UI |
 | M1+ 打磨 | ✅ | 设置窗口（开机自启/服务状态/版本信息/目录入口）、托盘「重启服务」、CHANGELOG |
+| FR-15 高级入口 | ✅ | `--dsh-args` 透传 dsh CLI 参数（实测 --trusted-host 完整到达） |
+| FR-13 卸载数据 | ✅ 核心已满足 | 实测卸载后 %APPDATA% 用户数据完整保留（NSIS per-user 默认行为）；卸载前询问对话框为 P2 增强，需自定义 NSIS 模板（有破坏安装器风险，暂缓） |
 | M2 更新与分发 | 🚧 | DSH 自动更新 ✅；Tauri updater 代码+密钥+签名链路 ✅；更新服务器端点待配置（发布时） |
 | M3 跨平台 | 🚧 | CI 三平台矩阵已配置（.github/workflows/build-release.yml）；macOS/Linux 真机验证待 CI 首跑 |
 | M4 打磨发布 | ⏳ | 待内测 |
