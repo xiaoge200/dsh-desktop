@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="stylesheet" href="/src/styles.css" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>DSH 工作台</title>
+    <script type="module" src="/src/main.ts" defer></script>
+  </head>
+
+  <body>
+    <main class="boot">
+      <div class="card" id="boot-card">
+        <img src="/src/assets/whale.png" class="logo" alt="DSH" />
+        <h1 id="title">正在启动…</h1>
+        <p id="message">正在准备程序，请稍候。</p>
+
+        <!-- 进度条 -->
+        <div class="progress-track" id="progress-track">
+          <div class="progress-bar" id="progress-bar"></div>
+        </div>
+
+        <!-- 错误区（默认隐藏） -->
+        <div class="error-box hidden" id="error-box">
+          <p class="error-message" id="error-message"></p>
+          <div class="error-actions">
+            <button id="retry-btn" class="btn primary">重试</button>
+            <button id="quit-btn" class="btn">退出</button>
+          </div>
+          <details class="tech-detail">
+            <summary>技术详情</summary>
+            <pre id="tech-detail"></pre>
+          </details>
+        </div>
+      </div>
+    </main>
+  </body>
+</html>

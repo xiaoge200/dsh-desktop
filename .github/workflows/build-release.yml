@@ -1,0 +1,114 @@
+name: Build & Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+env:
+  TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+  TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: windows-latest
+            args: --bundles nsis
+          - platform: macos-latest
+            args: --bundles dmg
+          - platform: ubuntu-22.04
+            args: --bundles deb,appimage
+
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux system deps
+        if: matrix.platform == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libgtk-3-dev
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            src-tauri/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('src-tauri/Cargo.lock') }}
+
+      - name: Cache npm
+        uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: ${{ runner.os }}-node-${{ hashFiles('package-lock.json') }}
+
+      - name: Install frontend deps
+        run: npm ci
+
+      # 内置 Node：Windows / macOS / Linux 各自下载对应发行版放入 resources/node/<platform>
+      - name: Download bundled Node (Windows x64)
+        if: matrix.platform == 'windows-latest'
+        run: |
+          Invoke-WebRequest -Uri "https://registry.npmmirror.com/-/binary/node/v24.9.0/node-v24.9.0-win-x64.zip" -OutFile node.zip
+          Expand-Archive node.zip -DestinationPath node-extract
+          $dst = "resources/node/win-x64"
+          New-Item -ItemType Directory -Force -Path $dst | Out-Null
+          Copy-Item "node-extract/node-v24.9.0-win-x64/node.exe" "$dst/node.exe"
+          Copy-Item "node-extract/node-v24.9.0-win-x64/node_modules" "$dst/node_modules" -Recurse
+          Copy-Item "node-extract/node-v24.9.0-win-x64/npm*" "$dst/" -Recurse
+          Copy-Item "node-extract/node-v24.9.0-win-x64/npx*" "$dst/" -Recurse
+        shell: pwsh
+
+      - name: Download bundled Node (macOS arm64)
+        if: matrix.platform == 'macos-latest'
+        run: |
+          curl -L -o node.tar.gz "https://registry.npmmirror.com/-/binary/node/v24.9.0/node-v24.9.0-darwin-arm64.tar.gz"
+          tar -xzf node.tar.gz
+          mkdir -p resources/node/mac-arm64
+          cp node-v24.9.0-darwin-arm64/bin/node resources/node/mac-arm64/node
+          cp -R node-v24.9.0-darwin-arm64/lib resources/node/mac-arm64/lib
+
+      - name: Download bundled Node (Linux x64)
+        if: matrix.platform == 'ubuntu-22.04'
+        run: |
+          curl -L -o node.tar.gz "https://registry.npmmirror.com/-/binary/node/v24.9.0/node-v24.9.0-linux-x64.tar.gz"
+          tar -xzf node.tar.gz
+          mkdir -p resources/node/linux-x64
+          cp node-v24.9.0-linux-x64/bin/node resources/node/linux-x64/node
+          cp -R node-v24.9.0-linux-x64/lib resources/node/linux-x64/lib
+
+      # 基线 dsh 依赖树：CI 里 npm 安装一次并裁剪为基线资源
+      # （版本与 install-dsh.mjs 的基线打包保持一致，可用 scripts/prepare-resources.ps1 本地复现）
+      - name: Build dsh baseline (CI)
+        run: |
+          npm install --prefix ci-baseline @deepseek-ai/dsh --no-audit --no-fund --registry https://registry.npmmirror.com --loglevel=error
+          mkdir -p resources/dsh-baseline
+          mv ci-baseline/node_modules resources/dsh-baseline/node_modules
+          # 清理无用元数据减小体积
+          rm -rf resources/dsh-baseline/node_modules/.package-lock.json resources/dsh-baseline/package.json 2>/dev/null || true
+          # 记录基线版本，供安装器/文档核对
+          node -e "const p=require('./resources/dsh-baseline/node_modules/@deepseek-ai/dsh/package.json'); console.log('baseline dsh version:', p.version)"
+
+      - name: Build (Tauri)
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: "DSH 工作台 ${{ github.ref_name }}"
+          releaseBody: "请查看 CHANGELOG 获取本次更新内容。"
+          releaseDraft: true
+          prerelease: false
+          args: ${{ matrix.args }}
