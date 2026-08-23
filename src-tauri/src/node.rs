@@ -137,3 +137,55 @@ pub fn read_installed_version(runtime_dir: &Path) -> Option<String> {
     let json: serde_json::Value = serde_json::from_str(&text).ok()?;
     json.get("version")?.as_str().map(|s| s.to_string())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn node_rel_path_has_platform_dir_and_exe() {
+        let p = node_rel_path();
+        let s = p.to_string_lossy().to_string();
+        let prefix = format!("node{}", std::path::MAIN_SEPARATOR);
+        assert!(s.starts_with(&prefix));
+        // Windows: node/win-x64/node.exe；macOS: node/mac-arm64/node；Linux: node/linux-x64/node
+        if cfg!(windows) {
+            assert!(s.ends_with("node.exe"));
+            assert!(s.contains("win-x64"));
+        } else if cfg!(target_os = "macos") {
+            assert!(s.ends_with("node"));
+            assert!(s.contains("mac-"));
+        } else {
+            assert!(s.ends_with("node"));
+            assert!(s.contains("linux-"));
+        }
+    }
+
+    #[test]
+    fn read_installed_version_parses_json() {
+        let dir = std::env::temp_dir().join(format!("dsh-node-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join(".installed.json"),
+            r#"{"version":"1.2.3-rc.1","source":"baseline"}"#,
+        )
+        .unwrap();
+        assert_eq!(read_installed_version(&dir).as_deref(), Some("1.2.3-rc.1"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn read_installed_version_missing_file_returns_none() {
+        let dir = std::env::temp_dir().join(format!("dsh-node-test-none-{}", std::process::id()));
+        assert_eq!(read_installed_version(&dir), None);
+    }
+
+    #[test]
+    fn read_installed_version_bad_json_returns_none() {
+        let dir = std::env::temp_dir().join(format!("dsh-node-test-bad-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(".installed.json"), "not json").unwrap();
+        assert_eq!(read_installed_version(&dir), None);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}

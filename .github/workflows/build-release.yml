@@ -57,6 +57,12 @@ jobs:
       - name: Install frontend deps
         run: npm ci
 
+      - name: Run Rust unit tests
+        run: cargo test --manifest-path src-tauri/Cargo.toml -- --nocapture
+
+      - name: Run installer unit tests
+        run: node --test resources/installer/install-dsh.test.mjs
+
       # 内置 Node：Windows / macOS / Linux 各自下载对应发行版放入 resources/node/<platform>
       - name: Download bundled Node (Windows x64)
         if: matrix.platform == 'windows-latest'

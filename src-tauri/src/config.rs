@@ -53,3 +53,50 @@ impl ConfigStore {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_config_is_optimal_for_ordinary_users() {
+        let c = AppConfig::default();
+        assert!(c.auto_update_dsh, "默认自动更新 DSH");
+        assert!(c.auto_update_app, "默认自动更新应用壳");
+        assert_eq!(c.port, 3080, "默认端口 3080");
+    }
+
+    #[test]
+    fn missing_config_file_returns_default() {
+        let dir = std::env::temp_dir().join(format!("dsh-cfg-none-{}", std::process::id()));
+        let store = ConfigStore::new(&dir);
+        assert_eq!(store.get().port, 3080);
+        assert!(store.get().auto_update_dsh);
+    }
+
+    #[test]
+    fn set_and_get_roundtrip() {
+        let dir = std::env::temp_dir().join(format!("dsh-cfg-rw-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = ConfigStore::new(&dir);
+        let mut c = store.get();
+        c.auto_update_dsh = false;
+        c.port = 4000;
+        store.set(c.clone()).unwrap();
+        // 重新加载（模拟重启后读取）
+        let reloaded = ConfigStore::new(&dir);
+        assert_eq!(reloaded.get().auto_update_dsh, false);
+        assert_eq!(reloaded.get().port, 4000);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn corrupt_config_file_falls_back_to_default() {
+        let dir = std::env::temp_dir().join(format!("dsh-cfg-corrupt-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("config.json"), "{corrupt!!").unwrap();
+        let store = ConfigStore::new(&dir);
+        assert_eq!(store.get().port, 3080, "损坏配置回退默认");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}

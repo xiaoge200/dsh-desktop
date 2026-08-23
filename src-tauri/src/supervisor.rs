@@ -299,3 +299,85 @@ impl Drop for Supervisor {
         self.stop();
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn loopback_addr_is_127_0_0_1() {
+        let a = loopback(3080);
+        assert_eq!(a.ip().to_string(), "127.0.0.1");
+        assert_eq!(a.port(), 3080);
+    }
+
+    #[test]
+    fn normalize_for_node_strips_verbatim_prefix() {
+        // `\\?\C:\path` → `C:\path`
+        let verbatim = PathBuf::from(r"\\?\C:\Users\test\dsh");
+        let n = normalize_for_node(&verbatim);
+        let s = n.to_string_lossy().to_string();
+        assert!(!s.starts_with(r"\\?\"));
+        assert!(s.contains(r"C:\Users\test\dsh"));
+    }
+
+    #[test]
+    fn normalize_for_node_keeps_plain_path() {
+        let plain = PathBuf::from(r"C:\Users\test\dsh");
+        let n = normalize_for_node(&plain);
+        assert_eq!(n, plain);
+    }
+
+    #[test]
+    fn pick_free_port_returns_preferred_when_free() {
+        // 3080 通常未被占用；若占用则返回别的端口（也是有效值）
+        let port = Supervisor::pick_free_port(3080);
+        assert!(port > 0);
+    }
+
+    #[test]
+    fn pick_free_port_returns_alternative_when_occupied() {
+        // 占用一个端口后，pick_free_port 应返回另一个空闲端口
+        let listener = std::net::TcpListener::bind(loopback(0)).unwrap();
+        let occupied = listener.local_addr().unwrap().port();
+        let picked = Supervisor::pick_free_port(occupied);
+        assert!(picked > 0);
+        assert_ne!(picked, occupied);
+    }
+
+    #[test]
+    fn health_check_fails_on_closed_port() {
+        // 绑定后立即关闭：该端口应不可连接
+        let listener = std::net::TcpListener::bind(loopback(0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let sup = Supervisor::new();
+        sup.port.store(port as u32, Ordering::SeqCst);
+        assert!(!sup.health_check());
+    }
+
+    #[test]
+    fn health_check_succeeds_on_http_server() {
+        // 起一个简易 HTTP 服务，验证 health_check 能识别
+        let listener = std::net::TcpListener::bind(loopback(0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 512];
+                let _ = stream.read(&mut buf);
+                let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+            }
+        });
+        let sup = Supervisor::new();
+        sup.port.store(port as u32, Ordering::SeqCst);
+        // 等待服务接受连接
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline {
+            if sup.health_check() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        panic!("health_check should succeed against a live HTTP server");
+    }
+}

@@ -126,3 +126,75 @@ pub struct StatusSnapshot {
     pub dsh_version: Option<String>,
     pub node_version: Option<String>,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn new_state() -> AppState {
+        AppState {
+            node_path: Mutex::new(PathBuf::new()),
+            runtime_dir: Mutex::new(PathBuf::new()),
+            workspace_dir: Mutex::new(PathBuf::new()),
+            log_file: Mutex::new(PathBuf::new()),
+            port: AtomicU16::new(0),
+            phase: AtomicU8::new(0),
+            error_message: Mutex::new(None),
+            supervisor: Mutex::new(Supervisor::new()),
+            config: Mutex::new(ConfigStore::new(std::path::Path::new(""))),
+            dsh_extra_args: Mutex::new(Vec::new()),
+        }
+    }
+
+    #[test]
+    fn phase_roundtrip() {
+        let s = new_state();
+        for (idx, p) in [
+            BootPhase::NodeCheck,
+            BootPhase::DshInstall,
+            BootPhase::ServiceStart,
+            BootPhase::Ready,
+            BootPhase::Error,
+        ]
+        .iter()
+        .enumerate()
+        {
+            s.set_phase(*p);
+            assert_eq!(s.phase(), *p, "phase #{idx}");
+        }
+    }
+
+    #[test]
+    fn error_sets_phase_to_error() {
+        let s = new_state();
+        s.set_error("程序出了问题");
+        assert_eq!(s.phase(), BootPhase::Error);
+        assert_eq!(s.error().as_deref(), Some("程序出了问题"));
+        s.clear_error();
+        assert_eq!(s.error(), None);
+    }
+
+    #[test]
+    fn port_roundtrip() {
+        let s = new_state();
+        s.set_port(0);
+        assert_eq!(s.port(), 0);
+        s.set_port(3080);
+        assert_eq!(s.port(), 3080);
+        s.set_port(65535);
+        assert_eq!(s.port(), 65535);
+    }
+
+    #[test]
+    fn path_accessors_roundtrip() {
+        let s = new_state();
+        s.set_node_path(PathBuf::from("/tmp/node"));
+        s.set_runtime_dir(PathBuf::from("/tmp/runtime"));
+        s.set_workspace_dir(PathBuf::from("/tmp/ws"));
+        s.set_log_file(PathBuf::from("/tmp/app.log"));
+        assert_eq!(s.node_path(), PathBuf::from("/tmp/node"));
+        assert_eq!(s.runtime_dir(), PathBuf::from("/tmp/runtime"));
+        assert_eq!(s.workspace_dir(), PathBuf::from("/tmp/ws"));
+        assert_eq!(s.log_file(), PathBuf::from("/tmp/app.log"));
+    }
+}
