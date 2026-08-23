@@ -130,6 +130,11 @@ impl Supervisor {
             }
         }
 
+        // 确保工作区目录存在（current_dir 必须存在，否则 spawn 报 os error 267）
+        if let Err(e) = std::fs::create_dir_all(workspace) {
+            log::warn!("ensure workspace dir: {e}");
+        }
+
         let mut cmd = Command::new(normalize_for_node(node));
         cmd.arg(normalize_for_node(dsh_bin))
             .arg("web")
