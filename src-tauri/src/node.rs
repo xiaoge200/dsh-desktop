@@ -49,8 +49,15 @@ pub fn resolve_node(resource_dir: &Path) -> std::io::Result<PathBuf> {
 
 /// 冒烟：node --version
 pub fn smoke(node: &Path) -> Result<String, String> {
-    let out = Command::new(normalize_for_node(node))
-        .arg("--version")
+    let mut cmd = Command::new(normalize_for_node(node));
+    cmd.arg("--version");
+    // Windows 下禁止子进程弹控制台窗口（CREATE_NO_WINDOW）
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
+    let out = cmd
         .output()
         .map_err(|e| format!("cannot execute node {}: {e}", node.display()))?;
     if !out.status.success() {
@@ -106,6 +113,12 @@ fn run_installer(node: &Path, installer_js: &Path, args: &[String]) -> Result<St
     cmd.arg(normalize_for_node(installer_js));
     for a in args {
         cmd.arg(a);
+    }
+    // Windows 下禁止子进程弹控制台窗口（CREATE_NO_WINDOW）
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
     }
     log::info!("installer: {:?}", cmd);
     let out = cmd
