@@ -594,6 +594,15 @@ pub fn run() {
                 })
                 .build(app)?;
 
+            // 窗口菜单栏（标题栏下方原生菜单）：设置 / 重启服务 / 退出
+            // （主界面设置入口，NFR-10 按系统语言显示）
+            use tauri::menu::{Menu as WinMenu, MenuItem as WinMenuItem};
+            let win_settings = WinMenuItem::with_id(app, "menu-settings", s_settings, true, None::<&str>)?;
+            let win_restart = WinMenuItem::with_id(app, "menu-restart", s_restart, true, None::<&str>)?;
+            let win_quit = WinMenuItem::with_id(app, "menu-quit", s_quit, true, None::<&str>)?;
+            let win_menu = WinMenu::with_items(app, &[&win_settings, &win_restart, &win_quit])?;
+            let _ = app.set_menu(win_menu);
+
             // 启动 boot（后台线程）
             let app_handle = app.handle().clone();
             std::thread::spawn(move || {
@@ -601,8 +610,48 @@ pub fn run() {
             });
             Ok(())
         })
+        .on_menu_event(|app, event| match event.id.as_ref() {
+            "menu-settings" => {
+                show_settings_window(app);
+            }
+            "menu-restart" => {
+                let handle = app.clone();
+                std::thread::spawn(move || {
+                    let state = handle.state::<AppState>();
+                    let runtime_dir = state.runtime_dir();
+                    if runtime_dir.as_os_str().is_empty() {
+                        return;
+                    }
+                    let dsh_bin = runtime_dir
+                        .join("node_modules")
+                        .join("@deepseek-ai")
+                        .join("dsh")
+                        .join("lib")
+                        .join("bin.js");
+                    let mut sup = state.supervisor.lock().unwrap();
+                    let extra = state.dsh_extra_args.lock().unwrap().clone();
+                    match sup.restart(&state.node_path(), &dsh_bin, &state.workspace_dir(), 3080, &extra) {
+                        Ok(port) => {
+                            state.set_port(port);
+                            log::info!("menu restart -> 127.0.0.1:{port}");
+                        }
+                        Err(e) => log::error!("menu restart failed: {e}"),
+                    }
+                });
+            }
+            "menu-quit" => {
+                let handle = app.clone();
+                std::thread::spawn(move || {
+                    let state = handle.state::<AppState>();
+                    state.supervisor.lock().unwrap().stop();
+                    std::thread::sleep(Duration::from_millis(300));
+                    handle.exit(0);
+                });
+            }
+            _ => {}
+        })
         .on_window_event(|window, event| {
-            // 关闭窗口 → 隐藏（不销毁、不退出），以便再次从托盘/主界面打开
+            // 关闭窗口 → 隐藏（不销毁、不退出），以便再次从托盘/菜单打开
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 match window.label() {
                     "main" => {
@@ -614,43 +663,6 @@ pub fn run() {
                         api.prevent_close();
                     }
                     _ => {}
-                }
-            }
-        })
-        .on_page_load(|webview, payload| {
-            // DSH 页面加载完成后注入浮动设置按钮（主界面设置入口）
-            if let tauri::webview::PageLoadEvent::Finished = payload.event() {
-                if payload.url().scheme() == "http" && webview.label() == "main" {
-                    let script = r#"
-(function () {
-  if (document.getElementById('dsh-settings-fab')) return;
-  var btn = document.createElement('button');
-  btn.id = 'dsh-settings-fab';
-  btn.title = '设置';
-  btn.setAttribute('aria-label', '设置');
-  btn.innerHTML = '&#9881;';
-  btn.style.cssText = [
-    'position:fixed', 'bottom:18px', 'right:18px',
-    'width:44px', 'height:44px', 'border-radius:50%',
-    'background:rgba(37,99,235,0.92)', 'color:#fff',
-    'font-size:22px', 'line-height:1', 'border:none',
-    'cursor:pointer', 'box-shadow:0 2px 10px rgba(0,0,0,0.25)',
-    'z-index:2147483647', 'display:flex', 'align-items:center', 'justify-content:center',
-    'transition:background 0.15s ease', 'user-select:none'
-  ].join(';');
-  btn.onmouseenter = function () { btn.style.background = 'rgba(29,78,216,0.95)'; };
-  btn.onmouseleave = function () { btn.style.background = 'rgba(37,99,235,0.92)'; };
-  btn.onclick = function () {
-    try {
-      if (window.__TAURI__ && window.__TAURI__.core) {
-        window.__TAURI__.core.invoke('open_settings');
-      }
-    } catch (e) { console.error('open settings failed', e); }
-  };
-  document.body.appendChild(btn);
-})();
-"#;
-                    let _ = webview.eval(script);
                 }
             }
         })

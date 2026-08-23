@@ -13,8 +13,5 @@
     "autostart:allow-enable",
     "autostart:allow-disable",
     "autostart:allow-is-enabled"
-  ],
-  "remote": {
-    "urls": ["http://127.0.0.1:*"]
-  }
+  ]
 }
