@@ -17,6 +17,37 @@ const RUNTIME_DIR: &str = "dsh-runtime";
 const WORKSPACE_DIR: &str = "workspace";
 const LOG_FILE: &str = "dsh-desktop.log";
 
+/// 显示设置窗口（隐藏后再次打开仍有效——窗口关闭时是隐藏而非销毁）
+fn show_settings_window(app: &AppHandle) {
+    if let Some(w) = app.get_webview_window("settings") {
+        let _ = w.show();
+        let _ = w.unminimize();
+        let _ = w.set_focus();
+    } else {
+        log::warn!("settings window not found; creating");
+        // 窗口意外被销毁（极端情况）：重新创建
+        if let Err(e) = tauri::WebviewWindowBuilder::new(
+            app,
+            "settings",
+            tauri::WebviewUrl::App("settings.html".into()),
+        )
+        .title("设置")
+        .inner_size(560.0, 640.0)
+        .resizable(false)
+        .center()
+        .build()
+        {
+            log::error!("create settings window failed: {e}");
+        }
+    }
+}
+
+/// 主界面设置按钮入口（由注入到 DSH 页面的按钮调用）
+#[tauri::command]
+fn open_settings(app: AppHandle) {
+    show_settings_window(&app);
+}
+
 /// 把阶段映射为白话文案（前端也有映射，这里用于日志）
 fn phase_text(p: BootPhase) -> &'static str {
     match p {
@@ -522,11 +553,7 @@ pub fn run() {
                         }
                     }
                     "settings" => {
-                        if let Some(w) = app.get_webview_window("settings") {
-                            let _ = w.show();
-                            let _ = w.unminimize();
-                            let _ = w.set_focus();
-                        }
+                        show_settings_window(app);
                     }
                     "restart" => {
                         let handle = app.clone();
@@ -575,11 +602,55 @@ pub fn run() {
             Ok(())
         })
         .on_window_event(|window, event| {
-            // 关闭窗口 → 最小化到托盘（不退出）
+            // 关闭窗口 → 隐藏（不销毁、不退出），以便再次从托盘/主界面打开
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
-                if window.label() == "main" {
-                    let _ = window.hide();
-                    api.prevent_close();
+                match window.label() {
+                    "main" => {
+                        let _ = window.hide();
+                        api.prevent_close();
+                    }
+                    "settings" => {
+                        let _ = window.hide();
+                        api.prevent_close();
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .on_page_load(|webview, payload| {
+            // DSH 页面加载完成后注入浮动设置按钮（主界面设置入口）
+            if let tauri::webview::PageLoadEvent::Finished = payload.event() {
+                if payload.url().scheme() == "http" && webview.label() == "main" {
+                    let script = r#"
+(function () {
+  if (document.getElementById('dsh-settings-fab')) return;
+  var btn = document.createElement('button');
+  btn.id = 'dsh-settings-fab';
+  btn.title = '设置';
+  btn.setAttribute('aria-label', '设置');
+  btn.innerHTML = '&#9881;';
+  btn.style.cssText = [
+    'position:fixed', 'bottom:18px', 'right:18px',
+    'width:44px', 'height:44px', 'border-radius:50%',
+    'background:rgba(37,99,235,0.92)', 'color:#fff',
+    'font-size:22px', 'line-height:1', 'border:none',
+    'cursor:pointer', 'box-shadow:0 2px 10px rgba(0,0,0,0.25)',
+    'z-index:2147483647', 'display:flex', 'align-items:center', 'justify-content:center',
+    'transition:background 0.15s ease', 'user-select:none'
+  ].join(';');
+  btn.onmouseenter = function () { btn.style.background = 'rgba(29,78,216,0.95)'; };
+  btn.onmouseleave = function () { btn.style.background = 'rgba(37,99,235,0.92)'; };
+  btn.onclick = function () {
+    try {
+      if (window.__TAURI__ && window.__TAURI__.core) {
+        window.__TAURI__.core.invoke('open_settings');
+      }
+    } catch (e) { console.error('open settings failed', e); }
+  };
+  document.body.appendChild(btn);
+})();
+"#;
+                    let _ = webview.eval(script);
                 }
             }
         })
@@ -592,7 +663,8 @@ pub fn run() {
             open_log_dir,
             open_workspace_dir,
             get_config,
-            set_config
+            set_config,
+            open_settings
         ])
         .run(tauri::generate_context!())
         .expect("error while running dsh-desktop");
