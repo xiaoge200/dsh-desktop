@@ -17,6 +17,15 @@ const RUNTIME_DIR: &str = "dsh-runtime";
 const WORKSPACE_DIR: &str = "workspace";
 const LOG_FILE: &str = "dsh-desktop.log";
 
+/// 显示主窗口（从托盘/单实例等入口复用）
+fn show_main_window(app: &AppHandle) {
+    if let Some(w) = app.get_webview_window("main") {
+        let _ = w.show();
+        let _ = w.unminimize();
+        let _ = w.set_focus();
+    }
+}
+
 /// 显示设置窗口（隐藏后再次打开仍有效——窗口关闭时是隐藏而非销毁）
 fn show_settings_window(app: &AppHandle) {
     if let Some(w) = app.get_webview_window("settings") {
@@ -489,11 +498,7 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
             // 第二实例：聚焦已有主窗口
-            if let Some(w) = app.get_webview_window("main") {
-                let _ = w.show();
-                let _ = w.unminimize();
-                let _ = w.set_focus();
-            }
+            show_main_window(app);
         }))
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_autostart::init(
@@ -569,14 +574,23 @@ pub fn run() {
             let _tray = TrayIconBuilder::with_id("main-tray")
                 .icon(app.default_window_icon().unwrap().clone())
                 .menu(&menu)
+                // 左键点击托盘图标 → 打开/聚焦主窗口；右键 → 弹出菜单
                 .show_menu_on_left_click(false)
+                .on_tray_icon_event(|tray, event| {
+                    use tauri::tray::{MouseButton, MouseButtonState, TrayIconEvent};
+                    if let TrayIconEvent::Click {
+                        button: MouseButton::Left,
+                        button_state: MouseButtonState::Up,
+                        ..
+                    } = event
+                    {
+                        let app = tray.app_handle();
+                        show_main_window(app);
+                    }
+                })
                 .on_menu_event(|app, event| match event.id.as_ref() {
                     "show" => {
-                        if let Some(w) = app.get_webview_window("main") {
-                            let _ = w.show();
-                            let _ = w.unminimize();
-                            let _ = w.set_focus();
-                        }
+                        show_main_window(app);
                     }
                     "settings" => {
                         show_settings_window(app);
