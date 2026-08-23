@@ -111,8 +111,22 @@ function writeInstalled(dir, info) {
 }
 
 /** 查询某个 registry 上 dsh 的最新版本；失败返回 null */
-function queryLatest(registry) {
-  const res = runNpm(["view", PKG, "version", "--registry", registry, "--no-audit", "--no-fund"], { timeout: 120_000 });
+/** 快速探测 registry 是否可达（≤3s），不可达直接返回 false，避免 npm 内部长重试 */
+function registryReachable(registry, timeoutMs = 3000) {
+  return new Promise((resolve) => {
+    const ac = new AbortController();
+    const timer = setTimeout(() => ac.abort(), timeoutMs);
+    fetch(registry, { method: "HEAD", signal: ac.signal, redirect: "follow" })
+      .then(() => { clearTimeout(timer); resolve(true); })
+      .catch(() => { clearTimeout(timer); resolve(false); });
+  });
+}
+
+async function queryLatest(registry) {
+  // 快速连通性探测：离线时立即返回，不等 npm 长重试（NFR-06 离线降级）
+  const reachable = await registryReachable(registry);
+  if (!reachable) return null;
+  const res = runNpm(["view", PKG, "version", "--registry", registry, "--no-audit", "--no-fund", "--fetch-retries=0", "--fetch-timeout=8000"], { timeout: 60_000 });
   if (res.status !== 0) return null;
   const v = (res.stdout ?? "").trim().split(/\r?\n/).filter(Boolean).pop();
   return v || null;
@@ -272,7 +286,7 @@ function out(obj) {
 }
 
 // ============ 主流程 ============
-function main() {
+async function main() {
   const opts = parseArgs(process.argv.slice(2));
   const target = opts.target;
   mkdirSync(target, { recursive: true });
@@ -317,7 +331,7 @@ function main() {
       ];
       let latest = null, latestSource = null;
       for (const r of registries) {
-        const v = queryLatest(r.url);
+        const v = await queryLatest(r.url);
         if (v) { latest = v; latestSource = r.label; break; }
       }
       if (!latest) {
@@ -342,7 +356,7 @@ function main() {
       ];
       let latest = null, latestSource = null;
       for (const r of registries) {
-        const v = queryLatest(r.url);
+        const v = await queryLatest(r.url);
         if (v) { latest = v; latestSource = r.label; break; }
       }
       if (!latest) {
@@ -419,7 +433,10 @@ function main() {
 // 直接运行时（argv[1] 是自身）执行 main。
 const invokedByTest = process.argv[1]?.endsWith?.("install-dsh.test.mjs");
 if (!invokedByTest) {
-  main();
+  main().catch((e) => {
+    console.log(JSON.stringify({ ok: false, error: { kind: "unknown", message: "程序内部错误", detail: String(e?.message ?? e) } }));
+    process.exit(1);
+  });
 }
 
 // 导出供测试（顶层 export 是 ESM 静态约束）
