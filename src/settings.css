@@ -149,23 +149,6 @@ h1 {
   cursor: default;
 }
 
-footer {
-  display: flex;
-  justify-content: flex-end;
-  margin-top: 16px;
-}
-
-.btn.close {
-  padding: 9px 28px;
-  background: var(--primary);
-  border-color: var(--primary);
-  color: #fff;
-}
-
-.btn.close:hover {
-  background: #1d4ed8;
-}
-
 /* 开关 */
 .switch {
   position: relative;

@@ -1,5 +1,4 @@
 import { invoke } from "@tauri-apps/api/core";
-import { getCurrentWindow } from "@tauri-apps/api/window";
 import { SETTINGS_STRINGS, detectLang, tr } from "./i18n";
 
 // 语言（NFR-10）
@@ -46,7 +45,6 @@ const els = {
   logPath: $("#log-path"),
   openWorkspaceBtn: $("#open-workspace-btn") as HTMLButtonElement,
   openLogBtn: $("#open-log-btn") as HTMLButtonElement,
-  closeBtn: $("#close-btn") as HTMLButtonElement,
 };
 
 let configCache: AppConfig | null = null;
@@ -131,10 +129,6 @@ function bind() {
     } catch (e) {
       alert(lang === "zh" ? "无法打开日志目录。" : "Cannot open the logs folder.");
     }
-  });
-
-  els.closeBtn.addEventListener("click", () => {
-    getCurrentWindow().close();
   });
 }
 
