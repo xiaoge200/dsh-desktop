@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="stylesheet" href="/src/settings.css" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>设置 - DSH 工作台</title>
+    <script type="module" src="/src/settings.ts" defer></script>
+  </head>
+
+  <body>
+    <main class="settings">
+      <header class="settings-header">
+        <img src="/src/assets/whale.png" class="logo" alt="DSH" />
+        <div>
+          <h1>设置</h1>
+          <p class="subtitle">DSH 工作台</p>
+        </div>
+      </header>
+
+      <section class="card">
+        <h2>启动</h2>
+        <div class="row">
+          <div class="row-text">
+            <span class="label">开机自动启动</span>
+            <span class="hint">电脑开机后自动打开 DSH 工作台</span>
+          </div>
+          <label class="switch">
+            <input type="checkbox" id="autostart" />
+            <span class="slider"></span>
+          </label>
+        </div>
+      </section>
+
+      <section class="card">
+        <h2>服务</h2>
+        <div class="row">
+          <div class="row-text">
+            <span class="label">本地服务</span>
+            <span class="hint" id="service-state">正在检查…</span>
+          </div>
+          <button class="btn" id="restart-btn">重启服务</button>
+        </div>
+      </section>
+
+      <section class="card">
+        <h2>关于</h2>
+        <div class="about-row"><span class="label">应用版本</span><span id="app-version">-</span></div>
+        <div class="about-row"><span class="label">DSH 版本</span><span id="dsh-version">-</span></div>
+        <div class="about-row"><span class="label">运行环境</span><span id="node-version">-</span></div>
+        <div class="about-row"><span class="label">工作区位置</span><span class="path" id="workspace-path">-</span></div>
+        <div class="about-row"><span class="label">日志位置</span><span class="path" id="log-path">-</span></div>
+        <div class="row actions">
+          <button class="btn" id="open-workspace-btn">打开工作区</button>
+          <button class="btn" id="open-log-btn">打开日志</button>
+        </div>
+      </section>
+
+      <footer>
+        <button class="btn close" id="close-btn">关闭</button>
+      </footer>
+    </main>
+  </body>
+</html>

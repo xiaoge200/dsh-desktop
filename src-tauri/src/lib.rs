@@ -304,6 +304,78 @@ async fn check_app_update(app: AppHandle) -> Result<Option<String>, String> {
     }
 }
 
+/// 设置页数据（白话展示）
+#[derive(serde::Serialize)]
+struct SettingsData {
+    app_version: String,
+    node_version: Option<String>,
+    dsh_version: Option<String>,
+    port: u16,
+    workspace_dir: String,
+    log_file: String,
+    autostart_enabled: bool,
+}
+
+#[tauri::command]
+fn get_settings(app: AppHandle, state: State<'_, AppState>) -> Result<SettingsData, String> {
+    use tauri_plugin_autostart::ManagerExt;
+
+    let pkg = app.package_info();
+    let autostart = app
+        .autolaunch()
+        .is_enabled()
+        .map_err(|e| format!("读取开机启动设置失败: {e}"))?;
+
+    Ok(SettingsData {
+        app_version: pkg.version.to_string(),
+        node_version: node::smoke(&state.node_path()).ok(),
+        dsh_version: node::read_installed_version(&state.runtime_dir()),
+        port: state.port(),
+        workspace_dir: state.workspace_dir().display().to_string(),
+        log_file: state.log_file().display().to_string(),
+        autostart_enabled: autostart,
+    })
+}
+
+/// 设置开机自启
+#[tauri::command]
+fn set_autostart(app: AppHandle, enabled: bool) -> Result<(), String> {
+    use tauri_plugin_autostart::ManagerExt;
+    if enabled {
+        app.autolaunch()
+            .enable()
+            .map_err(|e| format!("开启开机启动失败: {e}"))?;
+    } else {
+        app.autolaunch()
+            .disable()
+            .map_err(|e| format!("关闭开机启动失败: {e}"))?;
+    }
+    log::info!("autostart set to {enabled}");
+    Ok(())
+}
+
+/// 打开日志目录（系统文件管理器）
+#[tauri::command]
+fn open_log_dir(state: State<'_, AppState>) -> Result<(), String> {
+    let log_file = state.log_file();
+    let dir = log_file
+        .parent()
+        .ok_or("无法确定日志位置")?;
+    open::that(dir).map_err(|e| format!("打开日志目录失败: {e}"))?;
+    Ok(())
+}
+
+/// 打开工作区目录（用户数据）
+#[tauri::command]
+fn open_workspace_dir(state: State<'_, AppState>) -> Result<(), String> {
+    let ws = state.workspace_dir();
+    if ws.as_os_str().is_empty() {
+        return Err("工作区尚未初始化".into());
+    }
+    open::that(&ws).map_err(|e| format!("打开工作区失败: {e}"))?;
+    Ok(())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let logger = Arc::new(logging::FileLogger::new());
@@ -321,6 +393,10 @@ pub fn run() {
             }
         }))
         .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_autostart::init(
+            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+            None,
+        ))
         .manage(AppState {
             node_path: std::sync::Mutex::new(PathBuf::new()),
             runtime_dir: std::sync::Mutex::new(PathBuf::new()),
@@ -347,8 +423,10 @@ pub fn run() {
             use tauri::menu::{Menu, MenuItem};
             use tauri::tray::TrayIconBuilder;
             let show_i = MenuItem::with_id(app, "show", "打开界面", true, None::<&str>)?;
+            let settings_i = MenuItem::with_id(app, "settings", "设置", true, None::<&str>)?;
+            let restart_i = MenuItem::with_id(app, "restart", "重启服务", true, None::<&str>)?;
             let quit_i = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
-            let menu = Menu::with_items(app, &[&show_i, &quit_i])?;
+            let menu = Menu::with_items(app, &[&show_i, &settings_i, &restart_i, &quit_i])?;
             let _tray = TrayIconBuilder::with_id("main-tray")
                 .icon(app.default_window_icon().unwrap().clone())
                 .menu(&menu)
@@ -360,6 +438,37 @@ pub fn run() {
                             let _ = w.unminimize();
                             let _ = w.set_focus();
                         }
+                    }
+                    "settings" => {
+                        if let Some(w) = app.get_webview_window("settings") {
+                            let _ = w.show();
+                            let _ = w.unminimize();
+                            let _ = w.set_focus();
+                        }
+                    }
+                    "restart" => {
+                        let handle = app.clone();
+                        std::thread::spawn(move || {
+                            let state = handle.state::<AppState>();
+                            let runtime_dir = state.runtime_dir();
+                            if runtime_dir.as_os_str().is_empty() {
+                                return;
+                            }
+                            let dsh_bin = runtime_dir
+                                .join("node_modules")
+                                .join("@deepseek-ai")
+                                .join("dsh")
+                                .join("lib")
+                                .join("bin.js");
+                            let mut sup = state.supervisor.lock().unwrap();
+                            match sup.restart(&state.node_path(), &dsh_bin, &state.workspace_dir(), 3080) {
+                                Ok(port) => {
+                                    state.set_port(port);
+                                    log::info!("tray restart -> 127.0.0.1:{port}");
+                                }
+                                Err(e) => log::error!("tray restart failed: {e}"),
+                            }
+                        });
                     }
                     "quit" => {
                         app.exit(0);
@@ -384,7 +493,15 @@ pub fn run() {
                 }
             }
         })
-        .invoke_handler(tauri::generate_handler![get_status, restart_service, check_app_update])
+        .invoke_handler(tauri::generate_handler![
+            get_status,
+            restart_service,
+            check_app_update,
+            get_settings,
+            set_autostart,
+            open_log_dir,
+            open_workspace_dir
+        ])
         .run(tauri::generate_context!())
         .expect("error while running dsh-desktop");
 }

@@ -20,6 +20,16 @@
         "minWidth": 800,
         "minHeight": 600,
         "center": true
+      },
+      {
+        "label": "settings",
+        "title": "设置",
+        "url": "settings.html",
+        "width": 560,
+        "height": 640,
+        "resizable": false,
+        "center": true,
+        "visible": false
       }
     ],
     "security": {
@@ -31,10 +41,7 @@
       "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDIxNjU4NEE1QTdDMDI0M0QKUldROUpNQ25wWVJsSVdFeml0eHovNWcyck5BdTZHOWdNRHk3VG8zbjNPNkxzVkUxWWNWYnJRUHUK",
       "endpoints": [
         "https://your-update-server.example.com/{{target}}/{{arch}}/{{current_version}}"
-      ],
-      "windows": {
-        "installMode": "currentUser"
-      }
+      ]
     }
   },
   "bundle": {

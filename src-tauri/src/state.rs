@@ -105,6 +105,10 @@ impl AppState {
     pub fn set_log_file(&self, p: PathBuf) {
         *self.log_file.lock().unwrap() = p;
     }
+
+    pub fn log_file(&self) -> PathBuf {
+        self.log_file.lock().unwrap().clone()
+    }
 }
 
 /// 前端读取的状态快照
