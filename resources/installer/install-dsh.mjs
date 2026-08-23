@@ -61,8 +61,12 @@ function parseArgs(argv) {
 function resolveNpmCli() {
   const nodeDir = dirname(process.execPath);
   const candidates = [
+    // Windows 官方发行版：<nodeDir>/node_modules/npm/bin/npm-cli.js
     join(nodeDir, "node_modules", "npm", "bin", "npm-cli.js"),
+    // mac/Linux 官方发行版（bin 在 nodeDir）：<nodeDir>/../lib/node_modules/npm
     join(nodeDir, "..", "lib", "node_modules", "npm", "bin", "npm-cli.js"),
+    // 本项目资源布局：node 二进制与 lib 平级（CI 复制 bin/node + lib 到同一目录）
+    join(nodeDir, "lib", "node_modules", "npm", "bin", "npm-cli.js"),
   ];
   for (const p of candidates) {
     if (existsSync(p)) return p;
