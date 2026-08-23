@@ -61,7 +61,10 @@
     ],
     "windows": {
       "nsis": {
-        "installMode": "currentUser"
+        "installMode": "currentUser",
+        "installerHooks": "./nsis-hooks.nsh",
+        "languages": ["English", "SimpChinese", "TradChinese"],
+        "displayLanguageSelector": false
       }
     },
     "linux": {
