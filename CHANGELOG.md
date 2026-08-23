@@ -27,6 +27,9 @@
 - Windows `\\?\` verbatim 路径导致 Node 崩溃 → 参数规范化
 - Unix 进程组清理阻塞风险 → SIGTERM 5s 超时 + SIGKILL 兜底
 - updater 插件配置非法字段 → 移除，per-user 由 bundle 配置决定
+- dsh 服务 stdout/stderr 落盘（修复 pipe 未读导致的服务卡死，落实 FR-09）
+- 托盘退出前先停服务，避免残留 dsh 进程
+- install-dsh.mjs npm 解析支持 mac/Linux 资源布局（lib/node_modules/npm），保证 CI 三平台可用
 
 ### 待办（发布前）
 - [ ] 配置更新服务器端点（docs/RELEASE.md §2）
