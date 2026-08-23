@@ -1,3 +1,4 @@
+mod config;
 mod logging;
 mod node;
 mod state;
@@ -130,7 +131,8 @@ fn boot(app: AppHandle) {
         return;
     }
 
-    let preferred_port = 3080u16;
+    let cfg_port = state.config.lock().unwrap().get().port;
+    let preferred_port = if cfg_port > 0 { cfg_port } else { 3080u16 };
     let port = {
         let mut sup = state.supervisor.lock().unwrap();
         match sup.start(&state.node_path(), &dsh_bin, &state.workspace_dir(), preferred_port) {
@@ -181,7 +183,12 @@ fn boot(app: AppHandle) {
     let bg_node = state.node_path();
     let bg_installer = installer_js;
     let bg_runtime = runtime_dir;
+    let auto_update = state.config.lock().unwrap().get().auto_update_dsh;
     std::thread::spawn(move || {
+        if !auto_update {
+            log::info!("bg update: auto-update disabled by user");
+            return;
+        }
         // 先检查是否有新版本
         let check = match node::run_check(&bg_node, &bg_installer, &bg_runtime) {
             Ok(o) => o,
@@ -376,6 +383,18 @@ fn open_workspace_dir(state: State<'_, AppState>) -> Result<(), String> {
     Ok(())
 }
 
+/// 读取用户配置
+#[tauri::command]
+fn get_config(state: State<'_, AppState>) -> Result<config::AppConfig, String> {
+    Ok(state.config.lock().unwrap().get())
+}
+
+/// 保存用户配置
+#[tauri::command]
+fn set_config(state: State<'_, AppState>, config: config::AppConfig) -> Result<(), String> {
+    state.config.lock().unwrap().set(config)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let logger = Arc::new(logging::FileLogger::new());
@@ -406,8 +425,15 @@ pub fn run() {
             phase: std::sync::atomic::AtomicU8::new(0),
             error_message: std::sync::Mutex::new(None),
             supervisor: std::sync::Mutex::new(Supervisor::new()),
+            config: std::sync::Mutex::new(config::ConfigStore::new(std::path::Path::new(""))),
         })
         .setup(move |app| {
+            // 配置存储（appData/config.json）
+            if let Ok(data) = app.path().app_data_dir() {
+                let store = config::ConfigStore::new(&data);
+                let state = app.state::<AppState>();
+                *state.config.lock().unwrap() = store;
+            }
             // 日志文件
             if let Ok(data) = app.path().app_data_dir() {
                 let log_path = data.join(LOG_FILE);
@@ -500,7 +526,9 @@ pub fn run() {
             get_settings,
             set_autostart,
             open_log_dir,
-            open_workspace_dir
+            open_workspace_dir,
+            get_config,
+            set_config
         ])
         .run(tauri::generate_context!())
         .expect("error while running dsh-desktop");

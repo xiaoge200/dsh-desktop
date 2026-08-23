@@ -11,10 +11,17 @@ interface SettingsData {
   autostart_enabled: boolean;
 }
 
+interface AppConfig {
+  auto_update_dsh: boolean;
+  auto_update_app: boolean;
+  port: number;
+}
+
 const $ = <T extends HTMLElement = HTMLElement>(id: string) => document.querySelector(id) as T;
 
 const els = {
   autostart: document.querySelector("#autostart") as HTMLInputElement,
+  autoUpdate: document.querySelector("#auto-update") as HTMLInputElement,
   serviceState: $("#service-state"),
   restartBtn: $("#restart-btn") as HTMLButtonElement,
   appVersion: $("#app-version"),
@@ -26,6 +33,8 @@ const els = {
   openLogBtn: $("#open-log-btn") as HTMLButtonElement,
   closeBtn: $("#close-btn") as HTMLButtonElement,
 };
+
+let configCache: AppConfig | null = null;
 
 function setRowText(el: HTMLElement, text: string) {
   el.textContent = text;
@@ -44,6 +53,10 @@ async function loadSettings() {
     setRowText(els.nodeVersion, s.node_version ?? "未知");
     setRowText(els.workspacePath, s.workspace_dir);
     setRowText(els.logPath, s.log_file);
+
+    // 自动更新开关
+    configCache = await invoke<AppConfig>("get_config");
+    els.autoUpdate.checked = configCache.auto_update_dsh;
   } catch (e) {
     setRowText(els.serviceState, "读取失败");
     console.error("load settings failed", e);
@@ -58,6 +71,19 @@ function bind() {
       console.error("autostart toggle failed", e);
       els.autostart.checked = !els.autostart.checked;
       alert("切换开机启动失败，请稍后再试。");
+    }
+  });
+
+  els.autoUpdate.addEventListener("change", async () => {
+    if (!configCache) return;
+    const next = { ...configCache, auto_update_dsh: els.autoUpdate.checked };
+    try {
+      await invoke("set_config", { config: next });
+      configCache = next;
+    } catch (e) {
+      console.error("auto-update toggle failed", e);
+      els.autoUpdate.checked = !els.autoUpdate.checked;
+      alert("切换自动更新失败，请稍后再试。");
     }
   });
 

@@ -4,6 +4,7 @@ use std::sync::Mutex;
 
 use serde::Serialize;
 
+use crate::config::ConfigStore;
 use crate::supervisor::Supervisor;
 
 /// 启动阶段（与前端 boot UI 对应，白话文案由前端映射）
@@ -40,6 +41,8 @@ pub struct AppState {
     pub error_message: Mutex<Option<String>>,
     /// 服务进程托管
     pub supervisor: Mutex<Supervisor>,
+    /// 用户配置（设置页）
+    pub config: Mutex<ConfigStore>,
 }
 
 impl AppState {

@@ -30,6 +30,8 @@ const els = {
   techDetail: document.querySelector("#tech-detail") as HTMLElement,
   retryBtn: document.querySelector("#retry-btn") as HTMLButtonElement,
   quitBtn: document.querySelector("#quit-btn") as HTMLButtonElement,
+  welcomeBox: document.querySelector("#welcome-box") as HTMLElement,
+  welcomeBtn: document.querySelector("#welcome-btn") as HTMLButtonElement,
 };
 
 // 阶段 → 白话标题 + 进度百分比
@@ -89,6 +91,19 @@ async function navigate(url: string) {
   window.location.href = url;
 }
 
+// 首次使用引导（FR-16）：READY 后先显示白话引导，点「开始使用」才进入；
+// 用 localStorage 记录，仅首次显示。
+const WELCOME_KEY = "dsh-desktop.welcome-seen";
+let pendingUrl: string | null = null;
+
+function showWelcome(url: string) {
+  pendingUrl = url;
+  els.title.textContent = "准备完成";
+  els.message.classList.add("hidden");
+  els.progressTrack.classList.add("hidden");
+  els.welcomeBox.classList.remove("hidden");
+}
+
 function bindActions() {
   els.retryBtn.addEventListener("click", async () => {
     els.errorBox.classList.add("hidden");
@@ -98,6 +113,12 @@ function bindActions() {
   });
   els.quitBtn.addEventListener("click", async () => {
     getCurrentWindow().destroy();
+  });
+  els.welcomeBtn.addEventListener("click", () => {
+    try {
+      localStorage.setItem(WELCOME_KEY, "1");
+    } catch { /* 忽略存储失败 */ }
+    if (pendingUrl) navigate(pendingUrl);
   });
 }
 
@@ -109,14 +130,14 @@ async function main() {
     setPhase(e.payload.phase, e.payload.message);
   });
   await listen<BootReady>("boot://ready", (e) => {
-    navigate(e.payload.url);
+    handleReady(e.payload.url);
   });
 
   // 先拉一次快照（若 boot 已完成或已失败）
   try {
     const snap = await invoke<StatusSnapshot>("get_status");
     if (snap.phase === "ready" && snap.port > 0) {
-      navigate(`http://127.0.0.1:${snap.port}`);
+      handleReady(`http://127.0.0.1:${snap.port}`);
       return;
     }
     if (snap.phase === "error") {
@@ -126,6 +147,18 @@ async function main() {
     setPhase(snap.phase, snap.message);
   } catch (e) {
     // 忽略：事件流会接管
+  }
+}
+
+function handleReady(url: string) {
+  let seen = false;
+  try {
+    seen = localStorage.getItem(WELCOME_KEY) === "1";
+  } catch { /* 忽略 */ }
+  if (seen) {
+    navigate(url);
+  } else {
+    showWelcome(url);
   }
 }
 

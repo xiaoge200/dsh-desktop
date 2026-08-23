@@ -20,6 +20,13 @@
           <div class="progress-bar" id="progress-bar"></div>
         </div>
 
+        <!-- 首次使用引导（默认隐藏，FR-16） -->
+        <div class="welcome hidden" id="welcome-box">
+          <h2>欢迎使用 DSH 工作台</h2>
+          <p class="welcome-text">这就是你的 AI 工作台，直接开始对话即可。<br/>所有内容都保存在这台电脑上，随时可用。</p>
+          <button id="welcome-btn" class="btn primary welcome-btn">开始使用</button>
+        </div>
+
         <!-- 错误区（默认隐藏） -->
         <div class="error-box hidden" id="error-box">
           <p class="error-message" id="error-message"></p>

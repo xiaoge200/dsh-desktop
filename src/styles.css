@@ -94,6 +94,28 @@ p {
   display: none !important;
 }
 
+/* 首次使用引导（FR-16） */
+.welcome {
+  text-align: center;
+  padding-top: 8px;
+}
+
+.welcome h2 {
+  font-size: 18px;
+  margin-bottom: 10px;
+}
+
+.welcome-text {
+  font-size: 14px;
+  line-height: 1.8;
+  margin-bottom: 18px;
+}
+
+.welcome-btn {
+  width: 100%;
+  max-width: 220px;
+}
+
 .error-box {
   text-align: left;
 }
