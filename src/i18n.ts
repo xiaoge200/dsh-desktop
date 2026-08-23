@@ -32,6 +32,8 @@ export const BOOT_STRINGS = {
     "这就是你的 AI 工作台，直接开始对话即可。\n所有内容都保存在这台电脑上，随时可用。":
       "这就是你的 AI 工作台，直接开始对话即可。\n所有内容都保存在这台电脑上，随时可用。",
     "开始使用": "开始使用",
+    "一键修复": "一键修复",
+    "正在修复…": "正在修复…",
   },
   en: {
     "正在准备程序…": "Preparing…",
@@ -50,6 +52,8 @@ export const BOOT_STRINGS = {
     "这就是你的 AI 工作台，直接开始对话即可。\n所有内容都保存在这台电脑上，随时可用。":
       "This is your AI workspace. Just start chatting.\nEverything is stored on this computer and ready when you are.",
     "开始使用": "Get Started",
+    "一键修复": "Repair",
+    "正在修复…": "Repairing…",
   },
 } as const;
 

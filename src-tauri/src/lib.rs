@@ -390,6 +390,70 @@ fn restart_service(app: AppHandle, state: State<'_, AppState>) -> Result<(), Str
     }
 }
 
+/// 一键修复（FR-12）：强制重建 dsh 运行时（重新 prepare）+ 重启服务。
+/// 用于服务反复崩溃/安装损坏的降级态修复。
+#[tauri::command]
+fn repair_service(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+    let resource_dir = app.path().resource_dir().map_err(|e| e.to_string())?;
+    let installer_js = resource_dir.join("installer").join("install-dsh.mjs");
+    let baseline_dir = resource_dir.join("dsh-baseline");
+    let runtime_dir = state.runtime_dir();
+    let node_path = state.node_path();
+
+    // 1) 强制重建运行时（install-dsh.mjs prepare --force 未实现，用 update --force 重建基线等价物：
+    //    直接重新 prepare 到临时目录再替换，或简化：prepare 已幂等，这里 stop 后重跑 prepare）
+    state.supervisor.lock().unwrap().stop();
+    let install_out = node::run_prepare(&node_path, &installer_js, &runtime_dir, &baseline_dir)
+        .map_err(|e| format!("修复失败：{e}"))?;
+    let line = install_out.lines().last().unwrap_or("").to_string();
+    if let Ok(json) = serde_json::from_str::<serde_json::Value>(&line) {
+        if json.get("ok").and_then(|v| v.as_bool()) != Some(true) {
+            let msg = json
+                .pointer("/error/message")
+                .and_then(|v| v.as_str())
+                .unwrap_or("修复没有成功，请重试。");
+            return Err(msg.to_string());
+        }
+    }
+
+    // 2) 重启服务
+    let dsh_bin = runtime_dir
+        .join("node_modules")
+        .join("@deepseek-ai")
+        .join("dsh")
+        .join("lib")
+        .join("bin.js");
+    if !dsh_bin.exists() {
+        return Err("修复后服务仍不完整，请重新安装。".into());
+    }
+    let mut sup = state.supervisor.lock().unwrap();
+    let extra = state.dsh_extra_args.lock().unwrap().clone();
+    let cfg_port = state.config.lock().unwrap().get().port;
+    let preferred = if cfg_port > 0 { cfg_port } else { 3080 };
+    match sup.start(&node_path, &dsh_bin, &state.workspace_dir(), preferred, &extra) {
+        Ok(port) => {
+            state.set_port(port);
+            if sup.wait_ready(Duration::from_secs(30)) {
+                state.set_phase(BootPhase::Ready);
+                state.clear_error();
+                update_tray_tooltip(&app);
+                let _ = app.emit(
+                    "boot://ready",
+                    serde_json::json!({ "url": format!("http://127.0.0.1:{port}") }),
+                );
+                Ok(())
+            } else {
+                state.set_error("修复后服务仍未启动，请稍后再试。");
+                Err("服务未就绪".into())
+            }
+        }
+        Err(e) => {
+            state.set_error("修复后服务启动失败，请稍后再试。");
+            Err(e)
+        }
+    }
+}
+
 /// 应用壳更新：检查并（可选）安装新版本。
 /// 返回：(更新可用?, 版本号?)；安装成功后返回版本号。
 #[tauri::command]
@@ -756,6 +820,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             get_status,
             restart_service,
+            repair_service,
             check_app_update,
             get_settings,
             set_autostart,

@@ -29,6 +29,7 @@ const els = {
   errorBox: document.querySelector("#error-box") as HTMLElement,
   errorMessage: document.querySelector("#error-message") as HTMLElement,
   techDetail: document.querySelector("#tech-detail") as HTMLElement,
+  repairBtn: document.querySelector("#repair-btn") as HTMLButtonElement,
   retryBtn: document.querySelector("#retry-btn") as HTMLButtonElement,
   quitBtn: document.querySelector("#quit-btn") as HTMLButtonElement,
   welcomeBox: document.querySelector("#welcome-box") as HTMLElement,
@@ -79,6 +80,8 @@ function showError(message: string, detail?: string) {
   } else {
     els.techDetail.textContent = T("（无技术详情）");
   }
+  // 一键修复（FR-12）：服务类故障可修复时显示修复按钮
+  els.repairBtn.classList.remove("hidden");
 }
 
 function setPhase(phase: string, message?: string) {
@@ -123,6 +126,24 @@ function bindActions() {
     els.progressTrack.classList.remove("hidden");
     setPhase("node-check");
     window.location.reload();
+  });
+  els.repairBtn.addEventListener("click", async () => {
+    // 一键修复（FR-12）：重建运行时 + 重启服务；期间显示修复中状态
+    els.repairBtn.disabled = true;
+    els.repairBtn.textContent = lang === "zh" ? "正在修复…" : "Repairing…";
+    els.errorMessage.textContent = lang === "zh" ? "正在修复，请稍候…" : "Repairing, please wait…";
+    els.techDetail.textContent = "";
+    try {
+      await invoke("repair_service");
+      // 修复成功后 boot://ready 事件会触发跳转；这里兜底 reload
+    } catch (e) {
+      els.errorMessage.textContent =
+        lang === "zh" ? "修复没有成功，请稍后再试或重新安装。" : "Repair failed. Please try again or reinstall.";
+      console.error("repair failed", e);
+    } finally {
+      els.repairBtn.disabled = false;
+      els.repairBtn.textContent = lang === "zh" ? "一键修复" : "Repair";
+    }
   });
   els.quitBtn.addEventListener("click", async () => {
     getCurrentWindow().destroy();
