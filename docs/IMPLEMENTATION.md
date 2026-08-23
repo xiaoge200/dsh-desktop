@@ -15,6 +15,7 @@
 | NFR-10 本地化 | ✅ | i18n 中英双语：boot 页/设置页按 navigator.language，托盘按系统区域设置（Windows GetUserDefaultUILanguage / LANG） |
 | 自动化测试 | ✅ | Rust 单元测试 19 个 + install-dsh.mjs 测试 8 个（含回滚机制测试），CI 已接入 |
 | 更新回滚（R7/R10） | ✅ | update 前备份 `.dsh-runtime-bak`，安装/冒烟失败自动恢复旧版本，成功删备份 |
+| NFR-06 离线降级 | ✅ 优化 | registry 不可达时 HEAD 探测 3s 快速失败（原 npm 长重试 240s+ → 实测 0.1s）；在线路径 3.4s 正常 |
 | NFR-02 冷启动 | ✅ 达标 | 实测二次启动：服务就绪 ~4.5s（含 dsh 服务自身初始化 ~3s），WebView 跳转后用户可交互；首启含基线复制约 60-90s（文档已注明安装场景除外） |
 | M2 更新与分发 | 🚧 | DSH 自动更新 ✅；Tauri updater 代码+密钥+签名链路 ✅；更新服务器端点待配置（发布时） |
 | M3 跨平台 | 🚧 | CI 三平台矩阵已配置（.github/workflows/build-release.yml）；macOS/Linux 真机验证待 CI 首跑 |
