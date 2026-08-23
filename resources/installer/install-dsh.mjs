@@ -219,6 +219,30 @@ function copyBaseline(target, baselineRoot) {
   rmSync(stage, { recursive: true, force: true });
 }
 
+/** 调试日志（写 stderr，不进 stdout JSON 契约） */
+function log(msg) {
+  try {
+    process.stderr.write(`[install-dsh] ${msg}\n`);
+  } catch { /* ignore */ }
+}
+
+/** 从备份恢复旧版本（更新失败回滚，R7/R10） */
+function restoreBackup(target, bakDir, hasBackup) {
+  if (!hasBackup || !existsSync(bakDir)) {
+    log("no backup to restore");
+    return;
+  }
+  try {
+    rmSync(target, { recursive: true, force: true });
+    mkdirSync(target, { recursive: true });
+    copyTree(bakDir, target);
+    rmSync(bakDir, { recursive: true, force: true });
+    log("restored old runtime from backup");
+  } catch (e) {
+    log("restore failed: " + (e.message ?? e));
+  }
+}
+
 /** 冒烟：node <dsh>/lib/bin.js --version */
 function smokeTest(target) {
   const bin = join(target, "node_modules", "@deepseek-ai", "dsh", "lib", "bin.js");
@@ -311,7 +335,7 @@ function main() {
     }
 
     case "update": {
-      // 后台：安装/更新到最新版
+      // 后台：安装/更新到最新版；带回滚（R7/R10：失败保留旧版本可用）
       const registries = [
         { label: "npmjs", url: opts.registry || DEFAULT_REGISTRY },
         { label: "npmmirror", url: opts.mirror || DEFAULT_MIRROR },
@@ -331,6 +355,23 @@ function main() {
         out({ ok: true, action: "up-to-date", version: latest, dir: target, source: latestSource });
         return;
       }
+
+      // 1) 备份当前版本（若存在且有效），供回滚
+      const bakDir = join(dirname(target), ".dsh-runtime-bak");
+      rmSync(bakDir, { recursive: true, force: true });
+      const hasOld = smokeOk(target);
+      if (hasOld) {
+        try {
+          mkdirSync(bakDir, { recursive: true });
+          copyTree(target, bakDir);
+          log("backed up old runtime to " + bakDir);
+        } catch (e) {
+          log("backup failed (continue without rollback): " + (e.message ?? e));
+          rmSync(bakDir, { recursive: true, force: true });
+        }
+      }
+
+      // 2) 安装新版本（换源重试）
       let version = null, usedSource = null;
       const order = latestSource === "npmmirror" ? [registries[1], registries[0]] : [registries[0], registries[1]];
       for (const r of order) {
@@ -341,21 +382,29 @@ function main() {
         } catch { /* 换源重试 */ }
       }
       if (!version) {
-        out({ ok: false, error: { kind: "install", message: "新版本没有装好，不影响现在使用。", detail: "install failed on both registries" } });
+        // 安装失败：恢复旧版本
+        restoreBackup(target, bakDir, hasOld);
+        out({ ok: false, error: { kind: "install", message: "新版本没有装好，已保留旧版本。", detail: "install failed on both registries" } });
         process.exit(1);
       }
+
+      // 3) 冒烟：失败则回滚
       let smoke;
       try {
         smoke = smokeTest(target);
       } catch (e) {
-        out({ ok: false, error: { kind: "integrity", message: "新版本文件不完整，已保留旧版本。", detail: String(e.message ?? e) } });
+        restoreBackup(target, bakDir, hasOld);
+        out({ ok: false, error: { kind: "integrity", message: "新版本文件不完整，已恢复旧版本。", detail: String(e.message ?? e) } });
         process.exit(1);
       }
+
+      // 4) 成功：写状态，删备份
       writeInstalled(target, {
         package: PKG, version, installedAt: new Date().toISOString(),
         smoke, source: usedSource, node: process.version,
         integrity: shasum256(join(target, "node_modules", "@deepseek-ai", "dsh", "lib", "bin.js")),
       });
+      rmSync(bakDir, { recursive: true, force: true });
       out({ ok: true, action: "updated", version, dir: target, source: usedSource });
       return;
     }
@@ -366,4 +415,12 @@ function main() {
   }
 }
 
-main();
+// 测试钩子：被 install-dsh.test.mjs import 时不执行 main（argv[1] 是测试文件）；
+// 直接运行时（argv[1] 是自身）执行 main。
+const invokedByTest = process.argv[1]?.endsWith?.("install-dsh.test.mjs");
+if (!invokedByTest) {
+  main();
+}
+
+// 导出供测试（顶层 export 是 ESM 静态约束）
+export { restoreBackup, copyTree, copyTreeFallback, smokeTest, readInstalled, writeInstalled };

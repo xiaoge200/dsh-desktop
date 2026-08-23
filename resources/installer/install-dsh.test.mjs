@@ -19,6 +19,9 @@ import { dirname } from "node:path";
 
 const INSTALLER = fileURLToPath(new URL("./install-dsh.mjs", import.meta.url));
 
+// 顶层 import：install-dsh.mjs 检测到测试进程时不执行 main，仅导出内部函数
+const { restoreBackup, copyTreeFallback } = await import("./install-dsh.mjs");
+
 function runInstaller(args, timeout = 300_000) {
   return spawnSync(process.execPath, [INSTALLER, ...args], {
     encoding: "utf8",
@@ -36,11 +39,10 @@ test("copyTreeFallback 逐文件复制包含子目录与内容", () => {
   writeFileSync(join(src, "a.txt"), "hello");
   writeFileSync(join(src, "sub", "b.txt"), "world");
 
-  const { copyTreeFallback } = import("./install-dsh.mjs").catch(() => ({}));
-  // copyTreeFallback 未导出——改为通过 prepare 端到端验证（见下个测试）
-  // 这里直接用 Node 语义验证"复制工具路径分支"是否可执行：
-  // 若 install-dsh.mjs 在 prepare 中调用 copyTree（robocopy/cp），则端到端测试覆盖。
-  assert.ok(existsSync(src), "src prepared");
+  copyTreeFallback(src, dst);
+  assert.equal(readFileSync(join(dst, "a.txt"), "utf8"), "hello");
+  assert.equal(readFileSync(join(dst, "sub", "b.txt"), "utf8"), "world");
+
   rmSync(src, { recursive: true, force: true });
   rmSync(dst, { recursive: true, force: true });
 });
@@ -126,4 +128,51 @@ test("未知模式拒绝", () => {
   const target = join(tmpdir(), `dsh-test-unknown-${process.pid}`);
   const r = runInstaller(["bogus", "--target", target], 30_000);
   assert.notEqual(r.status, 0);
+});
+
+// ---- 回滚机制（R7/R10）：直接单元测试 restoreBackup ----
+test("restoreBackup 恢复旧版本并清理备份", () => {
+  const target = join(tmpdir(), `dsh-test-rb-${process.pid}`);
+  const bak = join(tmpdir(), ".dsh-runtime-bak");
+  rmSync(target, { recursive: true, force: true });
+  rmSync(bak, { recursive: true, force: true });
+
+  // 备份目录 = 旧版本（含 bin.js 与 .installed.json）
+  mkdirSync(join(bak, "node_modules", "@deepseek-ai", "dsh", "lib"), { recursive: true });
+  writeFileSync(join(bak, "node_modules", "@deepseek-ai", "dsh", "lib", "bin.js"), "#!/usr/bin/env node\nconsole.log('0.9.0');\n");
+  writeFileSync(join(bak, "node_modules", "@deepseek-ai", "dsh", "package.json"), JSON.stringify({ name: "@deepseek-ai/dsh", version: "0.9.0" }));
+  writeFileSync(join(bak, ".installed.json"), JSON.stringify({ version: "0.9.0" }));
+
+  // 目标目录 = 被破坏的新版本（半成品）
+  mkdirSync(join(target, "node_modules"), { recursive: true });
+  writeFileSync(join(target, "broken.txt"), "partial install");
+
+  restoreBackup(target, bak, true);
+
+  // 恢复后：目标含旧版 bin 与 .installed.json，半成品消失，备份已清理
+  assert.ok(existsSync(join(target, "node_modules", "@deepseek-ai", "dsh", "lib", "bin.js")), "旧版 bin 恢复");
+  assert.equal(JSON.parse(readFileSync(join(target, ".installed.json"), "utf8")).version, "0.9.0");
+  assert.ok(!existsSync(join(target, "broken.txt")), "半成品清除");
+  assert.ok(!existsSync(bak), "备份清理");
+
+  rmSync(target, { recursive: true, force: true });
+});
+
+test("restoreBackup 无备份时安全跳过", () => {
+  const target = join(tmpdir(), `dsh-test-rb-none-${process.pid}`);
+  const bak = join(tmpdir(), `.dsh-runtime-bak-none-${process.pid}`);
+  rmSync(target, { recursive: true, force: true });
+  rmSync(bak, { recursive: true, force: true });
+  mkdirSync(target, { recursive: true });
+  writeFileSync(join(target, "x.txt"), "1");
+
+  // hasBackup=false：不应动 target
+  restoreBackup(target, bak, false);
+  assert.ok(existsSync(join(target, "x.txt")));
+
+  // hasBackup=true 但备份目录不存在：也不应破坏 target
+  restoreBackup(target, bak, true);
+  assert.ok(existsSync(join(target, "x.txt")));
+
+  rmSync(target, { recursive: true, force: true });
 });
