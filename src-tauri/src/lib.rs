@@ -500,7 +500,14 @@ pub fn run() {
                         });
                     }
                     "quit" => {
-                        app.exit(0);
+                        // 先停服务（杀进程树），再退出；避免残留 dsh/node 进程
+                        let handle = app.clone();
+                        std::thread::spawn(move || {
+                            let state = handle.state::<AppState>();
+                            state.supervisor.lock().unwrap().stop();
+                            std::thread::sleep(Duration::from_millis(300));
+                            handle.exit(0);
+                        });
                     }
                     _ => {}
                 })
