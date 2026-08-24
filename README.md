@@ -173,7 +173,7 @@ dsh-desktop/
 
 ## 📄 开源许可
 
-> ⚠️ 待补充：请选择一个开源协议（如 MIT / Apache-2.0），添加 `LICENSE` 文件后在此处更新。
+本项目基于 **Apache License 2.0** 开源，详见 [LICENSE](LICENSE)。
 
 ---
 
