@@ -38,5 +38,13 @@ jobs:
       - name: Install frontend dependencies
         run: npm ci
 
+      # tauri-build 在编译期会校验 bundle.resources 路径存在（resources/node、resources/dsh-baseline
+      # 不入库，由 prepare-resources.ps1 在打包时生成）。编译检查不打包，建空目录占位即可通过校验。
+      # 注意：必须用 bash（Windows 默认 powershell 的 mkdir 不认 -p 多参数语法）
+      - name: Create placeholder resource dirs (compile check only)
+        shell: bash
+        run: |
+          mkdir -p resources/node resources/dsh-baseline
+
       - name: Compile check (no bundle)
         run: npm run tauri build -- --no-bundle

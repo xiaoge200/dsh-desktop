@@ -66,11 +66,11 @@ jobs:
       - name: Install frontend dependencies
         run: npm ci
 
-      # 下载内置 Node 发行版 + 构建 dsh 基线（resources/node、resources/dsh-baseline 不入库，每平台各自生成）
-      # CI 运行在海外节点，走 npmjs 官方源更快更稳
+      # 下载内置 Node 发行版（nodejs.org 官方源）+ 构建 dsh 基线（npmjs 官方源）
+      # resources/node、resources/dsh-baseline 不入库，每平台各自生成
       - name: Prepare bundled resources (Node runtime + dsh baseline)
         shell: pwsh
-        run: ./scripts/prepare-resources.ps1 -Registry https://registry.npmjs.org
+        run: ./scripts/prepare-resources.ps1 -Registry https://registry.npmjs.org -NodeBase https://nodejs.org/dist
 
       - name: Build & publish release assets
         uses: tauri-apps/tauri-action@v0
@@ -105,16 +105,20 @@ jobs:
 
   # tauri-action 的 latest.json 在多平台矩阵下会互相覆盖（tauri-apps/tauri-action#409、#927），
   # 因此这里统一由本任务基于各平台 .sig 签名文件合并生成完整的更新清单。
+  # 注意：secrets 不能用于 job 级 if（GitHub 限制），改为 job 级 env 传标志，各步骤按标志跳过。
   merge-updater-json:
     name: Merge updater manifest (latest.json)
-    if: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY != '' }}
+    env:
+      HAS_SIGNING_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY != '' }}
     needs: build
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        if: env.HAS_SIGNING_KEY == 'true'
 
       - name: Resolve tag & repo
         id: meta
+        if: env.HAS_SIGNING_KEY == 'true'
         shell: bash
         run: |
           VERSION="$(node -p "require('./src-tauri/tauri.conf.json').version")"
@@ -122,6 +126,7 @@ jobs:
           echo "repo=${{ github.repository }}" >> "$GITHUB_OUTPUT"
 
       - name: Download release assets
+        if: env.HAS_SIGNING_KEY == 'true'
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -130,6 +135,7 @@ jobs:
           gh release download "${{ steps.meta.outputs.tag }}" --dir assets --clobber
 
       - name: Merge latest.json
+        if: env.HAS_SIGNING_KEY == 'true'
         shell: bash
         run: |
           node scripts/merge-updater-json.mjs \
@@ -138,6 +144,7 @@ jobs:
             --tag "${{ steps.meta.outputs.tag }}"
 
       - name: Upload latest.json
+        if: env.HAS_SIGNING_KEY == 'true'
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
