@@ -72,14 +72,41 @@ jobs:
         shell: pwsh
         run: ./scripts/prepare-resources.ps1 -Registry https://registry.npmjs.org -NodeBase https://nodejs.org/dist
 
-      - name: Build & publish release assets
+      # macOS 签名/公证：APPLE_* Secret 缺失时不能把空值传给 tauri（会被当成"提供了证书"
+      # 去 security import，报 failed to import keychain certificate），因此按证书是否存在拆成两步。
+      # 未配置证书 → 无 APPLE_* 环境变量，产出未签名 dmg（首次打开右键 →「打开」）。
+      - name: Build & publish release assets (unsigned)
+        if: ${{ secrets.APPLE_CERTIFICATE == '' }}
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           # updater 签名（缺失则跳过签名与更新清单，构建仍成功）
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-          # macOS 签名 + 公证（缺失则产出未签名 dmg）
+        with:
+          tagName: v__VERSION__
+          releaseName: 'DSH 工作台 v__VERSION__'
+          releaseBody: |
+            ## DSH 工作台 v__VERSION__
+
+            本版本由 GitHub Actions 自动构建。
+
+            - **Windows**：`*-setup.exe`（NSIS，免管理员安装）
+            - **macOS Intel**：`*-x64.dmg`
+            - **macOS Apple Silicon**：`*-aarch64.dmg`
+
+            > macOS 安装包在未配置签名/公证前为未签名版本，首次打开请右键 →「打开」。
+          releaseDraft: true
+          prerelease: false
+          args: --bundles ${{ matrix.bundles }}
+
+      - name: Build & publish release assets (signed)
+        if: ${{ secrets.APPLE_CERTIFICATE != '' }}
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
@@ -97,8 +124,6 @@ jobs:
             - **Windows**：`*-setup.exe`（NSIS，免管理员安装）
             - **macOS Intel**：`*-x64.dmg`
             - **macOS Apple Silicon**：`*-aarch64.dmg`
-
-            > macOS 安装包在未配置签名/公证前为未签名版本，首次打开请右键 →「打开」。
           releaseDraft: true
           prerelease: false
           args: --bundles ${{ matrix.bundles }}
