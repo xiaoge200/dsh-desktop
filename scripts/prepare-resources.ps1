@@ -3,6 +3,7 @@
 # 用法：
 #   pwsh scripts/prepare-resources.ps1          # 下载 Node 24.9.0 并按当前平台解包
 #   pwsh scripts/prepare-resources.ps1 -NodeVer v24.9.0 -SkipBaseline
+#   pwsh scripts/prepare-resources.ps1 -DshVer 0.1.1-rc.2   # 固定 dsh 基线版本（默认 latest）
 #
 # 产物：
 #   resources/node/<platform>/   内置 Node 发行版（含 npm）
@@ -13,7 +14,8 @@
 param(
   [string]$NodeVer = "v24.9.0",
   [switch]$SkipBaseline,
-  [string]$Registry = "https://registry.npmmirror.com"
+  [string]$Registry = "https://registry.npmmirror.com",
+  [string]$DshVer = "latest"
 )
 
 $ErrorActionPreference = "Stop"
@@ -21,10 +23,12 @@ $root = Split-Path -Parent $PSScriptRoot
 
 function Get-NodePlatformDir {
   if ($IsWindows) { return "win-x64" }
-  if ($IsMacOS) {
-    return if ($env:PROCESSOR_ARCHITECTURE -match "ARM") { "mac-arm64" } else { "mac-x64" }
-  }
-  return if ($env:PROCESSOR_ARCHITECTURE -match "ARM") { "linux-arm64" } else { "linux-x64" }
+  # macOS/Linux 下 PROCESSOR_ARCHITECTURE 是 Windows 专属变量（恒为空），须用 uname 判断真实架构
+  $arch = (& uname -m) 2>$null
+  if (-not $arch) { $arch = $env:PROCESSOR_ARCHITECTURE }
+  $isArm = $arch -match "arm|aarch64"
+  if ($IsMacOS) { return if ($isArm) { "mac-arm64" } else { "mac-x64" } }
+  return if ($isArm) { "linux-arm64" } else { "linux-x64" }
 }
 
 $plat = Get-NodePlatformDir
@@ -73,7 +77,7 @@ if (-not $SkipBaseline) {
     if (Test-Path $work) { Remove-Item $work -Recurse -Force }
     New-Item -ItemType Directory -Force -Path $work | Out-Null
     Push-Location $work
-    npm install @deepseek-ai/dsh@latest --no-audit --no-fund --registry $Registry --loglevel=error
+    npm install "@deepseek-ai/dsh@$DshVer" --no-audit --no-fund --registry $Registry --loglevel=error
     Pop-Location
     New-Item -ItemType Directory -Force -Path $baseline | Out-Null
     Move-Item "$work\node_modules" "$baseline\node_modules" -Force

@@ -1,0 +1,42 @@
+# ci.yml — PR / main 分支的快速编译检查（不打包、不发版）
+#
+# 只做编译验证（tauri build --no-bundle），跑在 Windows 与 macOS 上；
+# 发布打包见 .github/workflows/release.yml。
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check:
+    name: Compile check (${{ matrix.platform }})
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [windows-latest, macos-latest]
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Compile check (no bundle)
+        run: npm run tauri build -- --no-bundle

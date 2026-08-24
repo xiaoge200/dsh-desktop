@@ -485,7 +485,11 @@ async fn check_app_update(app: AppHandle) -> Result<Option<String>, String> {
     let placeholder = endpoints
         .map(|a| {
             a.iter()
-                .any(|e| e.as_str().map(|s| s.contains("your-update-server")).unwrap_or(false))
+                .any(|e| {
+                    e.as_str()
+                        .map(|s| s.contains("your-update-server") || s.contains("<OWNER>"))
+                        .unwrap_or(false)
+                })
         })
         .unwrap_or(false);
     if !configured || placeholder {

@@ -1,0 +1,93 @@
+#!/usr/bin/env node
+/**
+ * merge-updater-json.mjs
+ *
+ * 将 GitHub Release 上各平台的安装包 + .sig 签名文件，合并生成 Tauri updater
+ * 所需的 latest.json（应用内自动更新的版本清单）。
+ *
+ * 背景：tauri-action 的多平台矩阵任务各自生成的 latest.json 会互相覆盖
+ * （tauri-apps/tauri-action#409、#927），因此统一由本脚本从 .sig 文件重建完整清单。
+ *
+ * 用法：
+ *   node scripts/merge-updater-json.mjs \
+ *     --assets <下载目录> \
+ *     --repo <owner/repo> \
+ *     --tag <vX.Y.Z> \
+ *     [--notes "更新说明"] \
+ *     [--out latest.json]
+ *
+ * 版本号自动从 src-tauri/tauri.conf.json 读取，无需手工传入。
+ */
+import { readdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { join, resolve, dirname } from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+const scriptDir = dirname(fileURLToPath(import.meta.url));
+const repoRoot = resolve(scriptDir, '..');
+
+function parseArgs(argv) {
+  const out = {};
+  for (let i = 0; i < argv.length; i += 2) {
+    out[argv[i].replace(/^--/, '')] = argv[i + 1];
+  }
+  return out;
+}
+
+const args = parseArgs(process.argv.slice(2));
+const assetsDir = args.assets;
+const repo = args.repo; // 例如 user/dsh-desktop
+const tag = args.tag; // 例如 v0.1.0
+const notes = args.notes ?? '';
+const outFile = args.out ?? 'latest.json';
+
+if (!assetsDir || !repo || !tag) {
+  console.error(
+    '用法: node scripts/merge-updater-json.mjs --assets <目录> --repo <owner/repo> --tag <vX.Y.Z> [--notes ".."] [--out latest.json]'
+  );
+  process.exit(1);
+}
+
+const { version } = JSON.parse(
+  readFileSync(join(repoRoot, 'src-tauri', 'tauri.conf.json'), 'utf8')
+);
+
+/** 根据产物文件名推断 updater 平台 key（与 Tauri 约定一致） */
+function platformKey(filename) {
+  if (filename.endsWith('.exe')) return 'windows-x86_64'; // NSIS 安装包
+  if (filename.endsWith('.app.tar.gz')) {
+    if (filename.includes('aarch64')) return 'darwin-aarch64';
+    if (filename.includes('universal')) return 'darwin-universal';
+    if (filename.includes('x64') || filename.includes('amd64')) return 'darwin-x86_64';
+  }
+  return null;
+}
+
+const platforms = {};
+for (const file of readdirSync(assetsDir)) {
+  if (!file.endsWith('.sig')) continue;
+  const base = file.slice(0, -'.sig'.length); // 去掉 .sig 后缀
+  const key = platformKey(base);
+  if (!key) continue;
+  const signature = readFileSync(join(assetsDir, file), 'utf8').trim();
+  const url = `https://github.com/${repo}/releases/download/${tag}/${encodeURIComponent(base)}`;
+  platforms[key] = { signature, url };
+  console.log(`  [OK] ${key.padEnd(18)} <- ${base}`);
+}
+
+if (Object.keys(platforms).length === 0) {
+  console.error(
+    '未找到任何 .sig 签名文件。请确认 TAURI_SIGNING_PRIVATE_KEY 已配置且构建任务确实产出了签名。'
+  );
+  process.exit(1);
+}
+
+const manifest = {
+  version,
+  notes,
+  pub_date: new Date().toISOString(),
+  platforms,
+};
+
+const outPath = join(assetsDir, outFile);
+writeFileSync(outPath, JSON.stringify(manifest, null, 2), 'utf8');
+console.log(`==> 已生成 ${outPath}（${Object.keys(platforms).length} 个平台）`);

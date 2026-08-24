@@ -38,9 +38,9 @@
   },
   "plugins": {
     "updater": {
-      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDIxNjU4NEE1QTdDMDI0M0QKUldROUpNQ25wWVJsSVdFeml0eHovNWcyck5BdTZHOWdNRHk3VG8zbjNPNkxzVkUxWWNWYnJRUHUK",
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDVDMUQyMkQ0ODg1Q0E0MTIKUldRU3BGeUkxQ0lkWEl4WFNWdXZYMWoybG9ybHAyZ3lBMEJOcm5qU21IWjJyNFdvRU9FaWhlVGsK",
       "endpoints": [
-        "https://your-update-server.example.com/{{target}}/{{arch}}/{{current_version}}"
+        "https://github.com/xiaoge200/dsh-desktop/releases/latest/download/latest.json"
       ]
     }
   },

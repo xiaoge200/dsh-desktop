@@ -1,0 +1,145 @@
+# release.yml — 打 tag 后自动构建并发布（Windows / macOS）
+#
+# 触发方式：
+#   1. 更新版本号（tauri.conf.json + Cargo.toml + package.json，保持一致）
+#   2. git tag v0.1.0 && git push origin v0.1.0
+#   3. Actions 自动构建三份产物，发布为 Draft Release，人工确认后公开
+#
+# 产物：
+#   - Windows:  NSIS per-user 安装包（*-setup.exe）
+#   - macOS:    Intel (x64) 与 Apple Silicon (arm64) 的 .app.tar.gz + .dmg
+#   - 更新清单: latest.json（由 merge-updater-json 任务合并各平台签名生成）
+#
+# 可选 Secrets（未配置则跳过对应能力，构建不受影响）：
+#   TAURI_SIGNING_PRIVATE_KEY / TAURI_SIGNING_PRIVATE_KEY_PASSWORD
+#     —— updater 签名，缺失则应用内自动更新不可用
+#   APPLE_CERTIFICATE / APPLE_CERTIFICATE_PASSWORD / APPLE_SIGNING_IDENTITY
+#   APPLE_ID / APPLE_PASSWORD / APPLE_TEAM_ID
+#     —— macOS Developer ID 签名 + 公证，缺失则 dmg 未签名（Gatekeeper 会拦截）
+
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build (${{ matrix.platform }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: windows-latest
+            bundles: nsis
+          - platform: macos-13 # Intel (x64)
+            bundles: app,dmg
+          - platform: macos-14 # Apple Silicon (arm64)
+            bundles: app,dmg
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      # 下载内置 Node 发行版 + 构建 dsh 基线（resources/node、resources/dsh-baseline 不入库，每平台各自生成）
+      # CI 运行在海外节点，走 npmjs 官方源更快更稳
+      - name: Prepare bundled resources (Node runtime + dsh baseline)
+        shell: pwsh
+        run: ./scripts/prepare-resources.ps1 -Registry https://registry.npmjs.org
+
+      - name: Build & publish release assets
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # updater 签名（缺失则跳过签名与更新清单，构建仍成功）
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          # macOS 签名 + 公证（缺失则产出未签名 dmg）
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        with:
+          tagName: v__VERSION__
+          releaseName: 'DSH 工作台 v__VERSION__'
+          releaseBody: |
+            ## DSH 工作台 v__VERSION__
+
+            本版本由 GitHub Actions 自动构建。
+
+            - **Windows**：`*-setup.exe`（NSIS，免管理员安装）
+            - **macOS Intel**：`*-x64.dmg`
+            - **macOS Apple Silicon**：`*-aarch64.dmg`
+
+            > macOS 安装包在未配置签名/公证前为未签名版本，首次打开请右键 →「打开」。
+          releaseDraft: true
+          prerelease: false
+          args: --bundles ${{ matrix.bundles }}
+
+  # tauri-action 的 latest.json 在多平台矩阵下会互相覆盖（tauri-apps/tauri-action#409、#927），
+  # 因此这里统一由本任务基于各平台 .sig 签名文件合并生成完整的更新清单。
+  merge-updater-json:
+    name: Merge updater manifest (latest.json)
+    if: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY != '' }}
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve tag & repo
+        id: meta
+        shell: bash
+        run: |
+          VERSION="$(node -p "require('./src-tauri/tauri.conf.json').version")"
+          echo "tag=v${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "repo=${{ github.repository }}" >> "$GITHUB_OUTPUT"
+
+      - name: Download release assets
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          rm -rf assets && mkdir -p assets
+          gh release download "${{ steps.meta.outputs.tag }}" --dir assets --clobber
+
+      - name: Merge latest.json
+        shell: bash
+        run: |
+          node scripts/merge-updater-json.mjs \
+            --assets assets \
+            --repo "${{ steps.meta.outputs.repo }}" \
+            --tag "${{ steps.meta.outputs.tag }}"
+
+      - name: Upload latest.json
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload "${{ steps.meta.outputs.tag }}" assets/latest.json --clobber

@@ -1,121 +1,180 @@
-# DSH 工作台（dsh-desktop）
+<div align="center">
 
-将 DSH（DeepSeek Harness）Web 封装为跨平台桌面应用：**内置 Node 运行时 + 安装后自动获取最新 DSH 包 + 本地运行 + WebView 纯内嵌**。
+# 🐳 DSH 工作台（DSH Desktop）
 
-需求与设计文档见 [`dsh-desktop-plan.md`](../dsh-desktop-plan.md)。
+**把 DeepSeek Harness（DSH）装进桌面的跨平台应用 —— 下载、双击、开聊。**
 
-## 特性
+![version](https://img.shields.io/badge/version-0.1.0-2f6fed)
+![platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-9cf)
+[![CI](https://github.com/xiaoge200/dsh-desktop/actions/workflows/ci.yml/badge.svg)](https://github.com/xiaoge200/dsh-desktop/actions/workflows/ci.yml)
+![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen)
 
-- 🖥️ Tauri v2 壳（Windows / macOS / Linux）
-- 📦 内置 Node 24 LTS（随安装包分发，含 npm，不依赖系统环境）
-- 🔄 启动时自动安装/更新最新 `@deepseek-ai/dsh`（npm registry，官方源失败自动切国内镜像）
-- 🪟 WebView 纯内嵌 DSH Web 界面（无系统浏览器依赖）
-- 🧩 托盘常驻、单实例、服务健康检查与限次自动重启
-- 🛡️ 服务仅绑定 `127.0.0.1`（沿用 dsh 安全默认，`0.0.0.0` 被上游禁用）
-- 💬 全白话错误提示（技术术语只进日志）
+</div>
 
-## 目录结构
+---
+
+## 📖 目录
+
+- [这是什么？](#-这是什么)
+- [为什么要做它？](#-为什么要做它)
+- [功能一览](#-功能一览)
+- [快速开始（新手教程）](#-快速开始新手教程)
+- [常见问题（FAQ）](#-常见问题faq)
+- [开发者指南（从源码构建）](#-开发者指南从源码构建)
+- [项目结构](#-项目结构简版)
+- [参与贡献](#-参与贡献)
+- [开源许可](#-开源许可)
+
+---
+
+## 这是什么？🤔
+
+DSH（DeepSeek Harness）是一个**运行在你本地电脑上**的 AI 智能体工具。过去想用它，你得先装好 Node.js，再在命令行里敲一堆指令——对不熟悉编程的朋友来说，光是"装环境"这一步就够劝退了。
+
+**DSH 工作台**把这一切打包解决掉了：
+
+- 装好就能用，**不需要装 Node.js、不需要碰命令行**
+- 首次启动自动初始化，之后**秒开**，**没网也能用**
+- 有新版**自动升级**，失败了还会自动退回旧版，你什么都不用管
+
+简单说：这是一个"零门槛"的 DSH 桌面版。
+
+## 为什么要做它？💡
+
+| 新手会遇到的问题 | 我们的解法 |
+|---|---|
+| 要装 Node.js、配置环境，劝退小白 | 安装包内置 Node 运行时，双击即装 |
+| 首次安装依赖要等半小时 | 内置完整 DSH 依赖包，首启即用 |
+| 命令行操作看不懂 | 图形界面 + 全白话提示，技术细节自动折叠 |
+| 升级麻烦、容易装坏 | 后台自动更新，失败自动回滚，全程不打扰 |
+
+## ✨ 功能一览
+
+- 🖥️ **跨平台**：Windows / macOS / Linux 都能装
+- 📦 **免环境**：内置 Node 运行时，不依赖系统环境
+- ⚡ **秒级启动**：首次初始化后开箱即用，完全离线可用
+- 🔄 **自动更新**：DSH 有新版本自动安装，网络不稳会自动切换镜像源
+- 🪟 **独立窗口**：DSH 界面直接嵌入应用，不依赖系统浏览器
+- 🧩 **托盘常驻**：关窗口最小化到托盘，随时一键唤回
+- 🌐 **中英双语**：界面随系统语言自动切换
+- 🛡️ **安全本地运行**：服务只在本机运行，不对外网开放
+- 💬 **小白友好**：所有提示都说人话，出错了也知道该怎么办
+
+> 📸 **截图位**：上传后建议补充 3 张截图（主界面 / 设置页 / 首次引导页），放到 `docs/screenshots/` 并在下方替换：
+>
+> ![主界面](docs/screenshots/main.png) ![设置页](docs/screenshots/settings.png)
+
+## 🚀 快速开始（新手教程）
+
+> 完全没接触过的小伙伴，照下面 3 步走就行。
+
+### 第 1 步：下载安装包
+
+1. 打开本仓库的 **Releases（发行版）** 页面：<https://github.com/xiaoge200/dsh-desktop/releases>
+2. 选择最新版本，下载对应系统的安装包：
+   - **Windows**：`.msi` / `.exe`（要求 Win10 及以上，无需管理员权限）
+   - **macOS**：`.dmg`（要求 macOS 11 及以上）
+   - **Linux**：`.deb` / `.rpm` / `.AppImage`（需 webkit2gtk 运行库）
+3. 双击安装包，一路点「下一步」完成安装
+
+### 第 2 步：启动
+
+安装完成后，桌面会出现 **DSH 工作台** 的图标，双击打开。
+
+- 首次启动会做一次性初始化，**大约一两分钟**（视电脑速度而定），进度页会实时显示状态
+- 之后每次启动都是秒开
+
+### 第 3 步：开始使用
+
+界面加载完成后，就是 DSH 的工作台了，像普通聊天软件一样直接用就好。
+
+**日常使用小贴士：**
+
+| 想做的事 | 怎么做 |
+|---|---|
+| 最小化到托盘 | 直接点窗口右上角的「关闭」按钮 |
+| 再次打开 | 点系统托盘里的 🐳 图标 →「打开界面」 |
+| 开机自启 | 托盘菜单 →「设置」→ 打开「开机自启」 |
+| 关闭自动更新 | 托盘菜单 →「设置」→ 关闭「自动更新」 |
+| 彻底退出 | 托盘菜单 →「退出」 |
+
+## ❓ 常见问题（FAQ）
+
+**Q：需要安装 Node.js 吗？**
+不需要。Node 运行时已内置在安装包里，打开就能用。
+
+**Q：没有网络可以用吗？**
+可以。内置的 DSH 完全离线可用；后台更新才需要网络，没网时它会安静跳过，不影响使用。
+
+**Q：我的数据存在哪里？**
+存在你电脑的用户目录下（Windows 为 `%APPDATA%\com.dsh.desktop`）。卸载应用时数据默认保留，重装不丢。
+
+**Q：怎么卸载？**
+Windows 在「设置 → 应用」里找到 DSH 工作台卸载即可，无需管理员权限。卸载只删除程序本体，你的数据会保留。
+
+**Q：提示端口被占用怎么办？**
+不用管。端口被占用时应用会自动换一个空闲端口，对你完全无感。
+
+**Q：DSH 更新失败会怎样？**
+不会坏。更新前会自动备份旧版本，新版本装不上会**自动回滚**，下次启动再重试，全程不打扰你。
+
+**Q：杀毒软件拦截 / 误报怎么办？**
+如果被杀毒软件拦截，请把安装包或安装目录加入信任白名单后重新安装；仍不行的话，欢迎到 Issue 区反馈给我们。
+
+**Q：打开后界面是英文/中文，能切换吗？**
+界面语言跟随系统语言自动切换（中英双语），无需手动设置。
+
+## 🛠️ 开发者指南（从源码构建）
+
+> 想自己编译、二次开发或贡献代码的看这里；普通用户直接跳过本节。
+
+**前置要求**：Rust 1.77+、Node 18+，以及各平台的 [Tauri 系统依赖](https://tauri.app/start/prerequisites/)。
+
+```bash
+# 1. 安装依赖
+npm install
+
+# 2. 开发模式运行（带热更新）
+npm run tauri dev
+
+# 3. 打包安装包
+npm run tauri build
+```
+
+> 注意：`npm install` 依赖 npm 脚本执行（`@tauri-apps/cli`、`esbuild` 需要 postinstall）。若你的环境开启了 npm `allow-scripts` 策略，需在 `.npmrc` 的 `allow-scripts` 中放行它们。
+
+## 🗂️ 项目结构（简版）
 
 ```
 dsh-desktop/
-├─ src/                     # 前端（boot 进度页）
-├─ src-tauri/               # Rust 壳
-│  ├─ src/
-│  │  ├─ main.rs            # 入口
-│  │  ├─ lib.rs             # Tauri builder / boot 编排 / 托盘 / 单实例 / 右键菜单
-│  │  ├─ state.rs           # 全局状态与启动阶段机
-│  │  ├─ config.rs          # 用户配置（config.json 持久化）
-│  │  ├─ node.rs            # 内置 Node 解析与冒烟、安装器调用
-│  │  ├─ supervisor.rs      # dsh 服务进程托管（spawn/健康检查/重启/清理）
-│  │  └─ logging.rs         # 滚动日志
-│  ├─ capabilities/         # 权限声明
-│  └─ tauri.conf.json
-├─ resources/
-│  ├─ node/                 # 内置 Node 发行版（构建期注入）
-│  ├─ dsh-baseline/         # dsh 基线包（完整依赖树，随安装包分发）
-│  └─ installer/
-│     └─ install-dsh.mjs    # DSH 运行时安装器（prepare/check/update + 回滚 + 镜像）
-├─ scripts/
-│  └─ prepare-resources.ps1 # 本地构建资源准备（下载 Node + 构建基线）
-├─ docs/                    # RELEASE.md（发布手册）、IMPLEMENTATION.md（踩坑记录）
+├─ src/              # 前端界面（启动进度页、设置页）
+├─ src-tauri/        # 桌面壳（Rust / Tauri）
+├─ resources/        # 内置运行时资源（构建期注入）
+├─ scripts/          # 构建脚本
+├─ docs/             # 发布手册与实现文档
 └─ package.json
 ```
 
-## 开发
+## 📚 更多文档
 
-前置：Rust 1.77+、Node 18+、平台系统依赖（见 [Tauri 文档](https://tauri.app/start/prerequisites/)）。
+- [发布手册 `docs/RELEASE.md`](docs/RELEASE.md) —— 如何发布新版本
+- [实现记录 `docs/IMPLEMENTATION.md`](docs/IMPLEMENTATION.md) —— 开发中的踩坑记录
+- [更新日志 `CHANGELOG.md`](CHANGELOG.md)
 
-```bash
-npm install
-npm run tauri dev      # 开发模式
-npm run tauri build    # 构建安装包
-```
+## 🤝 参与贡献
 
-> 注意：`npm install` 依赖 npm 的脚本执行（`@tauri-apps/cli`、`esbuild` 需要 postinstall）。
-> 若环境启用了 npm `allow-scripts` 策略，需在项目 `.npmrc` 的 `allow-scripts` 中放行它们。
+欢迎任何形式的贡献！你可以：
 
-## 打包与运行机制
+- 🐛 提 **Issue**：报告 bug、提出新功能建议
+- ✨ 提 **PR**：修 bug、加功能、改进文档
+- 💬 在讨论区分享使用心得
 
-### dsh 是怎么打包进安装包的
+给本项目点个 ⭐，也是对我们最大的鼓励！
 
-安装包里内置了一份 **dsh 完整基线**（`resources/dsh-baseline`，包含 `@deepseek-ai/dsh`
-及其全部 511 个依赖包，解压约 192MB，NSIS 压缩后约 25MB）。当前基线版本为
-`0.1.1-rc.2`，由 `scripts/prepare-resources.ps1` 构建，随安装包分发。
+## 📄 开源许可
 
-> 为什么内置基线：实测 `npm install @deepseek-ai/dsh` 需下载 511 包、约 30 分钟，
-> 0 门槛下不可接受。内置基线让**首次启动秒级就绪、完全离线可用**。
+> ⚠️ 待补充：请选择一个开源协议（如 MIT / Apache-2.0），添加 `LICENSE` 文件后在此处更新。
 
-### 运行时用的是副本，不是安装包里的那份
+---
 
-安装包里的基线是"种子"（只读、不可变），**首次启动时会复制一份到用户数据目录**：
-
-```
-安装包内的基线  <安装目录>\dsh-baseline\node_modules\
-   │  首次启动 install-dsh.mjs prepare（robocopy/cp，约 1 分钟内）
-   ▼
-运行副本  %APPDATA%\com.dsh.desktop\dsh-runtime\node_modules\   ← 真正运行
-```
-
-复制而不是直接用安装目录里的，原因：
-
-| 原因 | 说明 |
-|---|---|
-| 可更新 | 安装目录可能受系统保护；副本在用户目录可自由写入，后台更新不破坏安装 |
-| 可回滚 | 更新前备份 `.dsh-runtime-bak`，新版本装坏自动恢复旧版 |
-| 卸载保留 | 卸载只删安装目录，用户数据（含 dsh 运行时）默认保留 |
-
-### 两个"版本"概念的区分
-
-| 版本 | 位置 | 更新方式 |
-|---|---|---|
-| 安装包内的基线 | `<安装目录>\dsh-baseline\` | 随应用壳发版（重打安装包） |
-| 实际运行的 dsh | `%APPDATA%\com.dsh.desktop\dsh-runtime\` | 后台自动更新（npm + 镜像切换 + 完整性校验 + 回滚） |
-
-### 完整生命周期
-
-```
-1. 安装包（NSIS per-user）→ 释放内置 Node + dsh 基线到安装目录
-2. 首次启动 → install-dsh.mjs prepare
-   ├─ dsh-runtime 无效/不存在 → 从安装目录基线复制（不联网）
-   └─ dsh-runtime 有效 → 直接复用（秒级，二次启动 ~4.5s 就绪）
-3. 启动服务：node <dsh-runtime>\...\lib\bin.js web --no-open --port <port>
-4. 后台线程 → check（npm view 查最新版；离线 0.1s 快速跳过）
-   └─ 有新版本 → update（npm install 到 dsh-runtime + 备份回滚）→ 下次启动生效
-```
-
-## 运行机制
-
-1. 启动 → 校验内置 Node（`node --version` 冒烟）
-2. 运行 `install-dsh.mjs prepare`：无有效安装时从**内置基线**（`resources/dsh-baseline`，随安装包分发）快速复制到 `appData/dsh-runtime`（秒级，不依赖网络）
-3. 后台 `install-dsh.mjs check/update`：`npm view @deepseek-ai/dsh version` 对比 → 有新版本自动安装（官方源失败自动切 npmmirror，带回滚），失败不打扰用户，下次启动重试
-4. spawn `node <dsh>/lib/bin.js web --no-open --port <port>`（默认 3080，被占用自动换空闲端口，用户无感）
-5. 健康检查（HTTP GET /）通过后，WebView 装载 `http://127.0.0.1:<port>`
-6. 关闭窗口 → 最小化到托盘；托盘「退出」→ 清理 dsh 进程树后退出
-
-## 平台说明
-
-| 平台 | 说明 |
-|---|---|
-| Windows | NSIS per-user 安装（免管理员）；WebView2（Win10/11 自带或引导安装） |
-| macOS | 需 Developer ID 签名 + 公证（内置 Node 二进制有 quarantine 限制）；WKWebView |
-| Linux | deb/rpm/AppImage；依赖 webkit2gtk-4.1 |
+*本项目是 DSH（DeepSeek Harness）的桌面封装，与 DeepSeek 官方无隶属关系。*
