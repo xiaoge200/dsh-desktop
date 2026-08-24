@@ -46,6 +46,9 @@ jobs:
           - platform: macos-14 # Apple Silicon (arm64)
             bundles: app,dmg
     runs-on: ${{ matrix.platform }}
+    # secrets 不能用于 job/step 级 if（GitHub 限制），用 job 级 env 传标志供步骤判断
+    env:
+      HAS_APPLE_CERT: ${{ secrets.APPLE_CERTIFICATE != '' }}
     steps:
       - uses: actions/checkout@v5
 
@@ -76,7 +79,7 @@ jobs:
       # 去 security import，报 failed to import keychain certificate），因此按证书是否存在拆成两步。
       # 未配置证书 → 无 APPLE_* 环境变量，产出未签名 dmg（首次打开右键 →「打开」）。
       - name: Build & publish release assets (unsigned)
-        if: ${{ secrets.APPLE_CERTIFICATE == '' }}
+        if: env.HAS_APPLE_CERT == 'false'
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -101,7 +104,7 @@ jobs:
           args: --bundles ${{ matrix.bundles }}
 
       - name: Build & publish release assets (signed)
-        if: ${{ secrets.APPLE_CERTIFICATE != '' }}
+        if: env.HAS_APPLE_CERT == 'true'
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
