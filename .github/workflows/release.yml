@@ -41,11 +41,12 @@ jobs:
         include:
           - platform: windows-latest
             bundles: nsis
-          - platform: macos-13 # Intel (x64)
+          - platform: macos-15-intel # Intel (x64)
             bundles: app,dmg
-          - platform: macos-14 # Apple Silicon (arm64)
+          - platform: macos-15 # Apple Silicon (arm64)
             bundles: app,dmg
     runs-on: ${{ matrix.platform }}
+    timeout-minutes: 60
     # secrets 不能用于 job/step 级 if（GitHub 限制），用 job 级 env 传标志供步骤判断
     env:
       HAS_APPLE_CERT: ${{ secrets.APPLE_CERTIFICATE != '' }}
