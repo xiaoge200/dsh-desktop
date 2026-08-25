@@ -1,6 +1,7 @@
 mod config;
 mod logging;
 mod node;
+mod plugins;
 mod state;
 mod supervisor;
 
@@ -121,23 +122,24 @@ fn phase_text(p: BootPhase) -> &'static str {
 
 /// 系统语言是否为中文（NFR-10：托盘菜单等原生 UI 文案）
 fn is_zh_locale() -> bool {
+    #[cfg(windows)]
+    {
+        // Windows 优先读系统 UI 语言（注册表）：从 Git Bash 等环境启动时
+        // LANG/LC_ALL 可能被设为 en_US，若环境变量优先会导致托盘误显示英文
+        // （与网页端 navigator.language 不一致）。非中文系统再回退环境变量，
+        // 保留用户用 LANG=zh_* 强制中文的能力。
+        use winapi::um::winnls::GetUserDefaultUILanguage;
+        let lang = unsafe { GetUserDefaultUILanguage() };
+        // 0x0804 = 简体中文，0x1004 = 简体中文（新加坡），0x0404 = 繁体中文（台湾），0x0C04 = 繁体中文（香港）
+        if matches!(lang, 0x0804 | 0x1004 | 0x0404 | 0x0C04) {
+            return true;
+        }
+    }
     std::env::var("LANG")
         .or_else(|_| std::env::var("LC_ALL"))
+        .or_else(|_| std::env::var("LC_MESSAGES"))
         .map(|v| v.to_lowercase().starts_with("zh"))
-        .unwrap_or_else(|_| {
-            // Windows 上无 LANG；读注册表区域设置（尽力而为）
-            #[cfg(windows)]
-            {
-                use winapi::um::winnls::GetUserDefaultUILanguage;
-                let lang = unsafe { GetUserDefaultUILanguage() };
-                // 0x0804 = 简体中文，0x0404 = 繁体中文（台湾），0x0C04 = 繁体中文（香港）
-                lang == 0x0804 || lang == 0x0404 || lang == 0x0C04
-            }
-            #[cfg(not(windows))]
-            {
-                false
-            }
-        })
+        .unwrap_or(false)
 }
 
 fn emit_progress(app: &AppHandle, phase: BootPhase, message: &str) {
@@ -303,6 +305,8 @@ fn boot(app: AppHandle) {
     // 4) 就绪
     state.set_phase(BootPhase::Ready);
     state.clear_error();
+    // 记录当前 bundle 集合（插件页据此提示"重启后生效"）
+    plugins::record_restart(&state);
     let port = state.port();
     log::info!("READY http://127.0.0.1:{port}");
     update_tray_tooltip(&app);
@@ -313,11 +317,11 @@ fn boot(app: AppHandle) {
 
     // 5) 后台检查/更新 DSH（不阻塞使用；失败静默，用户无感）
     let bg_node = state.node_path();
-    let bg_installer = installer_js;
-    let bg_runtime = runtime_dir;
+    let bg_installer = installer_js.clone();
+    let bg_runtime = runtime_dir.clone();
     let cfg = state.config.lock().unwrap().get();
     let auto_update = cfg.auto_update_dsh;
-    let registry_source = cfg.registry_source;
+    let registry_source = cfg.registry_source.clone();
     std::thread::spawn(move || {
         if !auto_update {
             log::info!("bg update: auto-update disabled by user");
@@ -349,6 +353,16 @@ fn boot(app: AppHandle) {
             Err(e) => log::warn!("bg update failed: {e}"),
         }
         // 更新失败不打扰用户（下次启动会重试）；日志可查
+    });
+
+    // 6) 后台确保默认插件（FR-18：dshmarket 市场插件，装进 dsh 网页设置。
+    //    失败静默，下次启动重试；安装后需重启服务才生效——插件页会给出提示）
+    let ap_node = state.node_path();
+    let ap_runtime = runtime_dir;
+    let ap_data = app_data;
+    let ap_registry = cfg.registry_source.clone();
+    std::thread::spawn(move || {
+        plugins::ensure_default_plugin(&ap_node, &ap_runtime, &ap_data, &ap_registry);
     });
 }
 
@@ -389,6 +403,7 @@ fn restart_service(app: AppHandle, state: State<'_, AppState>) -> Result<(), Str
             if sup.wait_ready(Duration::from_secs(30)) {
                 state.set_phase(BootPhase::Ready);
                 state.clear_error();
+                plugins::record_restart(&state);
                 let _ = app.emit(
                     "boot://ready",
                     serde_json::json!({ "url": format!("http://127.0.0.1:{port}") }),
@@ -449,6 +464,7 @@ fn repair_service(app: AppHandle, state: State<'_, AppState>) -> Result<(), Stri
             if sup.wait_ready(Duration::from_secs(30)) {
                 state.set_phase(BootPhase::Ready);
                 state.clear_error();
+                plugins::record_restart(&state);
                 update_tray_tooltip(&app);
                 let _ = app.emit(
                     "boot://ready",
@@ -617,6 +633,7 @@ pub fn run() {
         ))
         .manage(AppState {
             node_path: std::sync::Mutex::new(PathBuf::new()),
+            app_data_dir: std::sync::Mutex::new(PathBuf::new()),
             runtime_dir: std::sync::Mutex::new(PathBuf::new()),
             workspace_dir: std::sync::Mutex::new(PathBuf::new()),
             log_file: std::sync::Mutex::new(PathBuf::new()),
@@ -628,11 +645,12 @@ pub fn run() {
             dsh_extra_args: std::sync::Mutex::new(Vec::new()),
         })
         .setup(move |app| {
-            // 配置存储（appData/config.json）
+            // 配置存储（appData/config.json）+ 应用数据目录（插件快照等）
             if let Ok(data) = app.path().app_data_dir() {
                 let store = config::ConfigStore::new(&data);
                 let state = app.state::<AppState>();
                 *state.config.lock().unwrap() = store;
+                state.set_app_data_dir(data);
             }
             // 日志文件
             if let Ok(data) = app.path().app_data_dir() {
@@ -846,7 +864,12 @@ pub fn run() {
             get_config,
             set_config,
             open_settings,
-            open_context_menu
+            open_context_menu,
+            plugins::plugins_list,
+            plugins::plugins_add,
+            plugins::plugins_remove,
+            plugins::plugins_set_enabled,
+            plugins::plugins_marketplace
         ])
         .run(tauri::generate_context!())
         .expect("error while running dsh-desktop");

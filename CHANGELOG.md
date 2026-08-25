@@ -1,5 +1,31 @@
 # Changelog
 
+## [0.1.1] - 2026-08-25
+
+### 新增
+- 插件管理器（FR-18）：设置窗口新增「插件」卡片
+  - 已安装列表：名称/版本/来源（内置/npm/Git/本地）、启用状态、移除按钮
+  - 安装：支持 npm 包名、`github:owner/repo`、本地绝对路径；第三方来源（Git/本地）安装前安全确认
+  - 启用/禁用：写入 profile 的 `cordis.patch.yml`，dsh 热重载立即生效（无需重启）
+  - 新增/移除 bundle 后提示「重启服务后生效」（重启快照对比机制）
+- 应用市场：浏览 awesome-dsh-plugin 社区目录 + GitHub `dsh-plugin` 主题仓库，搜索并一键安装
+- 默认自动安装 dsh-market 市场插件（npm 包 dshmarket）：启动后台静默安装进 web profile，
+  安装后插件页提示重启生效；成功写标记，用户手动移除后不再装回，失败下次启动重试
+- 完全复用 dsh 官方 Cordis 插件体系（bundle + 补丁层），零新增运行时依赖（内置 npm 安装）
+
+### 技术
+- 后端：新增 `src-tauri/src/plugins.rs`（~1500 行，含 28 个单元测试）
+  - 复刻上游 `dsh plugin` 的 `reconcilePlugins`（bundle 注册进 `dsh.profile.bundles`）与 `initProfile`（profile 模板）
+  - 内置 npm（`npm-cli.js`）安装，`--legacy-peer-deps` 对齐上游 pnpm 的 `autoInstallPeers: false`
+  - 补丁文件用 `serde_yaml::Value` 解析（容忍 `!!js` 标签），追加式写入、原子替换，从不重写用户补丁
+  - 插件操作串行锁 + 异步命令（安装不卡界面）；registry 镜像配置复用（auto 失败自动切 npmmirror）
+- 前端：`src/plugins.ts`（独立模块），i18n 中英双语新增 ~25 键
+- 插件实体安装在 `$DSH_HOME/profiles/web`——dsh 运行时更新（rm -rf 重建）不影响用户插件
+
+### 修复
+- 托盘菜单/tooltip 变英文：Windows 下系统 UI 语言（注册表）优先于环境变量——
+  从 Git Bash 等环境启动时 `LANG=en_US` 不再干扰托盘文案（网页端与托盘语言一致）
+
 ## [0.1.0] - 2026-08-23
 
 ### 新增

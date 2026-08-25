@@ -19,6 +19,7 @@
 | NFR-02 冷启动 | ✅ 达标 | 实测二次启动：服务就绪 ~4.5s（含 dsh 服务自身初始化 ~3s），WebView 跳转后用户可交互；首启含基线复制约 60-90s（文档已注明安装场景除外） |
 | M2 更新与分发 | 🚧 | DSH 自动更新 ✅；Tauri updater 代码+密钥+签名链路 ✅；更新服务器端点待配置（发布时） |
 | M3 跨平台 | 🚧 | CI 三平台矩阵已配置（.github/workflows/build-release.yml）；macOS/Linux 真机验证待 CI 首跑 |
+| FR-18 插件机制 | 🟡 | 后端 `plugins.rs`（28 单测）+ 设置页「插件」卡片（管理器+市场）+ 重启快照；端到端手动验证待跑 |
 | M4 打磨发布 | ⏳ | 待内测 |
 
 ## 关键决策（实现期新增）
@@ -28,6 +29,30 @@
    - 方案：安装包内置完整 dsh 依赖树（`resources/dsh-baseline`，解压 192MB / 压缩后约 25MB），
      首启 `install-dsh.mjs prepare` 秒级复制；更新走后台 `check`/`update`。
 2. **Node 版本：24 LTS**（O3 已定）——实测 dsh 正常，内置 npm 11.6.0。
+3. **插件机制（FR-18）：完全复用 dsh 官方 Cordis 插件体系，不另起炉灶**
+   - 插件实体 = 声明 `"dsh": {"bundle": {"patch": ...}}` 的 npm 包，安装在
+     `$DSH_HOME/profiles/web`（桌面端运行的 web profile；dsh 运行时更新 rm -rf 重建，
+     但 profile 归 dsh 管，天然持久）。
+   - 安装后端用**内置 npm**（`npm-cli.js`，不依赖系统 pnpm），Rust 侧复刻上游
+     `dsh plugin` 的 `reconcilePlugins`（扫描依赖 manifest 的 `dsh.bundle.patch` →
+     写入 `dsh.profile.bundles`）与 `initProfile`（模板逐字复制自
+     `@deepseek-ai/dsh-app-boot`）。**注意**：上游改动 reconcile/模板语义时需跟进
+     `src-tauri/src/plugins.rs`。
+   - `--legacy-peer-deps` 对齐上游 pnpm `autoInstallPeers: false`：没有它 npm 会把
+     `@deepseek-ai/*` peer 复制进 profile/node_modules，遮蔽安装树 fallback 符号链接。
+   - 启用/禁用 = 向 profile 的 `cordis.patch.yml` **追加** `- id: <id> disabled: <bool>`
+     行（后写覆盖先写，与 applyEntryPatches 语义一致）。dsh `watchUserPatches` 热重载，
+     无需重启。YAML 块序列**没有收尾符**——模板的空流式 `[]` 首写时展开为块式，
+     之后只追加；从不整文件重序列化用户补丁（保留注释与 `!!js` 表达式）。
+   - 新增/移除 bundle 行只在启动时读取 → 「重启快照」：boot/restart/repair 服务就绪后
+     把当前 bundle+版本写入 `appData/plugins-state.json`，插件页据此对比提示「重启后生效」。
+   - home 层（`$DSH_HOME/cordis.patch.yml`）优先级高于 profile 层：被 home 层禁用/启用的
+     行在设置页显示为只读（无法从 profile 层切换）。
+   - 默认插件：启动后台自动安装 `dshmarket`（dsh-market 市场插件，装进 dsh 网页设置）。
+     成功后写 `appData/default-plugin.json` 标记——用户手动移除后不会被自动装回；
+     失败静默（下次启动重试），安装后由重启快照提示「重启后生效」。
+   - 托盘语言：`is_zh_locale()` 在 Windows 上**注册表系统 UI 语言优先**、环境变量回退
+     （修复从 Git Bash 启动时 `LANG=en_US` 导致托盘英文、与网页端语言不一致）。
 
 ## 踩坑记录（重要）
 

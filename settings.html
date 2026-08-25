@@ -6,6 +6,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title data-i18n="设置">设置 - DSH 工作台</title>
     <script type="module" src="/src/settings.ts" defer></script>
+    <script type="module" src="/src/plugins.ts" defer></script>
   </head>
 
   <body>
@@ -50,6 +51,33 @@
             <span class="hint" id="service-state">正在检查…</span>
           </div>
           <button class="btn" id="restart-btn" data-i18n="重启服务">重启服务</button>
+        </div>
+      </section>
+
+      <section class="card">
+        <h2 data-i18n="插件">插件</h2>
+        <div class="tabs">
+          <button class="tab-btn active" id="tab-installed" data-i18n="已安装">已安装</button>
+          <button class="tab-btn" id="tab-market" data-i18n="应用市场">应用市场</button>
+        </div>
+
+        <div id="pane-installed">
+          <div class="status-line" id="plugin-status" hidden></div>
+          <div id="plugin-list"></div>
+          <div class="row add-plugin">
+            <input id="plugin-spec-input" class="text-input" data-i18n-placeholder="插件输入提示"
+              placeholder="npm 包名 / github:owner/repo / 本地绝对路径" />
+            <button class="btn" id="plugin-add-btn" data-i18n="安装">安装</button>
+          </div>
+        </div>
+
+        <div id="pane-market" hidden>
+          <div class="row add-plugin">
+            <input id="market-search-input" class="text-input" data-i18n-placeholder="搜索插件…" placeholder="搜索插件…" />
+            <button class="btn" id="market-refresh-btn" data-i18n="刷新">刷新</button>
+          </div>
+          <div class="error-banner" id="market-errors" hidden></div>
+          <div class="market-list" id="market-list"></div>
         </div>
       </section>
 

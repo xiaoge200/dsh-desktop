@@ -27,6 +27,8 @@ pub enum BootPhase {
 pub struct AppState {
     /// 内置 Node 二进制绝对路径
     pub node_path: Mutex<PathBuf>,
+    /// 应用数据目录（appData，config.json / 插件快照等所在）
+    pub app_data_dir: Mutex<PathBuf>,
     /// DSH 运行时根目录（appData/dsh-runtime）
     pub runtime_dir: Mutex<PathBuf>,
     /// 工作区目录（dsh 的 cwd）
@@ -91,6 +93,14 @@ impl AppState {
         self.node_path.lock().unwrap().clone()
     }
 
+    pub fn set_app_data_dir(&self, p: PathBuf) {
+        *self.app_data_dir.lock().unwrap() = p;
+    }
+
+    pub fn app_data_dir(&self) -> PathBuf {
+        self.app_data_dir.lock().unwrap().clone()
+    }
+
     pub fn set_runtime_dir(&self, p: PathBuf) {
         *self.runtime_dir.lock().unwrap() = p;
     }
@@ -134,6 +144,7 @@ mod tests {
     fn new_state() -> AppState {
         AppState {
             node_path: Mutex::new(PathBuf::new()),
+            app_data_dir: Mutex::new(PathBuf::new()),
             runtime_dir: Mutex::new(PathBuf::new()),
             workspace_dir: Mutex::new(PathBuf::new()),
             log_file: Mutex::new(PathBuf::new()),

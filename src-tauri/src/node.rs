@@ -4,7 +4,7 @@ use std::process::Command;
 /// Windows 上 Tauri 的 resource_dir() 会返回 `\\?\C:\...` 形式的 verbatim 路径，
 /// 而 Node 24 无法用这种路径作为入口脚本（EISDIR lstat 'C:' 崩溃）。
 /// 这里去掉 `\\?\` 前缀，转回普通路径。
-fn normalize_for_node(p: &Path) -> PathBuf {
+pub(crate) fn normalize_for_node(p: &Path) -> PathBuf {
     #[cfg(windows)]
     {
         let s = p.to_string_lossy();
