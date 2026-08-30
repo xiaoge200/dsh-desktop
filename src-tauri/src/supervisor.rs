@@ -6,6 +6,103 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+/// Windows Job Object 封装：把服务进程树挂到主进程名下，主进程无论以何种方式
+/// 退出（含被强杀/崩溃），job 内进程随之终止，杜绝孤儿 node 进程。
+#[cfg(windows)]
+mod win {
+    use std::mem::size_of;
+    use std::os::windows::io::AsRawHandle;
+    use std::process::Child;
+
+    use winapi::shared::minwindef::{FALSE, LPVOID};
+    use winapi::um::handleapi::{CloseHandle, INVALID_HANDLE_VALUE};
+    use winapi::um::jobapi2::{
+        AssignProcessToJobObject, CreateJobObjectW, SetInformationJobObject, TerminateJobObject,
+    };
+    use winapi::um::processthreadsapi::{OpenThread, ResumeThread};
+    use winapi::um::tlhelp32::{
+        CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD, THREADENTRY32,
+    };
+    use winapi::um::winnt::{
+        JobObjectExtendedLimitInformation, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, THREAD_SUSPEND_RESUME, HANDLE,
+    };
+
+    /// Job 句柄。裸 HANDLE 不是 Send/Sync，这里包一层标记。
+    pub struct Job(HANDLE);
+    unsafe impl Send for Job {}
+    unsafe impl Sync for Job {}
+
+    impl Drop for Job {
+        fn drop(&mut self) {
+            unsafe { CloseHandle(self.0) };
+        }
+    }
+
+    /// 创建带 KILL_ON_JOB_CLOSE 的 Job；失败返回 None（调用方降级为 taskkill 清理）。
+    pub fn create_kill_on_close_job() -> Option<Job> {
+        unsafe {
+            let h = CreateJobObjectW(std::ptr::null_mut(), std::ptr::null());
+            if h.is_null() {
+                return None;
+            }
+            let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+            info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            let ok = SetInformationJobObject(
+                h,
+                JobObjectExtendedLimitInformation,
+                &mut info as *mut _ as LPVOID,
+                size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            );
+            if ok == 0 {
+                CloseHandle(h);
+                return None;
+            }
+            Some(Job(h))
+        }
+    }
+
+    /// 把子进程加入 job（Win8+ 允许嵌套 job，一般会成功；失败不致命）。
+    pub fn assign(job: &Job, child: &Child) -> bool {
+        unsafe { AssignProcessToJobObject(job.0, child.as_raw_handle() as HANDLE) != 0 }
+    }
+
+    /// 恢复被 CREATE_SUSPENDED 挂起的进程全部线程（Toolhelp 枚举）。
+    /// 刚创建即挂起的进程只有主线程，恢复后即正常运行。
+    pub fn resume_threads(pid: u32) {
+        unsafe {
+            let snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+            if snap == INVALID_HANDLE_VALUE {
+                return;
+            }
+            let mut te: THREADENTRY32 = std::mem::zeroed();
+            te.dwSize = size_of::<THREADENTRY32>() as u32;
+            if Thread32First(snap, &mut te) == 0 {
+                CloseHandle(snap);
+                return;
+            }
+            loop {
+                if te.th32OwnerProcessID == pid {
+                    let h = OpenThread(THREAD_SUSPEND_RESUME, FALSE, te.th32ThreadID);
+                    if !h.is_null() {
+                        ResumeThread(h);
+                        CloseHandle(h);
+                    }
+                }
+                if Thread32Next(snap, &mut te) == 0 {
+                    break;
+                }
+            }
+            CloseHandle(snap);
+        }
+    }
+
+    /// 终止 job 内全部进程（正常 stop/退出路径；幂等）。
+    pub fn terminate(job: &Job) {
+        unsafe { TerminateJobObject(job.0, 1) };
+    }
+}
+
 /// 127.0.0.1 的 SocketAddr（端口动态）
 fn loopback(port: u16) -> SocketAddr {
     SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port)
@@ -34,7 +131,8 @@ fn normalize_for_node(p: &Path) -> PathBuf {
 /// - 端口：优先 3080，被占用时自动探测空闲端口（用户无感）
 /// - 健康检查：TCP + HTTP GET / 探测
 /// - 重启退避：5 分钟内最多 3 次，超出进入降级态
-/// - 退出清理：Windows 用 taskkill /T /F，其他平台 kill 进程组
+/// - 退出清理：Windows 挂 Job Object（KILL_ON_JOB_CLOSE）——主进程无论以何种方式
+///   退出（含强杀/崩溃）服务进程树都随之终止；再叠加 taskkill /T /F 兜底
 pub struct Supervisor {
     child: Mutex<Option<Child>>,
     /// 服务实际监听端口
@@ -47,6 +145,9 @@ pub struct Supervisor {
     log_dir: Mutex<Option<PathBuf>>,
     /// dsh 入口脚本绝对路径（用于按命令行标记清理残留/孤儿服务进程）
     dsh_bin: Mutex<Option<PathBuf>>,
+    /// Windows Job 对象（KILL_ON_JOB_CLOSE）：主进程被强杀时服务进程树随之终止
+    #[cfg(windows)]
+    job: Mutex<Option<win::Job>>,
 }
 
 const MAX_RESTARTS: usize = 3;
@@ -62,6 +163,8 @@ impl Supervisor {
             degraded: Mutex::new(false),
             log_dir: Mutex::new(None),
             dsh_bin: Mutex::new(None),
+            #[cfg(windows)]
+            job: Mutex::new(None),
         }
     }
 
@@ -170,14 +273,34 @@ impl Supervisor {
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt;
-            // CREATE_NO_WINDOW：不弹黑窗口（node 子进程）；CREATE_NEW_PROCESS_GROUP：便于整组清理
+            // CREATE_NO_WINDOW：不弹黑窗口（node 子进程）；CREATE_NEW_PROCESS_GROUP：便于整组清理；
+            // CREATE_SUSPENDED：先挂起，等挂进 Job 后再恢复，避免启动竞态
             const CREATE_NO_WINDOW: u32 = 0x0800_0000;
             const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-            cmd.creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP);
+            const CREATE_SUSPENDED: u32 = 0x0000_0004;
+            cmd.creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP | CREATE_SUSPENDED);
         }
 
         log::info!("spawn: {:?}", cmd);
         let child = cmd.spawn().map_err(|e| format!("启动服务失败: {e}"))?;
+
+        // Windows：把服务挂进 KILL_ON_JOB_CLOSE 的 Job——主进程无论以何种方式退出
+        // （含强杀/崩溃），整棵服务进程树都会随之终止，杜绝孤儿进程。
+        #[cfg(windows)]
+        {
+            let job = win::create_kill_on_close_job();
+            if let Some(ref j) = job {
+                if win::assign(j, &child) {
+                    log::info!("service attached to kill-on-close job");
+                } else {
+                    log::warn!("assign service to job failed; falling back to taskkill cleanup");
+                }
+            }
+            // 无论 job 是否创建成功，都要恢复被挂起的进程
+            win::resume_threads(child.id());
+            *self.job.lock().unwrap() = job;
+        }
+
         *self.child.lock().unwrap() = Some(child);
         self.port.store(port as u32, Ordering::SeqCst);
         log::info!("service spawning on 127.0.0.1:{port}");
@@ -268,6 +391,13 @@ impl Supervisor {
 
     /// 停止服务并清理进程树。
     pub fn stop(&mut self) {
+        // Windows：先终止 Job 内全部进程（含游离子进程），再走常规清理兜底
+        #[cfg(windows)]
+        {
+            if let Some(j) = self.job.lock().unwrap().take() {
+                win::terminate(&j);
+            }
+        }
         let child = self.child.lock().unwrap().take();
         if let Some(mut child) = child {
             log::info!("stopping service pid={}", child.id());
