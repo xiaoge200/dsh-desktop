@@ -59,6 +59,10 @@ function platformKey(filename) {
     if (filename.includes('universal')) return 'darwin-universal';
     if (filename.includes('x64') || filename.includes('amd64')) return 'darwin-x86_64';
   }
+  if (filename.endsWith('.AppImage')) {
+    if (filename.includes('aarch64') || filename.includes('arm64')) return 'linux-aarch64';
+    if (filename.includes('amd64') || filename.includes('x86_64')) return 'linux-x86_64';
+  }
   return null;
 }
 

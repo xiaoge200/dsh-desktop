@@ -16,6 +16,8 @@
 ### CI
 - macOS DMG 打包改为单独步骤（tauri 的 create-dmg 在无头 CI 上偶发失败）：
   显式 `CI=true` 跳过 AppleScript 图标排版（-10826），失败自动重试 3 次并打印日志尾部
+- 每次构建前删除该 tag 的旧 Draft Release：解决重跑/移动 tag 后上传同名资产报
+  `already_exists`（GitHub 不允许重复资产名），使 workflow 可重复运行
 
 ## [0.1.2] - 2026-08-30
 

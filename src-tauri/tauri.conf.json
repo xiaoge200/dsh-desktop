@@ -46,7 +46,8 @@
   },
   "bundle": {
     "active": true,
-    "targets": ["nsis", "msi"],
+    "createUpdaterArtifacts": true,
+    "targets": ["nsis", "msi", "app", "dmg", "appimage", "deb", "rpm"],
     "resources": {
       "../resources/node": "node/",
       "../resources/installer": "installer/",
