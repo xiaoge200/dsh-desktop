@@ -177,6 +177,42 @@ pub fn read_installed_version(runtime_dir: &Path) -> Option<String> {
     json.get("version")?.as_str().map(|s| s.to_string())
 }
 
+/// install-dsh.mjs 输出的解析结果（stdout 末行 JSON）
+#[derive(Debug, Clone, Default)]
+pub struct InstallerResult {
+    pub ok: bool,
+    /// "up-to-date" | "new-version-available" | "updated" | ...
+    pub action: String,
+    /// 最新/更新后版本
+    pub version: Option<String>,
+    /// 当前版本（检查到新版本时附带）
+    pub current: Option<String>,
+    /// 白话错误信息（ok=false 时）
+    pub message: Option<String>,
+    /// 技术细节
+    pub detail: Option<String>,
+}
+
+/// 解析 install-dsh.mjs 的 stdout 末行 JSON（失败时返回默认值，调用方按未知结果处理）
+pub fn parse_installer_output(out: &str) -> InstallerResult {
+    let mut res = InstallerResult::default();
+    let Some(line) = out.lines().last() else { return res };
+    let Ok(json) = serde_json::from_str::<serde_json::Value>(line) else { return res };
+    res.ok = json.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
+    res.action = json.get("action").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    res.version = json.get("version").and_then(|v| v.as_str()).map(|s| s.to_string());
+    res.current = json.get("current").and_then(|v| v.as_str()).map(|s| s.to_string());
+    res.message = json
+        .pointer("/error/message")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    res.detail = json
+        .pointer("/error/detail")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    res
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -226,5 +262,33 @@ mod tests {
         std::fs::write(dir.join(".installed.json"), "not json").unwrap();
         assert_eq!(read_installed_version(&dir), None);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn parse_installer_output_new_version() {
+        let r = parse_installer_output(
+            "log line\n{\"ok\":true,\"action\":\"new-version-available\",\"version\":\"1.5.0\",\"current\":\"1.4.0\",\"dir\":\"x\",\"source\":\"npmjs\"}",
+        );
+        assert!(r.ok);
+        assert_eq!(r.action, "new-version-available");
+        assert_eq!(r.version.as_deref(), Some("1.5.0"));
+        assert_eq!(r.current.as_deref(), Some("1.4.0"));
+    }
+
+    #[test]
+    fn parse_installer_output_error() {
+        let r = parse_installer_output(
+            "{\"ok\":false,\"error\":{\"kind\":\"network\",\"message\":\"暂时无法检查更新\",\"detail\":\"both registries unreachable\"}}",
+        );
+        assert!(!r.ok);
+        assert_eq!(r.message.as_deref(), Some("暂时无法检查更新"));
+    }
+
+    #[test]
+    fn parse_installer_output_garbage_returns_defaults() {
+        let r = parse_installer_output("not json at all");
+        assert!(!r.ok);
+        assert!(r.action.is_empty());
+        assert!(r.version.is_none());
     }
 }

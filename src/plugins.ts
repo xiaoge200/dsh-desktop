@@ -3,6 +3,7 @@
  * 独立脚本模块，由 settings.html 以第二个 <script type="module"> 加载。
  */
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { SETTINGS_STRINGS, detectLang, tr } from "./i18n";
 
 const lang = detectLang();
@@ -356,3 +357,8 @@ function bind() {
 applyPlaceholders();
 bind();
 renderList();
+
+// 与设置页其他数据一样：窗口在启动时即创建（hidden），页面加载早于
+// 插件环境初始化（默认插件安装是后台异步完成的），首次渲染可能是
+// "尚未初始化插件"。窗口每次打开时（settings://refresh）重新拉取列表。
+listen("settings://refresh", () => renderList());

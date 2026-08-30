@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { SETTINGS_STRINGS, detectLang, tr } from "./i18n";
 
 // 语言（NFR-10）
@@ -20,6 +21,9 @@ interface SettingsData {
   node_version: string | null;
   dsh_version: string | null;
   port: number;
+  service_running: boolean;
+  phase: string;
+  error: string | null;
   workspace_dir: string;
   log_file: string;
   autostart_enabled: boolean;
@@ -30,6 +34,14 @@ interface AppConfig {
   auto_update_app: boolean;
   port: number;
   registry_source: string;
+}
+
+interface DshUpdateStatus {
+  ok: boolean;
+  update_available: boolean;
+  current: string | null;
+  latest: string | null;
+  message: string;
 }
 
 const $ = <T extends HTMLElement = HTMLElement>(id: string) => document.querySelector(id) as T;
@@ -50,6 +62,9 @@ const els = {
   registrySelect: $("#registry-select") as HTMLSelectElement,
   advancedSaveBtn: $("#advanced-save-btn") as HTMLButtonElement,
   advancedSaveState: $("#advanced-save-state"),
+  updateState: $("#dsh-update-state"),
+  checkUpdateBtn: $("#check-update-btn") as HTMLButtonElement,
+  applyUpdateBtn: $("#apply-update-btn") as HTMLButtonElement,
 };
 
 let configCache: AppConfig | null = null;
@@ -58,14 +73,104 @@ function setRowText(el: HTMLElement, text: string) {
   el.textContent = text;
 }
 
+// ---- DSH 更新（状态展示 + 手动检查/更新） ----
+
+let lastUpdateStatus: DshUpdateStatus | null = null;
+let updateBusy = false;
+
+function renderUpdateStatus() {
+  const st = lastUpdateStatus;
+  if (!st) {
+    setRowText(els.updateState, T("尚未检查更新"));
+    els.applyUpdateBtn.hidden = true;
+    return;
+  }
+  setRowText(els.updateState, st.message);
+  // 只有发现新版本且当前没有更新任务时才显示「立即更新」
+  els.applyUpdateBtn.hidden = !st.update_available || updateBusy;
+  // 同步「DSH 版本」显示（更新后当前版本可能变化）
+  if (st.current) setRowText(els.dshVersion, st.current);
+}
+
+async function loadUpdateStatus() {
+  try {
+    lastUpdateStatus = await invoke<DshUpdateStatus | null>("get_dsh_update_status");
+  } catch (e) {
+    console.error("load update status failed", e);
+    lastUpdateStatus = null;
+  }
+  renderUpdateStatus();
+}
+
+async function doCheckUpdate() {
+  if (updateBusy) return;
+  updateBusy = true;
+  els.checkUpdateBtn.disabled = true;
+  els.checkUpdateBtn.textContent = T("检查中…");
+  setRowText(els.updateState, T("检查中…"));
+  try {
+    lastUpdateStatus = await invoke<DshUpdateStatus>("check_dsh_update");
+  } catch (e) {
+    console.error("check update failed", e);
+    lastUpdateStatus = {
+      ok: false,
+      update_available: false,
+      current: null,
+      latest: null,
+      message: lang === "zh" ? "检查更新失败，请查看日志。" : "Failed to check updates. See the logs.",
+    };
+  } finally {
+    updateBusy = false;
+    els.checkUpdateBtn.disabled = false;
+    els.checkUpdateBtn.textContent = T("检查更新");
+    renderUpdateStatus();
+  }
+}
+
+async function doApplyUpdate() {
+  if (updateBusy) return;
+  updateBusy = true;
+  els.applyUpdateBtn.disabled = true;
+  els.applyUpdateBtn.textContent = T("更新中…");
+  setRowText(els.updateState, T("正在更新，请稍候…"));
+  try {
+    lastUpdateStatus = await invoke<DshUpdateStatus>("update_dsh");
+  } catch (e) {
+    console.error("update failed", e);
+    lastUpdateStatus = {
+      ok: false,
+      update_available: false,
+      current: null,
+      latest: null,
+      message: lang === "zh" ? "更新失败，请查看日志。" : "Update failed. See the logs.",
+    };
+  } finally {
+    updateBusy = false;
+    els.applyUpdateBtn.disabled = false;
+    els.applyUpdateBtn.textContent = T("立即更新");
+    renderUpdateStatus();
+  }
+}
+
+/** 本地服务状态文案（实时健康检查 + 启动阶段） */
+function serviceStateText(s: SettingsData): string {
+  if (s.service_running) {
+    return lang === "zh" ? `运行中（端口 ${s.port}）` : `Running (port ${s.port})`;
+  }
+  if (s.phase === "node-check" || s.phase === "dsh-install" || s.phase === "service-start") {
+    return T("正在启动…");
+  }
+  if (s.phase === "error") {
+    return s.error ?? T("启动失败");
+  }
+  return s.port > 0 ? T("已停止") : T("未启动");
+}
+
 async function loadSettings() {
   try {
     const s = await invoke<SettingsData>("get_settings");
     els.autostart.checked = s.autostart_enabled;
-    setRowText(
-      els.serviceState,
-      s.port > 0 ? (lang === "zh" ? `运行中（端口 ${s.port}）` : `Running (port ${s.port})`) : T("未启动"),
-    );
+    setRowText(els.serviceState, serviceStateText(s));
     setRowText(els.appVersion, s.app_version);
     setRowText(els.dshVersion, s.dsh_version ?? T("尚未安装"));
     setRowText(els.nodeVersion, s.node_version ?? T("未知"));
@@ -78,10 +183,36 @@ async function loadSettings() {
     // 高级区：端口 + 更新源
     els.portInput.value = configCache.port > 0 ? String(configCache.port) : "0";
     els.registrySelect.value = configCache.registry_source || "auto";
+
+    // DSH 更新状态（后台自动更新 / 上次检查结果，纯本地读取）
+    await loadUpdateStatus();
   } catch (e) {
     setRowText(els.serviceState, T("读取失败"));
     console.error("load settings failed", e);
   }
+}
+
+let refreshing = false;
+
+/** 重新拉取设置数据（去重，避免事件连发时重复请求） */
+async function refreshSettings() {
+  if (refreshing) return;
+  refreshing = true;
+  try {
+    await loadSettings();
+  } finally {
+    refreshing = false;
+  }
+}
+
+async function bindRefreshEvents() {
+  // 设置窗口在应用启动时即已创建（hidden），页面加载早于 boot 完成，
+  // 首次读取到的 DSH 版本/运行环境/工作区/服务状态可能是空值。
+  // 因此：窗口每次打开（settings://refresh）以及 boot 进行中/完成时
+  // （boot://progress / boot://ready）都重新拉取最新数据。
+  await listen("settings://refresh", refreshSettings);
+  await listen("boot://progress", refreshSettings);
+  await listen("boot://ready", refreshSettings);
 }
 
 function bind() {
@@ -149,6 +280,10 @@ function bind() {
     }
   });
 
+  // DSH 更新：手动检查 / 立即更新
+  els.checkUpdateBtn.addEventListener("click", doCheckUpdate);
+  els.applyUpdateBtn.addEventListener("click", doApplyUpdate);
+
   els.openWorkspaceBtn.addEventListener("click", async () => {
     try {
       await invoke("open_workspace_dir");
@@ -168,3 +303,4 @@ function bind() {
 
 bind();
 loadSettings();
+bindRefreshEvents();

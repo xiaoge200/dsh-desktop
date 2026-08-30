@@ -368,7 +368,8 @@ h1 {
   transform: translateX(16px);
 }
 
-.market-list {
+.market-list,
+#plugin-list {
   max-height: 300px;
   overflow-y: auto;
   margin-top: 8px;

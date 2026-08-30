@@ -34,7 +34,13 @@ export default defineConfig(async () => ({
       : undefined,
     watch: {
       // 3. tell Vite to ignore watching `src-tauri`
-      ignored: ["**/src-tauri/**"],
+      ignored: [
+        "**/src-tauri/**",
+        // 编辑器/工具链原子写入的临时目录（形如 .settings.html.<pid>.<uuid>.tmpdir）。
+        // Windows 上其临时文件可能被短暂占用，fs.watch 会报 EBUSY 使 watcher 崩溃。
+        "**/.*.tmpdir",
+        "**/.*.tmpdir/**",
+      ],
     },
   },
 }));

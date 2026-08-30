@@ -1,6 +1,6 @@
 [package]
 name = "dsh-desktop"
-version = "0.1.1"
+version = "0.1.2"
 description = "DSH Web desktop client: built-in Node runtime + auto-installed latest dsh package + embedded WebView"
 authors = ["dsh-desktop team"]
 edition = "2021"
@@ -25,6 +25,8 @@ serde_yaml = "0.9"
 dirs = "6"
 log = "0.4"
 thiserror = "2"
+# 进程枚举（按命令行清理上一会话遗留的 dsh 服务进程）
+sysinfo = "0.33"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 open = "5"
 

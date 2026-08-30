@@ -702,10 +702,13 @@ fn run_npm(node: &Path, cwd: &Path, args: &[String], timeout: Duration) -> Resul
             let pid = child.id();
             #[cfg(windows)]
             {
+                use std::os::windows::process::CommandExt;
+                // CREATE_NO_WINDOW：避免超时杀进程时闪黑窗口
                 let _ = Command::new("taskkill")
                     .args(["/PID", &pid.to_string(), "/T", "/F"])
                     .stdout(Stdio::null())
                     .stderr(Stdio::null())
+                    .creation_flags(0x0800_0000)
                     .status();
             }
             #[cfg(unix)]

@@ -63,12 +63,12 @@
 
         <div id="pane-installed">
           <div class="status-line" id="plugin-status" hidden></div>
-          <div id="plugin-list"></div>
           <div class="row add-plugin">
             <input id="plugin-spec-input" class="text-input" data-i18n-placeholder="插件输入提示"
               placeholder="npm 包名 / github:owner/repo / 本地绝对路径" />
             <button class="btn" id="plugin-add-btn" data-i18n="安装">安装</button>
           </div>
+          <div id="plugin-list"></div>
         </div>
 
         <div id="pane-market" hidden>
@@ -113,6 +113,14 @@
         <h2 data-i18n="关于">关于</h2>
         <div class="about-row"><span class="label" data-i18n="应用版本">应用版本</span><span id="app-version">-</span></div>
         <div class="about-row"><span class="label" data-i18n="DSH 版本">DSH 版本</span><span id="dsh-version">-</span></div>
+        <div class="about-row">
+          <span class="label" data-i18n="DSH 更新">DSH 更新</span>
+          <span id="dsh-update-state">-</span>
+        </div>
+        <div class="row actions">
+          <button class="btn" id="check-update-btn" data-i18n="检查更新">检查更新</button>
+          <button class="btn" id="apply-update-btn" data-i18n="立即更新" hidden>立即更新</button>
+        </div>
         <div class="about-row"><span class="label" data-i18n="运行环境">运行环境</span><span id="node-version">-</span></div>
         <div class="about-row"><span class="label" data-i18n="工作区位置">工作区位置</span><span class="path" id="workspace-path">-</span></div>
         <div class="about-row"><span class="label" data-i18n="日志位置">日志位置</span><span class="path" id="log-path">-</span></div>

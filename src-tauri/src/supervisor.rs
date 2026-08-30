@@ -45,6 +45,8 @@ pub struct Supervisor {
     degraded: Mutex<bool>,
     /// 服务日志目录（stdout/stderr 落盘，FR-09）
     log_dir: Mutex<Option<PathBuf>>,
+    /// dsh 入口脚本绝对路径（用于按命令行标记清理残留/孤儿服务进程）
+    dsh_bin: Mutex<Option<PathBuf>>,
 }
 
 const MAX_RESTARTS: usize = 3;
@@ -59,6 +61,7 @@ impl Supervisor {
             restarts: Mutex::new(Vec::new()),
             degraded: Mutex::new(false),
             log_dir: Mutex::new(None),
+            dsh_bin: Mutex::new(None),
         }
     }
 
@@ -102,6 +105,8 @@ impl Supervisor {
         preferred_port: u16,
         extra_args: &[String],
     ) -> Result<u16, String> {
+        // 先记录入口脚本，stop() 才能按命令行标记清理残留进程（须在 stop 之前）
+        *self.dsh_bin.lock().unwrap() = Some(dsh_bin.to_path_buf());
         self.stop();
 
         let port = Self::pick_free_port(preferred_port);
@@ -269,11 +274,13 @@ impl Supervisor {
             let pid = child.id();
             #[cfg(windows)]
             {
-                // taskkill /T /F 杀整棵树
+                use std::os::windows::process::CommandExt;
+                // taskkill /T /F 杀整棵树（CREATE_NO_WINDOW：避免闪黑窗口）
                 let _ = Command::new("taskkill")
                     .args(["/PID", &pid.to_string(), "/T", "/F"])
                     .stdout(Stdio::null())
                     .stderr(Stdio::null())
+                    .creation_flags(0x0800_0000)
                     .status();
                 let _ = child.kill();
             }
@@ -297,6 +304,57 @@ impl Supervisor {
             }
             let _ = child.wait();
             log::info!("service stopped");
+        }
+        // 清理残留的 dsh 进程（上一会话异常退出遗留的孤儿进程、taskkill /T
+        // 未覆盖的游离进程）。它们占着端口/运行时，会导致新服务启动失败。
+        self.kill_stale_dsh();
+    }
+
+    /// 按命令行标记清理残留的 dsh 服务进程。
+    ///
+    /// 只匹配命令行里含本应用 dsh 入口脚本（bin.js 绝对路径）的 node 进程，
+    /// 不碰安装器（install-dsh.mjs）、其他程序的 node 进程。
+    /// Windows 上对每个命中进程再 taskkill /T，连其派生的子进程一起杀。
+    fn kill_stale_dsh(&self) {
+        let marker = match self.dsh_bin.lock().unwrap().clone() {
+            Some(p) => normalize_for_node(&p).to_string_lossy().to_lowercase(),
+            None => return,
+        };
+        let mut sys = sysinfo::System::new();
+        sys.refresh_processes_specifics(
+            sysinfo::ProcessesToUpdate::All,
+            true,
+            // 只需命令行，避免 everything() 额外枚举环境变量等开销
+            sysinfo::ProcessRefreshKind::nothing().with_cmd(sysinfo::UpdateKind::Always),
+        );
+        let current = sysinfo::get_current_pid().ok();
+        for (pid, proc_) in sys.processes() {
+            if Some(*pid) == current {
+                continue;
+            }
+            let matches = proc_
+                .cmd()
+                .iter()
+                .any(|a| a.to_string_lossy().to_lowercase().contains(&marker));
+            if !matches {
+                continue;
+            }
+            log::info!("killing stale dsh process pid={pid}");
+            #[cfg(windows)]
+            {
+                use std::os::windows::process::CommandExt;
+                // CREATE_NO_WINDOW：避免杀进程时闪黑窗口
+                let _ = Command::new("taskkill")
+                    .args(["/PID", &pid.as_u32().to_string(), "/T", "/F"])
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .creation_flags(0x0800_0000)
+                    .status();
+            }
+            #[cfg(not(windows))]
+            {
+                let _ = proc_.kill();
+            }
         }
     }
 }

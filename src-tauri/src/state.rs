@@ -47,6 +47,23 @@ pub struct AppState {
     pub config: Mutex<ConfigStore>,
     /// 高级用户透传的 dsh CLI 参数（FR-15，`--dsh-args` 启动参数）
     pub dsh_extra_args: Mutex<Vec<String>>,
+    /// 最近一次 DSH 更新结果（后台自动更新 / 手动检查更新共用，设置页展示）
+    pub dsh_update: Mutex<Option<DshUpdateStatus>>,
+}
+
+/// DSH 更新状态（设置页「关于」区展示）
+#[derive(Debug, Clone, Serialize)]
+pub struct DshUpdateStatus {
+    /// 检查/更新是否成功
+    pub ok: bool,
+    /// 是否有可用更新（待用户点击「立即更新」）
+    pub update_available: bool,
+    /// 当前已安装版本（可能为 None：运行时未初始化）
+    pub current: Option<String>,
+    /// 最新版本（检查成功时才有）
+    pub latest: Option<String>,
+    /// 白话状态文案（已是最新 / 发现新版本 / 失败原因等）
+    pub message: String,
 }
 
 impl AppState {
@@ -124,6 +141,14 @@ impl AppState {
     pub fn log_file(&self) -> PathBuf {
         self.log_file.lock().unwrap().clone()
     }
+
+    pub fn set_dsh_update(&self, status: DshUpdateStatus) {
+        *self.dsh_update.lock().unwrap() = Some(status);
+    }
+
+    pub fn dsh_update(&self) -> Option<DshUpdateStatus> {
+        self.dsh_update.lock().unwrap().clone()
+    }
 }
 
 /// 前端读取的状态快照
@@ -154,6 +179,7 @@ mod tests {
             supervisor: Mutex::new(Supervisor::new()),
             config: Mutex::new(ConfigStore::new(std::path::Path::new(""))),
             dsh_extra_args: Mutex::new(Vec::new()),
+            dsh_update: Mutex::new(None),
         }
     }
 
