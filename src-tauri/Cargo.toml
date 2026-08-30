@@ -1,6 +1,6 @@
 [package]
 name = "dsh-desktop"
-version = "0.1.2"
+version = "0.1.3"
 description = "DSH Web desktop client: built-in Node runtime + auto-installed latest dsh package + embedded WebView"
 authors = ["dsh-desktop team"]
 edition = "2021"

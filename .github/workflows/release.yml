@@ -6,9 +6,13 @@
 #   3. Actions 自动构建三份产物，发布为 Draft Release，人工确认后公开
 #
 # 产物：
-#   - Windows:  NSIS per-user 安装包（*-setup.exe）
+#   - Windows:  NSIS per-user 安装包（*-setup.exe）+ MSI 安装包（*-x64.msi）
 #   - macOS:    Intel (x64) 与 Apple Silicon (arm64) 的 .app.tar.gz + .dmg
 #   - 更新清单: latest.json（由 merge-updater-json 任务合并各平台签名生成）
+#
+# macOS 的 DMG 单独构建（tauri 的 create-dmg 在无头 CI 上偶发失败：
+#   osascript 图标排版 -10826 / hdiutil 间歇错误），带 3 次重试；
+#   失败时打印构建日志尾部，方便定位。
 #
 # 可选 Secrets（未配置则跳过对应能力，构建不受影响）：
 #   TAURI_SIGNING_PRIVATE_KEY / TAURI_SIGNING_PRIVATE_KEY_PASSWORD
@@ -40,11 +44,11 @@ jobs:
       matrix:
         include:
           - platform: windows-latest
-            bundles: nsis
+            bundles: nsis,msi
           - platform: macos-15-intel # Intel (x64)
-            bundles: app,dmg
+            bundles: app
           - platform: macos-15 # Apple Silicon (arm64)
-            bundles: app,dmg
+            bundles: app
     runs-on: ${{ matrix.platform }}
     timeout-minutes: 60
     # secrets 不能用于 job/step 级 if（GitHub 限制），用 job 级 env 传标志供步骤判断
@@ -78,7 +82,8 @@ jobs:
 
       # macOS 签名/公证：APPLE_* Secret 缺失时不能把空值传给 tauri（会被当成"提供了证书"
       # 去 security import，报 failed to import keychain certificate），因此按证书是否存在拆成两步。
-      # 未配置证书 → 无 APPLE_* 环境变量，产出未签名 dmg（首次打开右键 →「打开」）。
+      # 未配置证书 → 无 APPLE_* 环境变量，产出未签名产物（首次打开右键 →「打开」）。
+      # macOS 步骤只打 app bundle（.app + .app.tar.gz 更新包）；DMG 由后面的重试步骤单独构建。
       - name: Build & publish release assets (unsigned)
         if: env.HAS_APPLE_CERT == 'false'
         uses: tauri-apps/tauri-action@v0
@@ -87,15 +92,17 @@ jobs:
           # updater 签名（缺失则跳过签名与更新清单，构建仍成功）
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          # 显式 CI=true：让 create-dmg 跳过 AppleScript 图标排版（无头 CI 上会 -10826）
+          CI: "true"
         with:
           tagName: v__VERSION__
-          releaseName: 'DSH 工作台 v__VERSION__'
+          releaseName: 'v__VERSION__'
           releaseBody: |
             ## DSH 工作台 v__VERSION__
 
             本版本由 GitHub Actions 自动构建。
 
-            - **Windows**：`*-setup.exe`（NSIS，免管理员安装）
+            - **Windows**：`*-setup.exe`（NSIS，免管理员安装）/ `*-x64.msi`（MSI）
             - **macOS Intel**：`*-x64.dmg`
             - **macOS Apple Silicon**：`*-aarch64.dmg`
 
@@ -111,6 +118,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          CI: "true"
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
@@ -119,18 +127,72 @@ jobs:
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         with:
           tagName: v__VERSION__
-          releaseName: 'DSH 工作台 v__VERSION__'
+          releaseName: 'v__VERSION__'
           releaseBody: |
             ## DSH 工作台 v__VERSION__
 
             本版本由 GitHub Actions 自动构建。
 
-            - **Windows**：`*-setup.exe`（NSIS，免管理员安装）
+            - **Windows**：`*-setup.exe`（NSIS，免管理员安装）/ `*-x64.msi`（MSI）
             - **macOS Intel**：`*-x64.dmg`
             - **macOS Apple Silicon**：`*-aarch64.dmg`
           releaseDraft: true
           prerelease: false
           args: --bundles ${{ matrix.bundles }}
+
+      # macOS 专用：DMG 打包（create-dmg 在 CI 上偶发失败，重试 3 次）。
+      # 只打 dmg（.app 已由上面构建好，cargo 缓存命中，几十秒内完成）；
+      # 成功后上传 dmg 及签名到已由 tauri-action 创建的 Draft Release。
+      - name: Build & upload DMG (macOS, retry)
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CI: "true"
+          HAS_APPLE_CERT: ${{ env.HAS_APPLE_CERT }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          # 未配置 Apple 证书时清空 APPLE_*，避免 tauri 误判为「提供了证书」
+          if [ "${HAS_APPLE_CERT}" != "true" ]; then
+            unset APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID
+          fi
+          VERSION="$(node -p "require('./src-tauri/tauri.conf.json').version")"
+          TAG="v${VERSION}"
+          DMG=""
+          LOG="/tmp/dmg-build.log"
+          for i in 1 2 3; do
+            echo "::group::DMG bundling attempt ${i}/3"
+            if npm run tauri build -- --bundles dmg > "$LOG" 2>&1; then
+              DMG="$(ls -t src-tauri/target/release/bundle/dmg/*.dmg 2>/dev/null | head -n1 || true)"
+              if [ -n "$DMG" ]; then
+                echo "::endgroup::"
+                break
+              fi
+            fi
+            echo "::endgroup::"
+            echo "::warning::DMG bundling attempt ${i} failed. Last output:"
+            tail -n 40 "$LOG" || true
+            sleep 10
+          done
+          if [ -z "$DMG" ] || [ ! -f "$DMG" ]; then
+            echo "::error::DMG bundling failed after 3 attempts"
+            exit 1
+          fi
+          echo "Uploading DMG: $DMG"
+          gh release upload "$TAG" "$DMG" --clobber
+          SIG="${DMG%.dmg}.sig"
+          if [ -f "$SIG" ]; then
+            echo "Uploading signature: $SIG"
+            gh release upload "$TAG" "$SIG" --clobber
+          fi
 
   # tauri-action 的 latest.json 在多平台矩阵下会互相覆盖（tauri-apps/tauri-action#409、#927），
   # 因此这里统一由本任务基于各平台 .sig 签名文件合并生成完整的更新清单。

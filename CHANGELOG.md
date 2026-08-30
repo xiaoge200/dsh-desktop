@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.1.3] - 2026-08-31
+
+### 修复
+- 服务进程挂载到 Windows Job Object（`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`）：主进程无论以何种方式
+  退出（含强杀/崩溃/安装器结束进程），node 服务进程树都随之终止，彻底杜绝孤儿进程
+- NSIS 安装/卸载钩子：覆盖/升级安装前整棵树结束正在运行的应用（含 node 服务进程），
+  解决升级时「node 被占用」导致文件覆盖失败；并兜底清理安装目录下的残留 node 进程
+
+### 新增
+- Windows 产物新增 MSI 安装包（`*-x64.msi`，WiX 构建），与 NSIS 一起发布
+
+### CI
+- macOS DMG 打包改为单独步骤（tauri 的 create-dmg 在无头 CI 上偶发失败）：
+  显式 `CI=true` 跳过 AppleScript 图标排版（-10826），失败自动重试 3 次并打印日志尾部
+
 ## [0.1.2] - 2026-08-30
 
 ### 修复
