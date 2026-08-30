@@ -67,6 +67,9 @@
         "displayLanguageSelector": false
       }
     },
+    "macOS": {
+      "signingIdentity": "-"
+    },
     "linux": {
       "deb": {
         "depends": ["libwebkit2gtk-4.1-0", "libappindicator3-1"]
