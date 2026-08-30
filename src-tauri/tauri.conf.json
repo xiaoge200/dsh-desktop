@@ -65,6 +65,9 @@
         "installerHooks": "./nsis-hooks.nsh",
         "languages": ["English", "SimpChinese", "TradChinese"],
         "displayLanguageSelector": false
+      },
+      "wix": {
+        "language": "zh-CN"
       }
     },
     "macOS": {

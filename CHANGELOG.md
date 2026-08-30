@@ -10,6 +10,8 @@
 
 ### 新增
 - Windows 产物新增 MSI 安装包（`*-x64.msi`，WiX 构建），与 NSIS 一起发布
+  - MSI 使用 `wix.language: "zh-CN"`（代码页 936），规避 WiX 默认 en-US 代码页 1252
+    不支持中文 productName 导致 `light.exe` 失败的问题（tauri#8363）
 
 ### CI
 - macOS DMG 打包改为单独步骤（tauri 的 create-dmg 在无头 CI 上偶发失败）：
