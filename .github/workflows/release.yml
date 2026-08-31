@@ -130,6 +130,11 @@ jobs:
           CI: "true"
           # linuxdeploy 的 AppImage 不解压 FUSE 直接运行（配合 libfuse2 双保险）
           APPIMAGE_EXTRACT_AND_RUN: "1"
+          # linuxdeploy 会对 AppDir 内的二进制再 strip 一次；release 二进制已在链接期
+          # strip（Cargo.toml [profile.release] strip=true），新版 linuxdeploy 对
+          # 已 strip 的 ELF 会崩溃（std::logic_error → "failed to run linuxdeploy"），
+          # NO_STRIP=true 让 linuxdeploy 跳过 strip 步骤
+          NO_STRIP: "true"
         with:
           args: ${{ matrix.args }}
 
@@ -142,6 +147,8 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
           CI: "true"
           APPIMAGE_EXTRACT_AND_RUN: "1"
+          # 同上：跳过 linuxdeploy 对已 strip 二进制（Cargo.toml strip=true）的二次 strip，避免崩溃
+          NO_STRIP: "true"
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
