@@ -5,16 +5,18 @@
  * 职责（对应 dsh-desktop-plan.md §3.1 / §3.2）：
  *   1. 基线优先：安装包内置 dsh 完整依赖树（resources/dsh-baseline），
  *      无有效安装时直接复制基线 → 首启秒级就绪（0 门槛，不依赖网络）。
- *   2. 更新（后台，非阻塞启动）：npm view 检查最新版 → 需要时 npm install
- *      到 <target>（官方源失败自动切 npmmirror）。
+ *   2. 更新（两阶段，非阻塞启动）：先 update（下载到 staging 并校验，服务照常运行），
+ *      调用方停服务后 swap（staging 原子替换 target）——下载/校验失败不动现有运行时。
  *   3. 写 .installed.json（精确版本 + 完整性），供壳（Rust）读取。
  *   4. 幂等、可重入、崩溃安全（临时目录 + 原子改名）。
  *
  * 调用方式（由 Tauri 壳 spawn）：
  *   准备（同步，启动路径）：
  *     node install-dsh.mjs prepare --target <dir> --baseline <dir>
- *   更新（异步，后台路径）：
+ *   更新阶段一（异步，下载+校验，服务可继续运行）：
  *     node install-dsh.mjs update --target <dir> [--registry <url>] [--mirror <url>] [--force] [--pre]
+ *   更新阶段二（异步，停服务后原子替换）：
+ *     node install-dsh.mjs swap --target <dir> --staging <dir>
  *   检查（异步，仅查询）：
  *     node install-dsh.mjs check --target <dir> [--registry <url>] [--mirror <url>] [--pre]
  *
@@ -26,14 +28,17 @@
  *       不依赖 tag 名——latest tag 可能指向预发布版本。
  *
  * 输出契约（stdout 末行 = JSON）：
- *   {"ok":true,"action":"prepared-from-baseline"|"baseline-ok"|"updated"|"up-to-date"|"offline-reuse"|"new-version-available"|"prerelease-available","version":"0.1.1","prerelease":"0.1.2-rc.1","pre_available":true,"current":"0.1.0","dir":"...","source":"baseline"|"npmjs"|"npmmirror"|"cache"}
- *   {"ok":false,"error":{"kind":"network"|"install"|"integrity"|"unknown","message":"白话摘要","detail":"技术细节"}}
+ *   prepare: {"ok":true,"action":"prepared-from-baseline"|"baseline-ok","version":"0.1.1","dir":"...","source":"baseline"|"cache"}
+ *   check:   {"ok":true,"action":"up-to-date"|"new-version-available"|"prerelease-available","version":"0.1.1","prerelease":"0.1.2-rc.1","pre_available":true,"current":"0.1.0","dir":"...","source":"npmjs"|"npmmirror"}
+ *   update:  {"ok":true,"action":"downloaded","version":"0.1.1","staging":"<tmp dir>","dir":"...","source":"npmjs"}
+ *   swap:    {"ok":true,"action":"updated","version":"0.1.1","dir":"..."}
+ *   失败：   {"ok":false,"error":{"kind":"network"|"install"|"integrity"|"unknown","message":"白话摘要","detail":"技术细节"}}
  */
 
 import { spawnSync } from "node:child_process";
 import {
   copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, readlinkSync,
-  rmSync, symlinkSync, writeFileSync,
+  renameSync, rmSync, symlinkSync, writeFileSync,
 } from "node:fs";
 import { createHash } from "node:crypto";
 import { join, dirname } from "node:path";
@@ -46,7 +51,7 @@ const INSTALLED_FILE = ".installed.json";
 
 // ---- arg parsing ----
 function parseArgs(argv) {
-  const opts = { mode: null, target: null, baseline: null, registry: null, mirror: null, force: false, pre: false };
+  const opts = { mode: null, target: null, baseline: null, staging: null, registry: null, mirror: null, force: false, pre: false };
   let rest = [...argv];
   opts.mode = rest.shift();
   while (rest.length) {
@@ -54,6 +59,7 @@ function parseArgs(argv) {
     switch (a) {
       case "--target": opts.target = rest.shift(); break;
       case "--baseline": opts.baseline = rest.shift(); break;
+      case "--staging": opts.staging = rest.shift(); break;
       case "--registry": opts.registry = rest.shift(); break;
       case "--mirror": opts.mirror = rest.shift(); break;
       case "--force": opts.force = true; break;
@@ -193,23 +199,49 @@ async function queryDistTags(registry) {
   return splitVersions(versions);
 }
 
-/** npm install 到 target（可指定版本；versionSpec 为 null 时装最新） */
-function installTo(target, registry, versionSpec) {
-  rmSync(target, { recursive: true, force: true });
-  mkdirSync(target, { recursive: true });
+/** 下载到 staging 并校验（不替换 target）：返回 { version, stage }。
+ *  失败时清理 staging，现有运行时不受影响（服务可继续运行）。 */
+function fetchTo(target, registry, versionSpec) {
+  const parent = dirname(target);
+  const stage = join(parent, ".dsh-runtime-staging-" + process.pid);
+  rmSync(stage, { recursive: true, force: true });
+  mkdirSync(stage, { recursive: true });
   const spec = versionSpec ? `${PKG}@${versionSpec}` : PKG;
   const res = runNpm(
-    ["install", spec, "--prefix", target, "--registry", registry, "--no-audit", "--no-fund", "--no-update-notifier", "--loglevel=error"],
+    ["install", spec, "--prefix", stage, "--registry", registry, "--no-audit", "--no-fund", "--no-update-notifier", "--loglevel=error"],
     { timeout: 1_800_000 });
   if (res.status !== 0) {
+    rmSync(stage, { recursive: true, force: true }); // 清理 staging，target 不受影响
     const detail = (res.stderr || res.stdout || "").trim();
     throw Object.assign(new Error(detail), { kind: "install" });
   }
-  const manifest = join(target, "node_modules", "@deepseek-ai", "dsh", "package.json");
+  const manifest = join(stage, "node_modules", "@deepseek-ai", "dsh", "package.json");
   if (!existsSync(manifest)) {
+    rmSync(stage, { recursive: true, force: true });
     throw Object.assign(new Error(`manifest missing after install: ${manifest}`), { kind: "install" });
   }
-  return JSON.parse(readFileSync(manifest, "utf8")).version;
+  const version = JSON.parse(readFileSync(manifest, "utf8")).version;
+  return { version, stage };
+}
+
+/** 把已下载并校验过的 staging 原子替换到 target（调用方须已停服务）。
+ *  失败时尽力从 staging 恢复 target，保证旧版本可用。 */
+function swapStaging(target, stage) {
+  try {
+    rmSync(target, { recursive: true, force: true });
+    renameSync(stage, target);
+  } catch (e) {
+    // rename 失败（如 target 仍被占用）：staging 还在，复制兜底恢复
+    log("swap rename failed, copying from staging: " + (e.message ?? e));
+    try {
+      rmSync(target, { recursive: true, force: true });
+      mkdirSync(target, { recursive: true });
+      copyTree(stage, target);
+      rmSync(stage, { recursive: true, force: true });
+    } catch (e2) {
+      throw Object.assign(new Error(`swap failed: ${e2.message ?? e2}`), { kind: "install" });
+    }
+  }
 }
 
 /**
@@ -275,6 +307,9 @@ function cleanStaleStaging(target) {
 /** 从基线复制完整依赖树到 target（快，秒级）。baseline 接受两种形态：
  *  1) 直接是 node_modules 目录（含 @deepseek-ai/...）
  *  2) 是 dsh-baseline 根目录（含 node_modules/ 子目录）
+ *
+ * 用 staging + 原子改名：只复制一遍（src → staging），成功后 rename 到 target，
+ * 避免「先复制到 staging 再复制到 target」的两遍拷贝（首启慢）。
  */
 function copyBaseline(target, baselineRoot) {
   let src = baselineRoot;
@@ -289,10 +324,9 @@ function copyBaseline(target, baselineRoot) {
   rmSync(stage, { recursive: true, force: true });
   mkdirSync(stage, { recursive: true });
   copyTree(src, join(stage, "node_modules"));
+  // 原子替换：删旧 target → rename stage → target（同卷，快；半成品不落盘）
   rmSync(target, { recursive: true, force: true });
-  mkdirSync(target, { recursive: true });
-  copyTree(stage, target);
-  rmSync(stage, { recursive: true, force: true });
+  renameSync(stage, target);
 }
 
 /** 调试日志（写 stderr，不进 stdout JSON 契约） */
@@ -432,8 +466,8 @@ async function main() {
     }
 
     case "update": {
-      // 后台：安装/更新到目标版本（同 check 的目标选择；--pre 允许预发布）；
-      // 带回滚（R7/R10：失败保留旧版本可用）
+      // 阶段一：下载到 staging 并校验（服务可继续运行，现有运行时不受影响）。
+      // 成功后输出 staging 路径；调用方停服务后调 swap 模式做原子替换。
       const registries = [
         { label: opts.registry ? "custom" : "npmjs", url: opts.registry || DEFAULT_REGISTRY },
         { label: opts.mirror ? "custom" : "npmmirror", url: opts.mirror || DEFAULT_MIRROR },
@@ -467,56 +501,66 @@ async function main() {
         return;
       }
 
-      // 1) 备份当前版本（若存在且有效），供回滚
-      const bakDir = join(dirname(target), ".dsh-runtime-bak");
-      rmSync(bakDir, { recursive: true, force: true });
-      const hasOld = smokeOk(target);
-      if (hasOld) {
-        try {
-          mkdirSync(bakDir, { recursive: true });
-          copyTree(target, bakDir);
-          log("backed up old runtime to " + bakDir);
-        } catch (e) {
-          log("backup failed (continue without rollback): " + (e.message ?? e));
-          rmSync(bakDir, { recursive: true, force: true });
-        }
-      }
-
-      // 2) 安装目标版本（换源重试）
-      let version = null, usedSource = null;
+      // 下载到 staging（换源重试）
+      let fetched = null, usedSource = null;
       const order = latestSource === "npmmirror" ? [registries[1], registries[0]] : [registries[0], registries[1]];
       for (const r of order) {
         try {
-          version = installTo(target, r.url, targetVersion);
+          fetched = fetchTo(target, r.url, targetVersion);
           usedSource = r.label;
           break;
         } catch { /* 换源重试 */ }
       }
-      if (!version) {
-        // 安装失败：恢复旧版本
-        restoreBackup(target, bakDir, hasOld);
-        out({ ok: false, error: { kind: "install", message: "新版本没有装好，已保留旧版本。", detail: "install failed on both registries" } });
+      if (!fetched) {
+        out({ ok: false, error: { kind: "install", message: "新版本下载失败，已保留当前版本。", detail: "download failed on both registries" } });
         process.exit(1);
       }
 
-      // 3) 冒烟：失败则回滚
+      // 校验 staging 完整性（冒烟；失败清理 staging，现有运行时不受影响）
+      try {
+        smokeTest(fetched.stage);
+      } catch (e) {
+        rmSync(fetched.stage, { recursive: true, force: true });
+        out({ ok: false, error: { kind: "integrity", message: "新版本文件不完整，已保留当前版本。", detail: String(e.message ?? e) } });
+        process.exit(1);
+      }
+
+      out({
+        ok: true, action: "downloaded", version: fetched.version,
+        staging: fetched.stage, prerelease, pre_available, current,
+        dir: target, source: usedSource,
+      });
+      return;
+    }
+
+    case "swap": {
+      // 阶段二：把已下载并校验的 staging 原子替换到 target。
+      // 调用方须先停服务（释放文件占用）；失败尽力从 staging 恢复旧版本。
+      if (!opts.staging || !existsSync(opts.staging)) {
+        out({ ok: false, error: { kind: "install", message: "缺少已下载的暂存版本。", detail: "staging missing" } });
+        process.exit(1);
+      }
+      try {
+        swapStaging(opts.target, opts.staging);
+      } catch (e) {
+        out({ ok: false, error: { kind: "install", message: "新版本没有装好，已保留旧版本。", detail: String(e.message ?? e) } });
+        process.exit(1);
+      }
+      // 替换成功：写状态（冒烟已在下载阶段校验过，这里再确认一次）
       let smoke;
       try {
-        smoke = smokeTest(target);
+        smoke = smokeTest(opts.target);
       } catch (e) {
-        restoreBackup(target, bakDir, hasOld);
-        out({ ok: false, error: { kind: "integrity", message: "新版本文件不完整，已恢复旧版本。", detail: String(e.message ?? e) } });
+        out({ ok: false, error: { kind: "integrity", message: "替换后文件不完整，请重新安装。", detail: String(e.message ?? e) } });
         process.exit(1);
       }
-
-      // 4) 成功：写状态，删备份
-      writeInstalled(target, {
+      const version = readVersion(opts.target);
+      writeInstalled(opts.target, {
         package: PKG, version, installedAt: new Date().toISOString(),
-        smoke, source: usedSource, node: process.version,
-        integrity: shasum256(join(target, "node_modules", "@deepseek-ai", "dsh", "lib", "bin.js")),
+        smoke, source: "npm", node: process.version,
+        integrity: shasum256(join(opts.target, "node_modules", "@deepseek-ai", "dsh", "lib", "bin.js")),
       });
-      rmSync(bakDir, { recursive: true, force: true });
-      out({ ok: true, action: "updated", version, prerelease, pre_available, current, dir: target, source: usedSource });
+      out({ ok: true, action: "updated", version, dir: opts.target, source: "npm" });
       return;
     }
 

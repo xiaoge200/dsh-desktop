@@ -105,7 +105,8 @@ pub fn run_check(node: &Path, installer_js: &Path, target: &Path, source: &str, 
     run_installer(node, installer_js, &args)
 }
 
-/// 用内置 Node 运行 install-dsh.mjs 的 update 模式（后台：安装/更新到目标版本）
+/// 用内置 Node 运行 install-dsh.mjs 的 update 模式（阶段一：下载到 staging 并校验；
+/// 服务可继续运行，现有运行时不受影响）。返回输出（含 staging 路径），调用方解析。
 /// `source` 可选："npmjs" / "npmmirror" / 其他（自动）
 /// `pre`：允许安装到预发布版本（设置页「更新预发布版本」开启时传 true）
 pub fn run_update(node: &Path, installer_js: &Path, target: &Path, source: &str, pre: bool) -> Result<String, String> {
@@ -118,6 +119,19 @@ pub fn run_update(node: &Path, installer_js: &Path, target: &Path, source: &str,
     if pre {
         args.push("--pre".to_string());
     }
+    run_installer(node, installer_js, &args)
+}
+
+/// 用内置 Node 运行 install-dsh.mjs 的 swap 模式（阶段二：把已下载并校验过的
+/// staging 原子替换到 target）。调用方须已停服务（释放文件占用）。
+pub fn run_swap(node: &Path, installer_js: &Path, target: &Path, staging: &Path) -> Result<String, String> {
+    let args = vec![
+        "swap".to_string(),
+        "--target".to_string(),
+        normalize_for_node(target).to_string_lossy().to_string(),
+        "--staging".to_string(),
+        normalize_for_node(staging).to_string_lossy().to_string(),
+    ];
     run_installer(node, installer_js, &args)
 }
 
@@ -227,9 +241,9 @@ pub fn read_installed_version(runtime_dir: &Path) -> Option<String> {
 #[derive(Debug, Clone, Default)]
 pub struct InstallerResult {
     pub ok: bool,
-    /// "up-to-date" | "new-version-available" | "prerelease-available" | "updated" | ...
+    /// "up-to-date" | "new-version-available" | "prerelease-available" | "downloaded" | "updated" | ...
     pub action: String,
-    /// 最新/更新后版本（正式版 latest）
+    /// 最新/下载/更新后版本（正式版 stable）
     pub version: Option<String>,
     /// 最新预发布版本（dist-tags 非 latest 中最高；可能为 None）
     pub prerelease: Option<String>,
@@ -237,6 +251,8 @@ pub struct InstallerResult {
     pub pre_available: bool,
     /// 当前版本（检查到新版本时附带）
     pub current: Option<String>,
+    /// update 阶段一输出的 staging 路径（下载+校验成功后，供 swap 使用）
+    pub staging: Option<String>,
     /// 白话错误信息（ok=false 时）
     pub message: Option<String>,
     /// 技术细节
@@ -254,6 +270,7 @@ pub fn parse_installer_output(out: &str) -> InstallerResult {
     res.prerelease = json.get("prerelease").and_then(|v| v.as_str()).map(|s| s.to_string());
     res.pre_available = json.get("pre_available").and_then(|v| v.as_bool()).unwrap_or(false);
     res.current = json.get("current").and_then(|v| v.as_str()).map(|s| s.to_string());
+    res.staging = json.get("staging").and_then(|v| v.as_str()).map(|s| s.to_string());
     res.message = json
         .pointer("/error/message")
         .and_then(|v| v.as_str())
