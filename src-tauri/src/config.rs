@@ -12,6 +12,9 @@ pub struct AppConfig {
     pub auto_update_dsh: bool,
     /// 是否自动更新应用壳（默认 true）
     pub auto_update_app: bool,
+    /// 是否更新预发布版本（默认 false：只跟随正式发布；开启后检查/自动更新都含预发布）
+    #[serde(default)]
+    pub pre_release: bool,
     /// 自定义端口（0 = 自动，默认 3080 优先）
     pub port: u16,
     /// 更新源（"auto" 自动探测 / "npmjs" 官方 / "npmmirror" 国内镜像）
@@ -23,6 +26,7 @@ impl Default for AppConfig {
         Self {
             auto_update_dsh: true,
             auto_update_app: true,
+            pre_release: false,
             port: 3080,
             registry_source: "auto".to_string(),
         }
@@ -66,6 +70,7 @@ mod tests {
         let c = AppConfig::default();
         assert!(c.auto_update_dsh, "默认自动更新 DSH");
         assert!(c.auto_update_app, "默认自动更新应用壳");
+        assert!(!c.pre_release, "默认不更新预发布版本");
         assert_eq!(c.port, 3080, "默认端口 3080");
     }
 

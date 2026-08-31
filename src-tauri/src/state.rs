@@ -49,10 +49,12 @@ pub struct AppState {
     pub dsh_extra_args: Mutex<Vec<String>>,
     /// 最近一次 DSH 更新结果（后台自动更新 / 手动检查更新共用，设置页展示）
     pub dsh_update: Mutex<Option<DshUpdateStatus>>,
+    /// 最近一次应用壳更新结果（手动检查/更新，设置页展示）
+    pub app_update: Mutex<Option<DshUpdateStatus>>,
 }
 
-/// DSH 更新状态（设置页「关于」区展示）
-#[derive(Debug, Clone, Serialize)]
+/// 组件更新状态（DSH 运行时 / 应用壳共用，设置页「关于」区展示）
+#[derive(Debug, Clone, Serialize, Default)]
 pub struct DshUpdateStatus {
     /// 检查/更新是否成功
     pub ok: bool,
@@ -60,8 +62,12 @@ pub struct DshUpdateStatus {
     pub update_available: bool,
     /// 当前已安装版本（可能为 None：运行时未初始化）
     pub current: Option<String>,
-    /// 最新版本（检查成功时才有）
+    /// 最新版本（检查成功时才有；正式版 latest）
     pub latest: Option<String>,
+    /// 最新预发布版本（可能为 None；仅 DSH 更新使用）
+    pub prerelease: Option<String>,
+    /// 预发布版本是否比当前新（可更新到预发布）
+    pub pre_available: bool,
     /// 白话状态文案（已是最新 / 发现新版本 / 失败原因等）
     pub message: String,
 }
@@ -149,6 +155,14 @@ impl AppState {
     pub fn dsh_update(&self) -> Option<DshUpdateStatus> {
         self.dsh_update.lock().unwrap().clone()
     }
+
+    pub fn set_app_update(&self, status: DshUpdateStatus) {
+        *self.app_update.lock().unwrap() = Some(status);
+    }
+
+    pub fn app_update(&self) -> Option<DshUpdateStatus> {
+        self.app_update.lock().unwrap().clone()
+    }
 }
 
 /// 前端读取的状态快照
@@ -180,6 +194,7 @@ mod tests {
             config: Mutex::new(ConfigStore::new(std::path::Path::new(""))),
             dsh_extra_args: Mutex::new(Vec::new()),
             dsh_update: Mutex::new(None),
+            app_update: Mutex::new(None),
         }
     }
 

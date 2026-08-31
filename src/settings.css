@@ -116,6 +116,35 @@ h1 {
   flex-shrink: 0;
 }
 
+/* 版本 + 更新状态合并行（应用版本 / DSH 版本） */
+.about-update-row {
+  align-items: center;
+}
+
+.about-update-text {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.about-update-text .hint {
+  margin-top: 0;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.about-update-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+.about-update-actions > span {
+  font-size: 13px;
+}
+
 .path {
   text-align: right;
   word-break: break-all;

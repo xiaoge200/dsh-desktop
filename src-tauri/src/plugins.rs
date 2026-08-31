@@ -637,30 +637,57 @@ fn run_npm(node: &Path, cwd: &Path, args: &[String], timeout: Duration) -> Resul
     let node_n = crate::node::normalize_for_node(node);
     let npm_n = crate::node::normalize_for_node(&npm_cli);
     let cwd_n = crate::node::normalize_for_node(cwd);
-    let mut cmd = Command::new(&node_n);
-    cmd.arg(&npm_n).args(args).current_dir(&cwd_n);
-    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut full_args: Vec<String> = vec![npm_n.to_string_lossy().to_string()];
+    full_args.extend(args.iter().cloned());
+    log::info!("npm: {:?} {:?}", node_n, full_args);
+
+    // 平台相关启动：Windows 用「隐藏控制台」+ 匿名管道（npm 及其派生的 cmd/node
+    // 子进程都不弹窗口）；Unix 用 std Command + 进程组便于整组清理。
     #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        // CREATE_NO_WINDOW：不弹黑窗口；CREATE_NEW_PROCESS_GROUP：便于整组清理
-        cmd.creation_flags(0x0800_0000 | 0x0000_0200);
-    }
+    let (mut child, pipes): (
+        crate::winproc::ChildHandle,
+        Vec<(bool, Option<Box<dyn std::io::Read + Send>>)>,
+    ) = {
+        use crate::winproc::{create_pipe, spawn_hidden, SpawnOpts};
+        let (out_r, out_w) = create_pipe().map_err(|e| format!("无法创建管道: {e}"))?;
+        let (err_r, err_w) = create_pipe().map_err(|e| format!("无法创建管道: {e}"))?;
+        let child = spawn_hidden(SpawnOpts {
+            program: node_n.clone(),
+            args: full_args,
+            cwd: Some(cwd_n.clone()),
+            stdout: Some(out_w),
+            stderr: Some(err_w),
+            suspend: false,
+            process_group: true,
+        })
+        .map_err(|e| format!("无法启动 npm: {e}"))?;
+        // 父进程关闭写端：子进程退出后读端才能 EOF
+        let pipes: Vec<(bool, Option<Box<dyn std::io::Read + Send>>)> = vec![
+            (false, Some(Box::new(out_r) as Box<dyn std::io::Read + Send>)),
+            (true, Some(Box::new(err_r) as Box<dyn std::io::Read + Send>)),
+        ];
+        (child, pipes)
+    };
     #[cfg(unix)]
-    {
+    let (mut child, pipes): (
+        std::process::Child,
+        Vec<(bool, Option<Box<dyn std::io::Read + Send>>)>,
+    ) = {
+        let mut cmd = Command::new(&node_n);
+        cmd.args(&full_args).current_dir(&cwd_n);
+        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
         use std::os::unix::process::CommandExt;
         cmd.process_group(0);
-    }
-    log::info!("npm: {:?} {:?}", node_n, args);
-
-    let mut child = cmd.spawn().map_err(|e| format!("无法启动 npm: {e}"))?;
+        let mut child = cmd.spawn().map_err(|e| format!("无法启动 npm: {e}"))?;
+        let pipes: Vec<(bool, Option<Box<dyn std::io::Read + Send>>)> = vec![
+            (false, child.stdout.take().map(|p| Box::new(p) as Box<dyn std::io::Read + Send>)),
+            (true, child.stderr.take().map(|p| Box::new(p) as Box<dyn std::io::Read + Send>)),
+        ];
+        (child, pipes)
+    };
 
     // 边跑边排空管道，避免 npm 输出撑满缓冲区卡死
     let (tx, rx) = std::sync::mpsc::channel::<(bool, String)>();
-    let pipes: Vec<(bool, Option<Box<dyn std::io::Read + Send>>)> = vec![
-        (false, child.stdout.take().map(|p| Box::new(p) as Box<dyn std::io::Read + Send>)),
-        (true, child.stderr.take().map(|p| Box::new(p) as Box<dyn std::io::Read + Send>)),
-    ];
     for (is_err, pipe) in pipes {
         let tx = tx.clone();
         if let Some(mut pipe) = pipe {

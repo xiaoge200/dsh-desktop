@@ -41,6 +41,16 @@
             <span class="slider"></span>
           </label>
         </div>
+        <div class="row">
+          <div class="row-text">
+            <span class="label" data-i18n="更新预发布版本">更新预发布版本</span>
+            <span class="hint" data-i18n="更新预发布版本提示">开启后检查与自动更新也包含预发布版本（如 beta / rc）</span>
+          </div>
+          <label class="switch">
+            <input type="checkbox" id="pre-release" />
+            <span class="slider"></span>
+          </label>
+        </div>
       </section>
 
       <section class="card">
@@ -111,15 +121,27 @@
 
       <section class="card">
         <h2 data-i18n="关于">关于</h2>
-        <div class="about-row"><span class="label" data-i18n="应用版本">应用版本</span><span id="app-version">-</span></div>
-        <div class="about-row"><span class="label" data-i18n="DSH 版本">DSH 版本</span><span id="dsh-version">-</span></div>
-        <div class="about-row">
-          <span class="label" data-i18n="DSH 更新">DSH 更新</span>
-          <span id="dsh-update-state">-</span>
+        <div class="about-row about-update-row">
+          <div class="about-update-text">
+            <span class="label" data-i18n="应用版本">应用版本</span>
+            <span id="app-update-state" class="hint">-</span>
+          </div>
+          <div class="about-update-actions">
+            <span id="app-version">-</span>
+            <button class="btn btn-small" id="app-check-update-btn" data-i18n="检查更新">检查更新</button>
+            <button class="btn btn-small" id="app-apply-update-btn" data-i18n="立即更新" hidden>立即更新</button>
+          </div>
         </div>
-        <div class="row actions">
-          <button class="btn" id="check-update-btn" data-i18n="检查更新">检查更新</button>
-          <button class="btn" id="apply-update-btn" data-i18n="立即更新" hidden>立即更新</button>
+        <div class="about-row about-update-row">
+          <div class="about-update-text">
+            <span class="label" data-i18n="DSH 版本">DSH 版本</span>
+            <span id="dsh-update-state" class="hint">-</span>
+          </div>
+          <div class="about-update-actions">
+            <span id="dsh-version">-</span>
+            <button class="btn btn-small" id="check-update-btn" data-i18n="检查更新">检查更新</button>
+            <button class="btn btn-small" id="apply-update-btn" data-i18n="立即更新" hidden>立即更新</button>
+          </div>
         </div>
         <div class="about-row"><span class="label" data-i18n="运行环境">运行环境</span><span id="node-version">-</span></div>
         <div class="about-row"><span class="label" data-i18n="工作区位置">工作区位置</span><span class="path" id="workspace-path">-</span></div>

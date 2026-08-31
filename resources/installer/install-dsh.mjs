@@ -14,12 +14,19 @@
  *   准备（同步，启动路径）：
  *     node install-dsh.mjs prepare --target <dir> --baseline <dir>
  *   更新（异步，后台路径）：
- *     node install-dsh.mjs update --target <dir> [--registry <url>] [--mirror <url>] [--force]
+ *     node install-dsh.mjs update --target <dir> [--registry <url>] [--mirror <url>] [--force] [--pre]
  *   检查（异步，仅查询）：
- *     node install-dsh.mjs check --target <dir> [--registry <url>] [--mirror <url>]
+ *     node install-dsh.mjs check --target <dir> [--registry <url>] [--mirror <url>] [--pre]
+ *
+ * --pre：设置页「更新预发布版本」开启时传入——目标版本取正式版与预发布中更高者；
+ *       不带时优先正式版；若尚未发布正式版（全部是预发布），则跟随最高预发布，
+ *       保证始终能更新到当前发行中的最新版本。
+ *       正式版/预发布按 semver 版本号区分（含 `-` 后缀为预发布，如 1.2.0-rc.1），
+ *       查询用 `npm view dist-tags`（latest/next/beta/rc 所有 tag 指向的版本都纳入），
+ *       不依赖 tag 名——latest tag 可能指向预发布版本。
  *
  * 输出契约（stdout 末行 = JSON）：
- *   {"ok":true,"action":"prepared-from-baseline"|"baseline-ok"|"updated"|"up-to-date"|"offline-reuse"|"new-version-available","version":"0.1.1-rc.2","dir":"...","source":"baseline"|"npmjs"|"npmmirror"|"cache"}
+ *   {"ok":true,"action":"prepared-from-baseline"|"baseline-ok"|"updated"|"up-to-date"|"offline-reuse"|"new-version-available"|"prerelease-available","version":"0.1.1","prerelease":"0.1.2-rc.1","pre_available":true,"current":"0.1.0","dir":"...","source":"baseline"|"npmjs"|"npmmirror"|"cache"}
  *   {"ok":false,"error":{"kind":"network"|"install"|"integrity"|"unknown","message":"白话摘要","detail":"技术细节"}}
  */
 
@@ -39,7 +46,7 @@ const INSTALLED_FILE = ".installed.json";
 
 // ---- arg parsing ----
 function parseArgs(argv) {
-  const opts = { mode: null, target: null, baseline: null, registry: null, mirror: null, force: false };
+  const opts = { mode: null, target: null, baseline: null, registry: null, mirror: null, force: false, pre: false };
   let rest = [...argv];
   opts.mode = rest.shift();
   while (rest.length) {
@@ -50,6 +57,7 @@ function parseArgs(argv) {
       case "--registry": opts.registry = rest.shift(); break;
       case "--mirror": opts.mirror = rest.shift(); break;
       case "--force": opts.force = true; break;
+      case "--pre": opts.pre = true; break;
       default: break;
     }
   }
@@ -122,22 +130,76 @@ function registryReachable(registry, timeoutMs = 3000) {
   });
 }
 
-async function queryLatest(registry) {
+/** 简单 semver 比较：a>b 返回正数，a<b 返回负数，相等 0。预发布（含 -）低于同 core 的正式版。 */
+function compareVersions(a, b) {
+  const parse = (v) => {
+    const [core, pre] = String(v).split("-");
+    return { nums: core.split(".").map(Number), pre: pre ?? null };
+  };
+  const pa = parse(a), pb = parse(b);
+  for (let i = 0; i < 3; i++) {
+    const x = pa.nums[i] ?? 0, y = pb.nums[i] ?? 0;
+    if (x !== y) return x - y;
+  }
+  if (pa.pre === null && pb.pre !== null) return 1;
+  if (pa.pre !== null && pb.pre === null) return -1;
+  if (pa.pre !== null && pb.pre !== null && pa.pre !== pb.pre) {
+    return pa.pre < pb.pre ? -1 : 1;
+  }
+  return 0;
+}
+
+/**
+ * 从版本列表区分正式版与预发布（按 semver 预发布标记：版本号含 `-` 后缀即预发布，
+ * 如 1.2.0-beta.1 / 1.2.0-rc.2；不含 `-` 的是正式发布）。不依赖 npm dist-tag 名——
+ * latest tag 可能指向预发布版本，tag 名不可靠。
+ * 返回 { stable, prerelease }：各自范围内的最高版本，无则 null。
+ */
+function splitVersions(versions) {
+  let stable = null, prerelease = null;
+  for (const v of versions) {
+    if (typeof v !== "string" || !v.trim()) continue;
+    if (v.includes("-")) {
+      if (!prerelease || compareVersions(v, prerelease) > 0) prerelease = v;
+    } else {
+      if (!stable || compareVersions(v, stable) > 0) stable = v;
+    }
+  }
+  return { stable, prerelease };
+}
+
+/**
+ * 查询 dist-tags：返回 { stable, prerelease } 或 null。
+ * 所有 tag（latest / next / beta / rc …）指向的版本都纳入，按 semver 标记区分：
+ *   stable：不含 `-` 的最高正式版
+ *   prerelease：含 `-` 的最高版本（如 1.2.0-rc.1），无则 null
+ * 不依赖 tag 名——latest tag 可能指向预发布版本（如 0.1.1-rc.2），只看版本号。
+ */
+async function queryDistTags(registry) {
   // 快速连通性探测：离线时立即返回，不等 npm 长重试（NFR-06 离线降级）
   const reachable = await registryReachable(registry);
   if (!reachable) return null;
-  const res = runNpm(["view", PKG, "version", "--registry", registry, "--no-audit", "--no-fund", "--fetch-retries=0", "--fetch-timeout=8000"], { timeout: 60_000 });
+  const res = runNpm(["view", PKG, "dist-tags", "--json", "--registry", registry, "--no-audit", "--no-fund", "--fetch-retries=0", "--fetch-timeout=8000"], { timeout: 60_000 });
   if (res.status !== 0) return null;
-  const v = (res.stdout ?? "").trim().split(/\r?\n/).filter(Boolean).pop();
-  return v || null;
+  let tags;
+  try {
+    tags = JSON.parse((res.stdout ?? "").trim());
+  } catch {
+    return null;
+  }
+  if (!tags || typeof tags !== "object") return null;
+  const versions = Object.values(tags).filter((v) => typeof v === "string");
+  if (versions.length === 0) return null;
+  return splitVersions(versions);
 }
 
-/** npm install 到 target；成功返回版本字符串 */
-function installTo(target, registry) {
+/** npm install 到 target（可指定版本；versionSpec 为 null 时装最新） */
+function installTo(target, registry, versionSpec) {
   rmSync(target, { recursive: true, force: true });
   mkdirSync(target, { recursive: true });
+  const spec = versionSpec ? `${PKG}@${versionSpec}` : PKG;
   const res = runNpm(
-    ["install", PKG, "--prefix", target, "--registry", registry, "--no-audit", "--no-fund", "--no-update-notifier", "--loglevel=error"],
+    ["install", spec, "--prefix", target, "--registry", registry, "--no-audit", "--no-fund", "--no-update-notifier", "--loglevel=error"],
     { timeout: 1_800_000 });
   if (res.status !== 0) {
     const detail = (res.stderr || res.stdout || "").trim();
@@ -324,49 +386,84 @@ async function main() {
     }
 
     case "check": {
-      // 后台：仅查询最新版本
+      // 后台：仅查询最新版本。目标版本选择：
+      //  - --pre（设置开启预发布更新）：正式版与预发布中更高者
+      //  - 无 --pre：优先正式版；但 DSH 可能还没有正式版（全部是预发布），
+      //    此时跟随最高预发布，保证始终能更新到当前发行中的最新版本
       const registries = [
         { label: opts.registry ? "custom" : "npmjs", url: opts.registry || DEFAULT_REGISTRY },
         { label: opts.mirror ? "custom" : "npmmirror", url: opts.mirror || DEFAULT_MIRROR },
       ];
-      let latest = null, latestSource = null;
+      let info = null, latestSource = null;
       for (const r of registries) {
-        const v = await queryLatest(r.url);
-        if (v) { latest = v; latestSource = r.label; break; }
+        const d = await queryDistTags(r.url);
+        if (d && (d.stable || d.prerelease)) { info = d; latestSource = r.label; break; }
       }
-      if (!latest) {
+      if (!info) {
         out({ ok: false, error: { kind: "network", message: "暂时无法检查更新", detail: "both registries unreachable" } });
         process.exit(1);
       }
       const installed = readInstalled(target);
       const current = installed && installed.version ? installed.version : readVersion(target);
-      if (current === latest) {
-        out({ ok: true, action: "up-to-date", version: latest, dir: target, source: latestSource });
+      const stable = info.stable;
+      const prerelease = info.prerelease;
+      const cur = current ?? "0.0.0";
+      // 跟随目标
+      let follow = null;
+      if (opts.pre && prerelease && stable && compareVersions(prerelease, stable) > 0) {
+        follow = prerelease; // 开启且预发布更高
+      } else if (stable) {
+        follow = stable;
       } else {
-        out({ ok: true, action: "new-version-available", version: latest, current, dir: target, source: latestSource });
+        follow = prerelease; // 没有正式版：跟随最高预发布
       }
+      const target_available = !!follow && follow !== cur && compareVersions(follow, cur) > 0;
+      const pre_available = !!prerelease && prerelease !== cur && compareVersions(prerelease, cur) > 0;
+      // action：目标可用时，目标是预发布 → prerelease-available，否则 new-version-available
+      const is_pre_target = follow !== null && prerelease !== null && follow === prerelease && follow !== stable;
+      const action = !target_available
+        ? "up-to-date"
+        : (is_pre_target ? "prerelease-available" : "new-version-available");
+      out({
+        ok: true, action, version: stable, prerelease, pre_available, current,
+        dir: target, source: latestSource,
+      });
       return;
     }
 
     case "update": {
-      // 后台：安装/更新到最新版；带回滚（R7/R10：失败保留旧版本可用）
+      // 后台：安装/更新到目标版本（同 check 的目标选择；--pre 允许预发布）；
+      // 带回滚（R7/R10：失败保留旧版本可用）
       const registries = [
         { label: opts.registry ? "custom" : "npmjs", url: opts.registry || DEFAULT_REGISTRY },
         { label: opts.mirror ? "custom" : "npmmirror", url: opts.mirror || DEFAULT_MIRROR },
       ];
-      let latest = null, latestSource = null;
+      let info = null, latestSource = null;
       for (const r of registries) {
-        const v = await queryLatest(r.url);
-        if (v) { latest = v; latestSource = r.label; break; }
+        const d = await queryDistTags(r.url);
+        if (d && (d.stable || d.prerelease)) { info = d; latestSource = r.label; break; }
       }
-      if (!latest) {
+      if (!info) {
         out({ ok: false, error: { kind: "network", message: "当前没有网络，更新等联网后自动进行。", detail: "both registries unreachable" } });
         process.exit(1);
       }
       const installed = readInstalled(target);
       const current = installed && installed.version ? installed.version : readVersion(target);
-      if (!opts.force && current === latest) {
-        out({ ok: true, action: "up-to-date", version: latest, dir: target, source: latestSource });
+      const stable = info.stable;
+      const prerelease = info.prerelease;
+      const cur = current ?? "0.0.0";
+      const pre_available = !!prerelease && prerelease !== cur && compareVersions(prerelease, cur) > 0;
+      // 目标版本（与 check 一致）
+      let targetVersion = null;
+      if (opts.pre && prerelease && stable && compareVersions(prerelease, stable) > 0) {
+        targetVersion = prerelease;
+      } else if (stable) {
+        targetVersion = stable;
+      } else {
+        targetVersion = prerelease;
+      }
+      if (!opts.force && current === targetVersion) {
+        out({ ok: true, action: "up-to-date", version: stable, prerelease, pre_available, current, dir: target, source: latestSource });
         return;
       }
 
@@ -385,12 +482,12 @@ async function main() {
         }
       }
 
-      // 2) 安装新版本（换源重试）
+      // 2) 安装目标版本（换源重试）
       let version = null, usedSource = null;
       const order = latestSource === "npmmirror" ? [registries[1], registries[0]] : [registries[0], registries[1]];
       for (const r of order) {
         try {
-          version = installTo(target, r.url);
+          version = installTo(target, r.url, targetVersion);
           usedSource = r.label;
           break;
         } catch { /* 换源重试 */ }
@@ -419,7 +516,7 @@ async function main() {
         integrity: shasum256(join(target, "node_modules", "@deepseek-ai", "dsh", "lib", "bin.js")),
       });
       rmSync(bakDir, { recursive: true, force: true });
-      out({ ok: true, action: "updated", version, dir: target, source: usedSource });
+      out({ ok: true, action: "updated", version, prerelease, pre_available, current, dir: target, source: usedSource });
       return;
     }
 
@@ -440,4 +537,4 @@ if (!invokedByTest) {
 }
 
 // 导出供测试（顶层 export 是 ESM 静态约束）
-export { restoreBackup, copyTree, copyTreeFallback, smokeTest, readInstalled, writeInstalled };
+export { restoreBackup, copyTree, copyTreeFallback, smokeTest, readInstalled, writeInstalled, compareVersions, splitVersions };

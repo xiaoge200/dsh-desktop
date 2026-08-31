@@ -91,25 +91,33 @@ pub fn run_prepare(
 
 /// 用内置 Node 运行 install-dsh.mjs 的 check 模式（后台：仅查询最新版）
 /// `source` 可选："npmjs" / "npmmirror" / 其他（自动）
-pub fn run_check(node: &Path, installer_js: &Path, target: &Path, source: &str) -> Result<String, String> {
+/// `pre`：是否把预发布版本当作可用更新（设置页「更新预发布版本」开启时传 true）
+pub fn run_check(node: &Path, installer_js: &Path, target: &Path, source: &str, pre: bool) -> Result<String, String> {
     let mut args = vec![
         "check".to_string(),
         "--target".to_string(),
         normalize_for_node(target).to_string_lossy().to_string(),
     ];
     args.extend(registry_args(source));
+    if pre {
+        args.push("--pre".to_string());
+    }
     run_installer(node, installer_js, &args)
 }
 
-/// 用内置 Node 运行 install-dsh.mjs 的 update 模式（后台：安装/更新到最新版）
+/// 用内置 Node 运行 install-dsh.mjs 的 update 模式（后台：安装/更新到目标版本）
 /// `source` 可选："npmjs" / "npmmirror" / 其他（自动）
-pub fn run_update(node: &Path, installer_js: &Path, target: &Path, source: &str) -> Result<String, String> {
+/// `pre`：允许安装到预发布版本（设置页「更新预发布版本」开启时传 true）
+pub fn run_update(node: &Path, installer_js: &Path, target: &Path, source: &str, pre: bool) -> Result<String, String> {
     let mut args = vec![
         "update".to_string(),
         "--target".to_string(),
         normalize_for_node(target).to_string_lossy().to_string(),
     ];
     args.extend(registry_args(source));
+    if pre {
+        args.push("--pre".to_string());
+    }
     run_installer(node, installer_js, &args)
 }
 
@@ -135,34 +143,72 @@ fn registry_args(source: &str) -> Vec<String> {
 
 /// 用内置 Node 运行 install-dsh.mjs；返回 stdout 全文（调用方解析末行 JSON）
 fn run_installer(node: &Path, installer_js: &Path, args: &[String]) -> Result<String, String> {
-    let mut cmd = Command::new(normalize_for_node(node));
-    cmd.arg(normalize_for_node(installer_js));
-    for a in args {
-        cmd.arg(a);
-    }
-    // Windows 下禁止子进程弹控制台窗口（CREATE_NO_WINDOW）
+    let mut full_args: Vec<String> = vec![normalize_for_node(installer_js).to_string_lossy().to_string()];
+    full_args.extend(args.iter().cloned());
+    log::info!("installer: {:?} {:?}", normalize_for_node(node), full_args);
+
+    // 平台相关启动：Windows 用「隐藏控制台」+ 匿名管道（install-dsh.mjs 派生的
+    // npm 子进程同样不弹窗口）；Unix 用 std Command 捕获输出。
     #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
-    }
-    log::info!("installer: {:?}", cmd);
-    let out = cmd
-        .output()
+    let (success, stdout, stderr) = {
+        use crate::winproc::{create_pipe, spawn_hidden, SpawnOpts};
+        let (out_r, out_w) = create_pipe().map_err(|e| format!("cannot start installer: {e}"))?;
+        let (err_r, err_w) = create_pipe().map_err(|e| format!("cannot start installer: {e}"))?;
+        let mut child = spawn_hidden(SpawnOpts {
+            program: normalize_for_node(node),
+            args: full_args,
+            cwd: None,
+            stdout: Some(out_w),
+            stderr: Some(err_w),
+            suspend: false,
+            process_group: false,
+        })
         .map_err(|e| format!("cannot start installer: {e}"))?;
-    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+        // 边跑边排空管道，避免输出撑满缓冲区卡死
+        let t_out = std::thread::spawn(move || {
+            use std::io::Read;
+            let mut buf = String::new();
+            let _ = (&mut &out_r).read_to_string(&mut buf);
+            buf
+        });
+        let t_err = std::thread::spawn(move || {
+            use std::io::Read;
+            let mut buf = String::new();
+            let _ = (&mut &err_r).read_to_string(&mut buf);
+            buf
+        });
+        let status = child.wait().map_err(|e| format!("installer wait failed: {e}"))?;
+        (
+            status.success(),
+            t_out.join().unwrap_or_default(),
+            t_err.join().unwrap_or_default(),
+        )
+    };
+    #[cfg(unix)]
+    let (success, stdout, stderr) = {
+        let mut cmd = Command::new(normalize_for_node(node));
+        cmd.args(&full_args);
+        log::info!("installer: {:?}", cmd);
+        let out = cmd
+            .output()
+            .map_err(|e| format!("cannot start installer: {e}"))?;
+        (
+            out.status.success(),
+            String::from_utf8_lossy(&out.stdout).to_string(),
+            String::from_utf8_lossy(&out.stderr).to_string(),
+        )
+    };
+
     if !stderr.trim().is_empty() {
         log::warn!("installer stderr: {}", stderr.trim());
     }
-    if !out.status.success() {
+    if !success {
         // 安装器失败时，stdout 末行仍是 JSON（含白话错误）
         if let Some(line) = stdout.lines().last() {
             return Ok(line.to_string()); // 让调用方解析 ok:false
         }
         return Err(format!(
-            "installer exited {}: {}",
-            out.status,
+            "installer exited: {}",
             if stderr.trim().is_empty() { stdout.trim() } else { stderr.trim() }
         ));
     }
@@ -181,10 +227,14 @@ pub fn read_installed_version(runtime_dir: &Path) -> Option<String> {
 #[derive(Debug, Clone, Default)]
 pub struct InstallerResult {
     pub ok: bool,
-    /// "up-to-date" | "new-version-available" | "updated" | ...
+    /// "up-to-date" | "new-version-available" | "prerelease-available" | "updated" | ...
     pub action: String,
-    /// 最新/更新后版本
+    /// 最新/更新后版本（正式版 latest）
     pub version: Option<String>,
+    /// 最新预发布版本（dist-tags 非 latest 中最高；可能为 None）
+    pub prerelease: Option<String>,
+    /// 预发布版本是否比当前新（可更新到预发布）
+    pub pre_available: bool,
     /// 当前版本（检查到新版本时附带）
     pub current: Option<String>,
     /// 白话错误信息（ok=false 时）
@@ -201,6 +251,8 @@ pub fn parse_installer_output(out: &str) -> InstallerResult {
     res.ok = json.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
     res.action = json.get("action").and_then(|v| v.as_str()).unwrap_or("").to_string();
     res.version = json.get("version").and_then(|v| v.as_str()).map(|s| s.to_string());
+    res.prerelease = json.get("prerelease").and_then(|v| v.as_str()).map(|s| s.to_string());
+    res.pre_available = json.get("pre_available").and_then(|v| v.as_bool()).unwrap_or(false);
     res.current = json.get("current").and_then(|v| v.as_str()).map(|s| s.to_string());
     res.message = json
         .pointer("/error/message")

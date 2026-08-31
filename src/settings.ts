@@ -32,6 +32,7 @@ interface SettingsData {
 interface AppConfig {
   auto_update_dsh: boolean;
   auto_update_app: boolean;
+  pre_release: boolean;
   port: number;
   registry_source: string;
 }
@@ -41,6 +42,8 @@ interface DshUpdateStatus {
   update_available: boolean;
   current: string | null;
   latest: string | null;
+  prerelease: string | null;
+  pre_available: boolean;
   message: string;
 }
 
@@ -49,6 +52,7 @@ const $ = <T extends HTMLElement = HTMLElement>(id: string) => document.querySel
 const els = {
   autostart: document.querySelector("#autostart") as HTMLInputElement,
   autoUpdate: document.querySelector("#auto-update") as HTMLInputElement,
+  preRelease: document.querySelector("#pre-release") as HTMLInputElement,
   serviceState: $("#service-state"),
   restartBtn: $("#restart-btn") as HTMLButtonElement,
   appVersion: $("#app-version"),
@@ -65,6 +69,9 @@ const els = {
   updateState: $("#dsh-update-state"),
   checkUpdateBtn: $("#check-update-btn") as HTMLButtonElement,
   applyUpdateBtn: $("#apply-update-btn") as HTMLButtonElement,
+  appUpdateState: $("#app-update-state"),
+  appCheckUpdateBtn: $("#app-check-update-btn") as HTMLButtonElement,
+  appApplyUpdateBtn: $("#app-apply-update-btn") as HTMLButtonElement,
 };
 
 let configCache: AppConfig | null = null;
@@ -73,7 +80,7 @@ function setRowText(el: HTMLElement, text: string) {
   el.textContent = text;
 }
 
-// ---- DSH 更新（状态展示 + 手动检查/更新） ----
+// ---- DSH 更新（版本 + 状态合并展示；手动检查/更新） ----
 
 let lastUpdateStatus: DshUpdateStatus | null = null;
 let updateBusy = false;
@@ -85,11 +92,25 @@ function renderUpdateStatus() {
     els.applyUpdateBtn.hidden = true;
     return;
   }
-  setRowText(els.updateState, st.message);
+  // 状态文案：主 message +（若预发布可用且已开启预发布）附加预发布提示
+  let msg = st.message;
+  if (st.pre_available && st.prerelease && !st.update_available) {
+    // 正式版已最新（或无正式版），仅预发布更新可用
+    msg = lang === "zh"
+      ? `已是最新正式版；发现预发布版本 ${st.prerelease}（已开启预发布更新）`
+      : `Latest stable installed; prerelease ${st.prerelease} available (prerelease updates on)`;
+  } else if (st.prerelease && st.pre_available) {
+    msg = lang === "zh"
+      ? `${st.message}（预发布 ${st.prerelease}）`
+      : `${st.message} (prerelease ${st.prerelease})`;
+  }
+  setRowText(els.updateState, msg);
   // 只有发现新版本且当前没有更新任务时才显示「立即更新」
   els.applyUpdateBtn.hidden = !st.update_available || updateBusy;
-  // 同步「DSH 版本」显示（更新后当前版本可能变化）
-  if (st.current) setRowText(els.dshVersion, st.current);
+  // 「DSH 版本」与更新状态合并显示：优先展示检查/更新结果里的版本信息
+  // （无正式版时 latest 为 null，回退到预发布版本号）
+  const ver = st.current ?? st.latest ?? st.prerelease;
+  if (ver) setRowText(els.dshVersion, ver);
 }
 
 async function loadUpdateStatus() {
@@ -117,6 +138,8 @@ async function doCheckUpdate() {
       update_available: false,
       current: null,
       latest: null,
+      prerelease: null,
+      pre_available: false,
       message: lang === "zh" ? "检查更新失败，请查看日志。" : "Failed to check updates. See the logs.",
     };
   } finally {
@@ -142,6 +165,8 @@ async function doApplyUpdate() {
       update_available: false,
       current: null,
       latest: null,
+      prerelease: null,
+      pre_available: false,
       message: lang === "zh" ? "更新失败，请查看日志。" : "Update failed. See the logs.",
     };
   } finally {
@@ -149,6 +174,88 @@ async function doApplyUpdate() {
     els.applyUpdateBtn.disabled = false;
     els.applyUpdateBtn.textContent = T("立即更新");
     renderUpdateStatus();
+  }
+}
+
+// ---- 应用更新（版本 + 状态合并展示；手动检查/更新） ----
+
+let lastAppUpdateStatus: DshUpdateStatus | null = null;
+let appUpdateBusy = false;
+
+function renderAppUpdateStatus() {
+  const st = lastAppUpdateStatus;
+  if (!st) {
+    setRowText(els.appUpdateState, T("尚未检查更新"));
+    els.appApplyUpdateBtn.hidden = true;
+    return;
+  }
+  setRowText(els.appUpdateState, st.message);
+  els.appApplyUpdateBtn.hidden = !st.update_available || appUpdateBusy;
+  const ver = st.current ?? st.latest;
+  if (ver) setRowText(els.appVersion, ver);
+}
+
+async function loadAppUpdateStatus() {
+  try {
+    lastAppUpdateStatus = await invoke<DshUpdateStatus | null>("get_app_update_status");
+  } catch (e) {
+    console.error("load app update status failed", e);
+    lastAppUpdateStatus = null;
+  }
+  renderAppUpdateStatus();
+}
+
+async function doCheckAppUpdate() {
+  if (appUpdateBusy) return;
+  appUpdateBusy = true;
+  els.appCheckUpdateBtn.disabled = true;
+  els.appCheckUpdateBtn.textContent = T("检查中…");
+  setRowText(els.appUpdateState, T("检查中…"));
+  try {
+    lastAppUpdateStatus = await invoke<DshUpdateStatus>("check_app_update");
+  } catch (e) {
+    console.error("check app update failed", e);
+    lastAppUpdateStatus = {
+      ok: false,
+      update_available: false,
+      current: null,
+      latest: null,
+      prerelease: null,
+      pre_available: false,
+      message: lang === "zh" ? "检查更新失败，请查看日志。" : "Failed to check updates. See the logs.",
+    };
+  } finally {
+    appUpdateBusy = false;
+    els.appCheckUpdateBtn.disabled = false;
+    els.appCheckUpdateBtn.textContent = T("检查更新");
+    renderAppUpdateStatus();
+  }
+}
+
+async function doApplyAppUpdate() {
+  if (appUpdateBusy) return;
+  appUpdateBusy = true;
+  els.appApplyUpdateBtn.disabled = true;
+  els.appApplyUpdateBtn.textContent = T("更新中…");
+  setRowText(els.appUpdateState, T("正在更新，请稍候…"));
+  try {
+    lastAppUpdateStatus = await invoke<DshUpdateStatus>("update_app");
+  } catch (e) {
+    console.error("app update failed", e);
+    lastAppUpdateStatus = {
+      ok: false,
+      update_available: false,
+      current: null,
+      latest: null,
+      prerelease: null,
+      pre_available: false,
+      message: lang === "zh" ? "更新失败，请查看日志。" : "Update failed. See the logs.",
+    };
+  } finally {
+    appUpdateBusy = false;
+    els.appApplyUpdateBtn.disabled = false;
+    els.appApplyUpdateBtn.textContent = T("立即更新");
+    renderAppUpdateStatus();
   }
 }
 
@@ -180,12 +287,15 @@ async function loadSettings() {
     // 自动更新开关
     configCache = await invoke<AppConfig>("get_config");
     els.autoUpdate.checked = configCache.auto_update_dsh;
+    els.preRelease.checked = configCache.pre_release;
     // 高级区：端口 + 更新源
     els.portInput.value = configCache.port > 0 ? String(configCache.port) : "0";
     els.registrySelect.value = configCache.registry_source || "auto";
 
     // DSH 更新状态（后台自动更新 / 上次检查结果，纯本地读取）
     await loadUpdateStatus();
+    // 应用更新状态（上次手动检查/更新的结果，纯本地读取）
+    await loadAppUpdateStatus();
   } catch (e) {
     setRowText(els.serviceState, T("读取失败"));
     console.error("load settings failed", e);
@@ -265,6 +375,20 @@ function bind() {
     }
   });
 
+  // 更新预发布版本开关
+  els.preRelease.addEventListener("change", async () => {
+    if (!configCache) return;
+    const next = { ...configCache, pre_release: els.preRelease.checked };
+    try {
+      await invoke("set_config", { config: next });
+      configCache = next;
+    } catch (e) {
+      console.error("pre-release toggle failed", e);
+      els.preRelease.checked = !els.preRelease.checked;
+      alert(lang === "zh" ? "切换预发布更新失败，请稍后再试。" : "Failed to change prerelease setting. Please try again.");
+    }
+  });
+
   els.restartBtn.addEventListener("click", async () => {
     els.restartBtn.disabled = true;
     els.restartBtn.textContent = lang === "zh" ? "正在重启…" : "Restarting…";
@@ -283,6 +407,10 @@ function bind() {
   // DSH 更新：手动检查 / 立即更新
   els.checkUpdateBtn.addEventListener("click", doCheckUpdate);
   els.applyUpdateBtn.addEventListener("click", doApplyUpdate);
+
+  // 应用更新：手动检查 / 立即更新
+  els.appCheckUpdateBtn.addEventListener("click", doCheckAppUpdate);
+  els.appApplyUpdateBtn.addEventListener("click", doApplyAppUpdate);
 
   els.openWorkspaceBtn.addEventListener("click", async () => {
     try {

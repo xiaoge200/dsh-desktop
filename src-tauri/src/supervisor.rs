@@ -1,18 +1,23 @@
 use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
+
+/// 平台相关的子进程句柄：Windows 用隐藏控制台的 ChildHandle（其子孙进程也不弹窗），
+/// 其他平台用 std::process::Child。
+#[cfg(windows)]
+type SpawnedChild = crate::winproc::ChildHandle;
+#[cfg(not(windows))]
+type SpawnedChild = std::process::Child;
 
 /// Windows Job Object 封装：把服务进程树挂到主进程名下，主进程无论以何种方式
 /// 退出（含被强杀/崩溃），job 内进程随之终止，杜绝孤儿 node 进程。
 #[cfg(windows)]
 mod win {
     use std::mem::size_of;
-    use std::os::windows::io::AsRawHandle;
-    use std::process::Child;
 
     use winapi::shared::minwindef::{FALSE, LPVOID};
     use winapi::um::handleapi::{CloseHandle, INVALID_HANDLE_VALUE};
@@ -63,8 +68,8 @@ mod win {
     }
 
     /// 把子进程加入 job（Win8+ 允许嵌套 job，一般会成功；失败不致命）。
-    pub fn assign(job: &Job, child: &Child) -> bool {
-        unsafe { AssignProcessToJobObject(job.0, child.as_raw_handle() as HANDLE) != 0 }
+    pub fn assign(job: &Job, child_handle: HANDLE) -> bool {
+        unsafe { AssignProcessToJobObject(job.0, child_handle) != 0 }
     }
 
     /// 恢复被 CREATE_SUSPENDED 挂起的进程全部线程（Toolhelp 枚举）。
@@ -134,7 +139,7 @@ fn normalize_for_node(p: &Path) -> PathBuf {
 /// - 退出清理：Windows 挂 Job Object（KILL_ON_JOB_CLOSE）——主进程无论以何种方式
 ///   退出（含强杀/崩溃）服务进程树都随之终止；再叠加 taskkill /T /F 兜底
 pub struct Supervisor {
-    child: Mutex<Option<Child>>,
+    child: Mutex<Option<SpawnedChild>>,
     /// 服务实际监听端口
     port: AtomicU32,
     /// 5 分钟滑动窗口内的重启计数
@@ -243,54 +248,43 @@ impl Supervisor {
             log::warn!("ensure workspace dir: {e}");
         }
 
-        let mut cmd = Command::new(normalize_for_node(node));
-        cmd.arg(normalize_for_node(dsh_bin))
-            .arg("web")
-            .arg("--no-open")
-            .arg("--port")
-            .arg(port.to_string())
-            .current_dir(normalize_for_node(workspace));
+        // 组装命令行参数（两平台共用）：node <dsh_bin> web --no-open --port N [extra...]
+        let mut args: Vec<String> = vec![
+            normalize_for_node(dsh_bin).to_string_lossy().to_string(),
+            "web".to_string(),
+            "--no-open".to_string(),
+            "--port".to_string(),
+            port.to_string(),
+        ];
         for a in extra_args {
-            cmd.arg(a);
-        }
-        if let Some(f) = stdout_file {
-            cmd.stdout(f);
-        } else {
-            cmd.stdout(Stdio::null());
-        }
-        if let Some(f) = stderr_file {
-            cmd.stderr(f);
-        } else {
-            cmd.stderr(Stdio::null());
+            args.push(a.clone());
         }
 
-        // 进程组：便于退出时清理整棵进程树
-        #[cfg(unix)]
-        {
-            use std::os::unix::process::CommandExt;
-            cmd.process_group(0);
-        }
+        // Windows：用「隐藏控制台」启动——node 自身及其全部后代（dsh worker、
+        // npm 脚本等）都继承同一个隐藏控制台，整棵进程树都不弹命令行窗口。
+        // （CREATE_NO_WINDOW 只隐藏直接进程，node 的后代没有可继承控制台时会
+        //   各自新建可见控制台 → 插件更新/重启时闪黑窗。详见 winproc 模块注释。）
+        // CREATE_SUSPENDED：先挂起，等挂进 Job 后再恢复，避免启动竞态。
         #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt;
-            // CREATE_NO_WINDOW：不弹黑窗口（node 子进程）；CREATE_NEW_PROCESS_GROUP：便于整组清理；
-            // CREATE_SUSPENDED：先挂起，等挂进 Job 后再恢复，避免启动竞态
-            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-            const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-            const CREATE_SUSPENDED: u32 = 0x0000_0004;
-            cmd.creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP | CREATE_SUSPENDED);
-        }
+        let child: SpawnedChild = {
+            use crate::winproc::{spawn_hidden, SpawnOpts};
+            let child = spawn_hidden(SpawnOpts {
+                program: normalize_for_node(node),
+                args,
+                cwd: Some(normalize_for_node(workspace)),
+                stdout: stdout_file,
+                stderr: stderr_file,
+                suspend: true,
+                process_group: true,
+            })
+            .map_err(|e| format!("启动服务失败: {e}"))?;
+            log::info!("service spawned (hidden console), pid={}", child.id());
 
-        log::info!("spawn: {:?}", cmd);
-        let child = cmd.spawn().map_err(|e| format!("启动服务失败: {e}"))?;
-
-        // Windows：把服务挂进 KILL_ON_JOB_CLOSE 的 Job——主进程无论以何种方式退出
-        // （含强杀/崩溃），整棵服务进程树都会随之终止，杜绝孤儿进程。
-        #[cfg(windows)]
-        {
+            // 把服务挂进 KILL_ON_JOB_CLOSE 的 Job——主进程无论以何种方式退出
+            // （含强杀/崩溃），整棵服务进程树都会随之终止，杜绝孤儿进程。
             let job = win::create_kill_on_close_job();
             if let Some(ref j) = job {
-                if win::assign(j, &child) {
+                if win::assign(j, child.as_raw_handle()) {
                     log::info!("service attached to kill-on-close job");
                 } else {
                     log::warn!("assign service to job failed; falling back to taskkill cleanup");
@@ -299,7 +293,29 @@ impl Supervisor {
             // 无论 job 是否创建成功，都要恢复被挂起的进程
             win::resume_threads(child.id());
             *self.job.lock().unwrap() = job;
-        }
+            child
+        };
+
+        // Unix：进程组便于退出时整组清理；stdout/stderr 落盘或丢弃
+        #[cfg(unix)]
+        let child: SpawnedChild = {
+            let mut cmd = Command::new(normalize_for_node(node));
+            cmd.args(&args).current_dir(normalize_for_node(workspace));
+            if let Some(f) = stdout_file {
+                cmd.stdout(f);
+            } else {
+                cmd.stdout(Stdio::null());
+            }
+            if let Some(f) = stderr_file {
+                cmd.stderr(f);
+            } else {
+                cmd.stderr(Stdio::null());
+            }
+            use std::os::unix::process::CommandExt;
+            cmd.process_group(0);
+            log::info!("spawn: {:?}", cmd);
+            cmd.spawn().map_err(|e| format!("启动服务失败: {e}"))?
+        };
 
         *self.child.lock().unwrap() = Some(child);
         self.port.store(port as u32, Ordering::SeqCst);
@@ -333,18 +349,6 @@ impl Supervisor {
             }
             Err(_) => false,
         }
-    }
-
-    /// 等待服务就绪：轮询健康检查，最多 timeout。
-    pub fn wait_ready(&self, timeout: Duration) -> bool {
-        let deadline = Instant::now() + timeout;
-        while Instant::now() < deadline {
-            if self.health_check() {
-                return true;
-            }
-            std::thread::sleep(Duration::from_millis(300));
-        }
-        self.health_check()
     }
 
     /// 检查子进程是否已退出（返回 true 表示已退出）。

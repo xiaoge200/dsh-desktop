@@ -20,7 +20,7 @@ import { dirname } from "node:path";
 const INSTALLER = fileURLToPath(new URL("./install-dsh.mjs", import.meta.url));
 
 // 顶层 import：install-dsh.mjs 检测到测试进程时不执行 main，仅导出内部函数
-const { restoreBackup, copyTreeFallback } = await import("./install-dsh.mjs");
+const { restoreBackup, copyTreeFallback, compareVersions, splitVersions } = await import("./install-dsh.mjs");
 
 function runInstaller(args, timeout = 300_000) {
   return spawnSync(process.execPath, [INSTALLER, ...args], {
@@ -175,4 +175,43 @@ test("restoreBackup 无备份时安全跳过", () => {
   assert.ok(existsSync(join(target, "x.txt")));
 
   rmSync(target, { recursive: true, force: true });
+});
+
+// ---- 版本比较（预发布支持）----
+test("compareVersions 比较正式版", () => {
+  assert.ok(compareVersions("1.5.0", "1.4.0") > 0);
+  assert.ok(compareVersions("1.4.0", "1.5.0") < 0);
+  assert.equal(compareVersions("1.4.0", "1.4.0"), 0);
+  assert.ok(compareVersions("1.10.0", "1.9.0") > 0, "多位数版本按数字比较");
+});
+
+test("compareVersions 预发布低于同 core 正式版", () => {
+  assert.ok(compareVersions("1.5.0-rc.1", "1.5.0") < 0);
+  assert.ok(compareVersions("1.5.0", "1.5.0-rc.1") > 0);
+  assert.ok(compareVersions("1.5.0-rc.2", "1.5.0-rc.1") > 0);
+  assert.ok(compareVersions("1.5.0-beta.1", "1.5.0-rc.1") < 0, "beta < rc（字符串序）");
+});
+
+// ---- 版本列表区分正式版/预发布（按 semver 标记，不依赖 tag 名）----
+test("splitVersions 按 semver 标记区分正式版与预发布", () => {
+  const versions = [
+    "0.1.0", "0.1.1", "0.1.2-alpha.1", "0.1.2-rc.1", "0.2.0", "0.2.1-beta.2",
+  ];
+  const { stable, prerelease } = splitVersions(versions);
+  assert.equal(stable, "0.2.0", "正式版取不含 - 的最高版本");
+  assert.equal(prerelease, "0.2.1-beta.2", "预发布取含 - 的最高版本");
+});
+
+test("splitVersions latest tag 指向预发布时仍正确区分", () => {
+  // 模拟 latest tag 指向预发布（如 0.1.1-rc.2），正式版是更早的 0.1.0
+  const versions = ["0.1.0", "0.1.1-rc.1", "0.1.1-rc.2"];
+  const { stable, prerelease } = splitVersions(versions);
+  assert.equal(stable, "0.1.0");
+  assert.equal(prerelease, "0.1.1-rc.2");
+});
+
+test("splitVersions 只有预发布时 stable 为 null", () => {
+  const { stable, prerelease } = splitVersions(["1.0.0-rc.1", "1.0.0-rc.2"]);
+  assert.equal(stable, null);
+  assert.equal(prerelease, "1.0.0-rc.2");
 });
