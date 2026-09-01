@@ -1,31 +1,13 @@
 # release.yml — 打 tag 后自动构建并发布（Windows / macOS / Linux）
-#
-# 架构（对比 tauri-action 直传 release 更稳，重跑幂等）：
-#   1. build 矩阵：各平台只构建产物（tauri-action 不传 tagName，不碰 release），
-#      汇总 bundle 产物上传为 workflow artifact；
-#   2. release job：下载全部产物 → 按平台加数字前缀（01-Win / 02-macOS / 03-Linux，
-#      GitHub Releases UI 按文件名字母序排列，前缀保证分组顺序）→
-#      有签名密钥时用 merge-updater-json.mjs 重建 latest.json →
-#      softprops/action-gh-release 一次性创建草稿并上传（overwrite 默认开，
-#      重跑/移动 tag 不会再有 already_exists）。
-#
-# 触发方式：
-#   1. 更新版本号（tauri.conf.json + Cargo.toml + package.json，保持一致）
-#   2. git tag v0.1.0 && git push origin v0.1.0
-#   3. Actions 自动构建全部产物，发布为 Draft Release，人工确认后公开
-#   （也可 workflow_dispatch 手动触发：tag 不存在时会基于当前提交自动创建）
-#
-# macOS 说明：x86_64 在 arm64 的 macos-latest 上交叉编译（--target x86_64-apple-darwin），
-#   DMG 由宿主机（arm64，已验证稳定）生成，绕开 Intel runner 的 create-dmg 兼容问题。
-# MSI 说明：WiX 语言 zh-CN（代码页 936），规避默认 en-US 代码页 1252 不支持
-#   中文 productName 导致 light.exe 失败（tauri#8363）。
-#
-# 可选 Secrets（未配置则跳过对应能力，构建不受影响）：
-#   TAURI_SIGNING_PRIVATE_KEY / TAURI_SIGNING_PRIVATE_KEY_PASSWORD
-#     —— updater 签名，缺失则跳过 latest.json 与 .sig（应用内自动更新不可用）
-#   APPLE_CERTIFICATE / APPLE_CERTIFICATE_PASSWORD / APPLE_SIGNING_IDENTITY
-#   APPLE_ID / APPLE_PASSWORD / APPLE_TEAM_ID
-#     —— macOS Developer ID 签名 + 公证，缺失则产物未签名（Gatekeeper 会拦截）
+# 触发：三处版本号一致（tauri.conf.json/Cargo.toml/package.json）→ git tag v0.1.0
+#   → git push origin v0.1.0（或 workflow_dispatch：tag 不存在时自动基于当前提交创建）
+# 架构：build 矩阵只产 artifact（不碰 release）→ release job 按平台加前缀
+#   （01-Win/02-macOS/03-Linux，保证 Releases 页分组顺序）后创建草稿并上传（重跑幂等）；
+#   有签名密钥时重建 latest.json（updater 清单）。
+# macOS：x86_64 在 arm64 runner 交叉编译；MSI：WiX 语言 zh-CN（代码页 936）处理中文 productName。
+# Secrets（缺失则跳过对应能力）：
+#   TAURI_SIGNING_PRIVATE_KEY(_PASSWORD) — updater 签名，缺失则无 .sig/latest.json
+#   APPLE_* — macOS 签名+公证，缺失则 macOS 产物未签名
 
 name: Release
 
@@ -61,14 +43,13 @@ jobs:
             args: '--bundles appimage,deb,rpm'
             label: linux-amd64
           - platform: ubuntu-22.04-arm
-            # Linux ARM64：GitHub 官方 ARM64 托管 runner 原生构建
-            # （AppImage 工具链不支持 x86→arm64 交叉编译）
+            # AppImage 工具链不支持交叉编译，用官方 ARM64 runner 原生构建
             args: '--bundles appimage,deb,rpm'
             label: linux-aarch64
 
     runs-on: ${{ matrix.platform }}
     timeout-minutes: 90
-    # secrets 不能用于 job/step 级 if（GitHub 限制），用 job 级 env 传标志供步骤判断
+    # secrets 不能用于 if：用 job 级 env 传标志
     env:
       HAS_APPLE_CERT: ${{ secrets.APPLE_CERTIFICATE != '' }}
 
@@ -96,9 +77,8 @@ jobs:
         if: startsWith(matrix.platform, 'ubuntu')
         run: |
           sudo apt-get update
-          # libfuse2：Ubuntu 22.04 默认无 FUSE2，AppImage（linuxdeploy）需要它才能运行
-          # xdg-utils：提供 /usr/bin/xdg-open（tauri 打包 AppImage 时需要，精简的 arm runner 缺）
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libgtk-3-dev libdpkg-dev rpm libfuse2 xdg-utils
+          # 均为 AppImage（linuxdeploy）打包链所需，file/squashfs-tools 精简 runner 常缺
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libgtk-3-dev libdpkg-dev rpm libfuse2 xdg-utils file squashfs-tools xvfb libglib2.0-bin build-essential
 
       - name: Install PowerShell (Linux, for prepare-resources)
         if: startsWith(matrix.platform, 'ubuntu')
@@ -108,46 +88,38 @@ jobs:
       - name: Install frontend dependencies
         run: npm ci
 
-      # 下载内置 Node 发行版（nodejs.org 官方源）+ 构建 dsh 基线（npmjs 官方源）
-      # resources/node、resources/dsh-baseline 不入库，每平台各自生成
+      # 生成不入库的 resources/node + resources/dsh-baseline
       - name: Prepare bundled resources (Node runtime + dsh baseline)
         shell: pwsh
         run: ./scripts/prepare-resources.ps1 -Registry https://registry.npmjs.org -NodeBase https://nodejs.org/dist
 
-      # macOS 签名/公证：APPLE_* Secret 缺失时不能把空值传给 tauri（会被当成"提供了证书"
-      # 去 security import，报 failed to import keychain certificate），因此按证书是否存在拆成两步。
-      # 未配置证书 → 无 APPLE_* 环境变量，产出未签名产物（macOS 首次打开右键 →「打开」）。
-      # 只构建不发布：不传 tagName，tauri-action 不会创建/上传 Release。
+      # 按证书是否存在拆两步：无证书时不能传空 APPLE_* 给 tauri（会被误认为提供了证书）。
+      # 只构建不发布：不传 tagName，tauri-action 不创建/上传 Release。
       - name: Build & upload build artifacts (unsigned)
-        if: env.HAS_APPLE_CERT == 'false'
+        if: env.HAS_APPLE_CERT == 'false' && !startsWith(matrix.platform, 'ubuntu')
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # updater 签名（缺失则跳过签名与更新清单，构建仍成功）
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-          # 显式 CI=true：让 create-dmg 跳过 AppleScript 图标排版（无头 CI 上会 -10826）
+          # CI=true：无头 CI 上 create-dmg 跳过 AppleScript 图标排版（-10826）
           CI: "true"
-          # linuxdeploy 的 AppImage 不解压 FUSE 直接运行（配合 libfuse2 双保险）
+          # AppImage 打包：不解压 FUSE 直接运行、不再二次 strip（release 已 strip，再 strip 会崩）
           APPIMAGE_EXTRACT_AND_RUN: "1"
-          # linuxdeploy 会对 AppDir 内的二进制再 strip 一次；release 二进制已在链接期
-          # strip（Cargo.toml [profile.release] strip=true），新版 linuxdeploy 对
-          # 已 strip 的 ELF 会崩溃（std::logic_error → "failed to run linuxdeploy"），
-          # NO_STRIP=true 让 linuxdeploy 跳过 strip 步骤
           NO_STRIP: "true"
         with:
           args: ${{ matrix.args }}
 
       - name: Build & upload build artifacts (signed)
-        if: env.HAS_APPLE_CERT == 'true'
+        if: env.HAS_APPLE_CERT == 'true' && !startsWith(matrix.platform, 'ubuntu')
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          # AppImage 打包环境同 unsigned 步
           CI: "true"
           APPIMAGE_EXTRACT_AND_RUN: "1"
-          # 同上：跳过 linuxdeploy 对已 strip 二进制（Cargo.toml strip=true）的二次 strip，避免崩溃
           NO_STRIP: "true"
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
@@ -158,8 +130,22 @@ jobs:
         with:
           args: ${{ matrix.args }}
 
-      # 汇总所有 bundle 产物（含 .sig 签名）到 release-assets/
-      # （macOS 交叉编译时产物在 target/<target-triple>/release/bundle 下，find 全覆盖）
+      # Linux 不走 action（v0 无 exec 入参套不了 xvfb-run），改脚本直调 CLI 包 xvfb-run
+      - name: Build Linux bundles (xvfb-run)
+        if: startsWith(matrix.platform, 'ubuntu')
+        shell: bash
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          CI: "true"
+          # AppImage 打包环境同 unsigned 步
+          APPIMAGE_EXTRACT_AND_RUN: "1"
+          NO_STRIP: "true"
+        run: |
+          xvfb-run --auto-servernum --server-args="-screen 0 1024x768x24" \
+            npm run tauri build -- ${{ matrix.args }}
+
+      # 汇总所有 bundle 产物（含 .sig）→ release-assets/，find 全覆盖各 target
       - name: Stage bundle outputs
         shell: bash
         run: |
@@ -221,7 +207,7 @@ jobs:
           GITCLIFF_EOF
           EOF
 
-      # 一次下载全部构建产物（v4 不带 name 会按 artifact 名分目录解包到 assets/）
+      # v4 不带 name 会按 artifact 名分目录解包到 assets/
       - name: Download build artifacts
         uses: actions/download-artifact@v4
         with:
@@ -260,8 +246,7 @@ jobs:
           echo "=== latest.json ==="
           cat ordered-assets/latest.json
 
-      # 一次性创建草稿 Release 并按前缀顺序上传全部资源。
-      # softprops overwrite 默认开启：重跑/移动 tag 时覆盖同名资产，幂等。
+      # 创建草稿 Release 并上传（overwrite 默认开，重跑/移动 tag 幂等）
       - name: Create draft release & upload assets
         uses: softprops/action-gh-release@v3
         env:
