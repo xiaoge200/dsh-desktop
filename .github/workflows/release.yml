@@ -77,14 +77,37 @@ jobs:
         if: startsWith(matrix.platform, 'ubuntu')
         run: |
           sudo apt-get update
-          # 均为 AppImage（linuxdeploy）打包链所需，file/squashfs-tools 精简 runner 常缺
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libgtk-3-dev libdpkg-dev rpm libfuse2 xdg-utils file squashfs-tools xvfb libglib2.0-bin build-essential gdk-pixbuf2.0-bin librsvg2-common
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libappindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            libgtk-3-dev \
+            libdpkg-dev \
+            rpm \
+            libfuse2 \
+            xdg-utils \
+            file \
+            squashfs-tools \
+            xvfb \
+            libglib2.0-bin \
+            build-essential \
+            gdk-pixbuf2.0-bin \
+            librsvg2-common
 
       - name: Refresh GTK loaders
         if: startsWith(matrix.platform, 'ubuntu')
+        shell: bash
         run: |
-          gdk-pixbuf-query-loaders --update-cache
+          echo "=== GDK Pixbuf loader ==="
+          command -v gdk-pixbuf-query-loaders || true
+          find /usr -name 'gdk-pixbuf-query-loaders*' -type f 2>/dev/null || true
 
+          if command -v gdk-pixbuf-query-loaders >/dev/null 2>&1; then
+            gdk-pixbuf-query-loaders --update-cache
+          else
+            echo "WARNING: gdk-pixbuf-query-loaders not found; skipping cache refresh"
+          fi
       - name: Install PowerShell (Linux, for prepare-resources)
         if: startsWith(matrix.platform, 'ubuntu')
         run: |
