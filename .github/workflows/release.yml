@@ -108,6 +108,7 @@ jobs:
           else
             echo "WARNING: gdk-pixbuf-query-loaders not found; skipping cache refresh"
           fi
+
       - name: Install PowerShell (Linux, for prepare-resources)
         if: startsWith(matrix.platform, 'ubuntu')
         run: |
@@ -120,6 +121,52 @@ jobs:
       - name: Prepare bundled resources (Node runtime + dsh baseline)
         shell: pwsh
         run: ./scripts/prepare-resources.ps1 -Registry https://registry.npmjs.org -NodeBase https://nodejs.org/dist
+
+      - name: Clean incompatible Linux native modules
+        if: startsWith(matrix.platform, 'ubuntu')
+        shell: bash
+        run: |
+          set -eux
+
+          BASE="src-tauri/resources/dsh-baseline/node_modules"
+
+          echo "Cleaning platform-incompatible native modules..."
+
+          if [[ "${{ matrix.label }}" == "linux-amd64" ]]; then
+            # x86_64 AppImage：删除 ARM64 / musl 版本
+            rm -rf "$BASE/node-pty/prebuilds/linux-arm64"
+            rm -rf "$BASE/@vscode/ripgrep-linux-arm64"
+            rm -rf "$BASE/@deepseek-ai/node-addon-landlock-run-linux-arm64"
+            rm -rf "$BASE/@img/sharp-linux-arm64"
+            rm -rf "$BASE/@img/sharp-libvips-linux-arm64"
+            rm -rf "$BASE/@koromix/koffi-linux-arm64"
+
+            # Ubuntu 是 glibc，不要把 musl native binary 放进去
+            rm -rf "$BASE/@koromix/koffi-linux-x64/musl_x64"
+
+            # landlock-run 是静态 ELF，linuxdeploy 无法 patchelf
+            rm -rf "$BASE/@deepseek-ai/node-addon-landlock-run-linux-x64"
+
+          elif [[ "${{ matrix.label }}" == "linux-aarch64" ]]; then
+            # ARM64 AppImage：删除 x86_64 / musl 版本
+            rm -rf "$BASE/node-pty/prebuilds/linux-x64"
+            rm -rf "$BASE/@vscode/ripgrep-linux-x64"
+            rm -rf "$BASE/@deepseek-ai/node-addon-landlock-run-linux-x64"
+            rm -rf "$BASE/@img/sharp-linux-x64"
+            rm -rf "$BASE/@img/sharp-libvips-linux-x64"
+            rm -rf "$BASE/@koromix/koffi-linux-x64"
+
+            # Ubuntu ARM64 是 glibc，不要 musl
+            rm -rf "$BASE/@koromix/koffi-linux-arm64/musl_arm64"
+
+            # landlock-run 是静态 ELF
+            rm -rf "$BASE/@deepseek-ai/node-addon-landlock-run-linux-arm64"
+          fi
+
+          echo "Remaining native modules:"
+          find "$BASE" \
+            \( -name '*.node' -o -name 'rg' -o -name 'landlock-run' \) \
+            -type f 2>/dev/null || true
 
       # 按证书是否存在拆两步：无证书时不能传空 APPLE_* 给 tauri（会被误认为提供了证书）。
       # 只构建不发布：不传 tagName，tauri-action 不创建/上传 Release。
