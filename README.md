@@ -4,10 +4,12 @@
 
 **把 DeepSeek Harness（DSH）装进桌面的跨平台应用 —— 下载、双击、开聊。**
 
-![version](https://img.shields.io/badge/version-0.1.0-2f6fed)
+![version](https://img.shields.io/badge/version-0.1.3-2f6fed)
 ![platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-9cf)
 [![CI](https://github.com/xiaoge200/dsh-desktop/actions/workflows/ci.yml/badge.svg)](https://github.com/xiaoge200/dsh-desktop/actions/workflows/ci.yml)
 ![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen)
+
+**[English](README.en.md) | 中文**
 
 </div>
 
