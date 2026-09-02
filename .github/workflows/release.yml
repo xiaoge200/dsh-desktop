@@ -250,7 +250,8 @@ jobs:
           ls -la release-assets/
 
       - name: Upload build artifact
-        uses: actions/upload-artifact@v4
+        # v4/v5 声明 node20 运行时会触发弃用警告；v6 起默认 node24
+        uses: actions/upload-artifact@v6
         with:
           name: bundle-${{ matrix.label }}
           path: release-assets/*
@@ -297,7 +298,8 @@ jobs:
 
       # v4 不带 name 会按 artifact 名分目录解包到 assets/
       - name: Download build artifacts
-        uses: actions/download-artifact@v4
+        # v4/v5/v6 声明 node20 运行时会触发弃用警告；v7 起默认 node24
+        uses: actions/download-artifact@v7
         with:
           path: assets
 
@@ -343,7 +345,7 @@ jobs:
           tag_name: ${{ steps.meta.outputs.tag }}
           # workflow_dispatch 触发时 tag 尚不存在，基于当前提交创建
           target_commitish: ${{ github.sha }}
-          name: DSH 工作台 v${{ steps.meta.outputs.version }}
+          name: v${{ steps.meta.outputs.version }}
           body: ${{ steps.meta.outputs.RELEASE_BODY }}
           draft: true
           prerelease: false
