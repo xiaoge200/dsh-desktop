@@ -78,7 +78,12 @@ jobs:
         run: |
           sudo apt-get update
           # 均为 AppImage（linuxdeploy）打包链所需，file/squashfs-tools 精简 runner 常缺
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libgtk-3-dev libdpkg-dev rpm libfuse2 xdg-utils file squashfs-tools xvfb libglib2.0-bin build-essential
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libgtk-3-dev libdpkg-dev rpm libfuse2 xdg-utils file squashfs-tools xvfb libglib2.0-bin build-essential gdk-pixbuf2.0-bin librsvg2-common
+
+      - name: Refresh GTK loaders
+        if: startsWith(matrix.platform, 'ubuntu')
+        run: |
+          gdk-pixbuf-query-loaders --update-cache
 
       - name: Install PowerShell (Linux, for prepare-resources)
         if: startsWith(matrix.platform, 'ubuntu')
@@ -106,7 +111,7 @@ jobs:
           CI: "true"
           # AppImage 打包：不解压 FUSE 直接运行、不再二次 strip（release 已 strip，再 strip 会崩）
           APPIMAGE_EXTRACT_AND_RUN: "1"
-          NO_STRIP: "true"
+          NO_STRIP: "1"
         with:
           args: ${{ matrix.args }}
 
@@ -120,7 +125,7 @@ jobs:
           # AppImage 打包环境同 unsigned 步
           CI: "true"
           APPIMAGE_EXTRACT_AND_RUN: "1"
-          NO_STRIP: "true"
+          NO_STRIP: "1"
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
@@ -138,12 +143,25 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
           CI: "true"
-          # AppImage 打包环境同 unsigned 步
+          RUST_BACKTRACE: "1"
           APPIMAGE_EXTRACT_AND_RUN: "1"
-          NO_STRIP: "true"
+          NO_STRIP: "1"
         run: |
-          xvfb-run --auto-servernum --server-args="-screen 0 1024x768x24" \
-            npm run tauri build -- ${{ matrix.args }}
+          echo "=== Environment ==="
+          uname -a
+          uname -m
+          rustc --version
+          cargo --version
+
+          echo "=== GTK / GDK Pixbuf ==="
+          pkg-config --modversion gtk+-3.0 || true
+          pkg-config --modversion gdk-pixbuf-2.0 || true
+          gdk-pixbuf-query-loaders --version || true
+
+          echo "=== Build ==="
+          xvfb-run --auto-servernum \
+            --server-args="-screen 0 1024x768x24" \
+            npm run tauri build -- ${{ matrix.args }} --verbose
 
       # 汇总所有 bundle 产物（含 .sig）→ release-assets/，find 全覆盖各 target
       - name: Stage bundle outputs
