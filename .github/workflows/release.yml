@@ -284,9 +284,7 @@ jobs:
           echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
           cat >> "$GITHUB_OUTPUT" <<EOF
           RELEASE_BODY<<GITCLIFF_EOF
-          ## DSH 工作台 v${VERSION}
-
-          本版本由 GitHub Actions 自动构建。
+          ## 本版本由 GitHub Actions 自动构建。
 
           - **Windows**：\`*-setup.exe\`（NSIS，免管理员安装）/ \`*-x64.msi\`（MSI）
           - **macOS**：\`*-x64.dmg\`（Intel）/ \`*-aarch64.dmg\`（Apple Silicon）
