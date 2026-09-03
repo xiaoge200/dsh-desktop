@@ -1,14 +1,14 @@
-# prepare-resources.ps1 — 准备随包资源（Node 运行时 + dsh 基线）
-#
-# 用法：
-#   pwsh scripts/prepare-resources.ps1
-#   pwsh scripts/prepare-resources.ps1 -NodeVer v24.9.0 -SkipBaseline
-#   pwsh scripts/prepare-resources.ps1 -DshVer 0.1.1-rc.2
-#   pwsh scripts/prepare-resources.ps1 -NodeBase https://nodejs.org/dist
-#
-# 产物：
-#   resources/node/<platform>/
-#   resources/dsh-baseline/
+
+
+
+
+
+
+
+
+
+
+
 
 param(
   [string]$NodeVer = "v24.9.0",
@@ -20,7 +20,7 @@ param(
 
 $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $PSScriptRoot
-# $env:TEMP 是 Windows 专属变量，macOS/Linux 上为空；统一使用 .NET 获取系统临时目录
+
 $tmpRoot = [System.IO.Path]::GetTempPath()
 
 function Get-NodePlatformDir {
@@ -60,9 +60,9 @@ $nodeDir = Join-Path $root "resources\node\$plat"
 
 Write-Host "==> Node: $NodeVer / $plat" -ForegroundColor Cyan
 
-# ============================================================
-# Node runtime
-# ============================================================
+
+
+
 if (-not (Test-Path "$nodeDir\node$(if ($IsWindows) {'.exe'})")) {
   Write-Host "==> Downloading Node $NodeVer..." -ForegroundColor Cyan
   $base = "$NodeBase/$NodeVer"

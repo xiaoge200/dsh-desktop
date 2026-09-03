@@ -1,39 +1,5 @@
 #!/usr/bin/env node
-/**
- * install-dsh.mjs — DSH 运行时准备器
- *
- * 职责（对应 dsh-desktop-plan.md §3.1 / §3.2）：
- *   1. 基线优先：安装包内置 dsh 完整依赖树（resources/dsh-baseline），
- *      无有效安装时直接复制基线 → 首启秒级就绪（0 门槛，不依赖网络）。
- *   2. 更新（两阶段，非阻塞启动）：先 update（下载到 staging 并校验，服务照常运行），
- *      调用方停服务后 swap（staging 原子替换 target）——下载/校验失败不动现有运行时。
- *   3. 写 .installed.json（精确版本 + 完整性），供壳（Rust）读取。
- *   4. 幂等、可重入、崩溃安全（临时目录 + 原子改名）。
- *
- * 调用方式（由 Tauri 壳 spawn）：
- *   准备（同步，启动路径）：
- *     node install-dsh.mjs prepare --target <dir> --baseline <dir>
- *   更新阶段一（异步，下载+校验，服务可继续运行）：
- *     node install-dsh.mjs update --target <dir> [--registry <url>] [--mirror <url>] [--force] [--pre]
- *   更新阶段二（异步，停服务后原子替换）：
- *     node install-dsh.mjs swap --target <dir> --staging <dir>
- *   检查（异步，仅查询）：
- *     node install-dsh.mjs check --target <dir> [--registry <url>] [--mirror <url>] [--pre]
- *
- * --pre：设置页「更新预发布版本」开启时传入——目标版本取正式版与预发布中更高者；
- *       不带时优先正式版；若尚未发布正式版（全部是预发布），则跟随最高预发布，
- *       保证始终能更新到当前发行中的最新版本。
- *       正式版/预发布按 semver 版本号区分（含 `-` 后缀为预发布，如 1.2.0-rc.1），
- *       查询用 `npm view dist-tags`（latest/next/beta/rc 所有 tag 指向的版本都纳入），
- *       不依赖 tag 名——latest tag 可能指向预发布版本。
- *
- * 输出契约（stdout 末行 = JSON）：
- *   prepare: {"ok":true,"action":"prepared-from-baseline"|"baseline-ok","version":"0.1.1","dir":"...","source":"baseline"|"cache"}
- *   check:   {"ok":true,"action":"up-to-date"|"new-version-available"|"prerelease-available","version":"0.1.1","prerelease":"0.1.2-rc.1","pre_available":true,"current":"0.1.0","dir":"...","source":"npmjs"|"npmmirror"}
- *   update:  {"ok":true,"action":"downloaded","version":"0.1.1","staging":"<tmp dir>","dir":"...","source":"npmjs"}
- *   swap:    {"ok":true,"action":"updated","version":"0.1.1","dir":"..."}
- *   失败：   {"ok":false,"error":{"kind":"network"|"install"|"integrity"|"unknown","message":"白话摘要","detail":"技术细节"}}
- */
+
 
 import { spawnSync } from "node:child_process";
 import {
@@ -49,7 +15,7 @@ const DEFAULT_REGISTRY = "https://registry.npmjs.org";
 const DEFAULT_MIRROR = "https://registry.npmmirror.com";
 const INSTALLED_FILE = ".installed.json";
 
-// ---- arg parsing ----
+
 function parseArgs(argv) {
   const opts = { mode: null, target: null, baseline: null, staging: null, registry: null, mirror: null, force: false, pre: false };
   let rest = [...argv];
@@ -71,15 +37,15 @@ function parseArgs(argv) {
   return opts;
 }
 
-// ---- npm 定位：优先用内置 Node 自带的 npm-cli.js（不依赖系统 PATH）----
+
 function resolveNpmCli() {
   const nodeDir = dirname(process.execPath);
   const candidates = [
-    // Windows 官方发行版：<nodeDir>/node_modules/npm/bin/npm-cli.js
+    
     join(nodeDir, "node_modules", "npm", "bin", "npm-cli.js"),
-    // mac/Linux 官方发行版（bin 在 nodeDir）：<nodeDir>/../lib/node_modules/npm
+    
     join(nodeDir, "..", "lib", "node_modules", "npm", "bin", "npm-cli.js"),
-    // 本项目资源布局：node 二进制与 lib 平级（CI 复制 bin/node + lib 到同一目录）
+    
     join(nodeDir, "lib", "node_modules", "npm", "bin", "npm-cli.js"),
   ];
   for (const p of candidates) {
@@ -88,7 +54,7 @@ function resolveNpmCli() {
   return null;
 }
 
-// ---- helpers ----
+
 function runNpm(args, opts = {}) {
   const npmCli = resolveNpmCli();
   if (!npmCli) {
@@ -124,8 +90,8 @@ function writeInstalled(dir, info) {
   writeFileSync(join(dir, INSTALLED_FILE), JSON.stringify(info, null, 2), "utf8");
 }
 
-/** 查询某个 registry 上 dsh 的最新版本；失败返回 null */
-/** 快速探测 registry 是否可达（≤3s），不可达直接返回 false，避免 npm 内部长重试 */
+
+
 function registryReachable(registry, timeoutMs = 3000) {
   return new Promise((resolve) => {
     const ac = new AbortController();
@@ -136,7 +102,7 @@ function registryReachable(registry, timeoutMs = 3000) {
   });
 }
 
-/** 简单 semver 比较：a>b 返回正数，a<b 返回负数，相等 0。预发布（含 -）低于同 core 的正式版。 */
+
 function compareVersions(a, b) {
   const parse = (v) => {
     const [core, pre] = String(v).split("-");
@@ -155,12 +121,7 @@ function compareVersions(a, b) {
   return 0;
 }
 
-/**
- * 从版本列表区分正式版与预发布（按 semver 预发布标记：版本号含 `-` 后缀即预发布，
- * 如 1.2.0-beta.1 / 1.2.0-rc.2；不含 `-` 的是正式发布）。不依赖 npm dist-tag 名——
- * latest tag 可能指向预发布版本，tag 名不可靠。
- * 返回 { stable, prerelease }：各自范围内的最高版本，无则 null。
- */
+
 function splitVersions(versions) {
   let stable = null, prerelease = null;
   for (const v of versions) {
@@ -174,15 +135,9 @@ function splitVersions(versions) {
   return { stable, prerelease };
 }
 
-/**
- * 查询 dist-tags：返回 { stable, prerelease } 或 null。
- * 所有 tag（latest / next / beta / rc …）指向的版本都纳入，按 semver 标记区分：
- *   stable：不含 `-` 的最高正式版
- *   prerelease：含 `-` 的最高版本（如 1.2.0-rc.1），无则 null
- * 不依赖 tag 名——latest tag 可能指向预发布版本（如 0.1.1-rc.2），只看版本号。
- */
+
 async function queryDistTags(registry) {
-  // 快速连通性探测：离线时立即返回，不等 npm 长重试（NFR-06 离线降级）
+  
   const reachable = await registryReachable(registry);
   if (!reachable) return null;
   const res = runNpm(["view", PKG, "dist-tags", "--json", "--registry", registry, "--no-audit", "--no-fund", "--fetch-retries=0", "--fetch-timeout=8000"], { timeout: 60_000 });
@@ -199,8 +154,7 @@ async function queryDistTags(registry) {
   return splitVersions(versions);
 }
 
-/** 下载到 staging 并校验（不替换 target）：返回 { version, stage }。
- *  失败时清理 staging，现有运行时不受影响（服务可继续运行）。 */
+
 function fetchTo(target, registry, versionSpec) {
   const parent = dirname(target);
   const stage = join(parent, ".dsh-runtime-staging-" + process.pid);
@@ -211,7 +165,7 @@ function fetchTo(target, registry, versionSpec) {
     ["install", spec, "--prefix", stage, "--registry", registry, "--no-audit", "--no-fund", "--no-update-notifier", "--loglevel=error"],
     { timeout: 1_800_000 });
   if (res.status !== 0) {
-    rmSync(stage, { recursive: true, force: true }); // 清理 staging，target 不受影响
+    rmSync(stage, { recursive: true, force: true }); 
     const detail = (res.stderr || res.stdout || "").trim();
     throw Object.assign(new Error(detail), { kind: "install" });
   }
@@ -224,14 +178,13 @@ function fetchTo(target, registry, versionSpec) {
   return { version, stage };
 }
 
-/** 把已下载并校验过的 staging 原子替换到 target（调用方须已停服务）。
- *  失败时尽力从 staging 恢复 target，保证旧版本可用。 */
+
 function swapStaging(target, stage) {
   try {
     rmSync(target, { recursive: true, force: true });
     renameSync(stage, target);
   } catch (e) {
-    // rename 失败（如 target 仍被占用）：staging 还在，复制兜底恢复
+    
     log("swap rename failed, copying from staging: " + (e.message ?? e));
     try {
       rmSync(target, { recursive: true, force: true });
@@ -244,17 +197,11 @@ function swapStaging(target, stage) {
   }
 }
 
-/**
- * 递归复制目录。注意：Node 的 fs.cpSync 在 Windows 含非 ASCII 路径（如中文
- * 安装目录/用户名）时会崩溃（0xC0000409），因此改用系统原生复制工具：
- *  - Windows: robocopy（原生、Unicode 安全、快）
- *  - macOS/Linux: cp -R
- *  - 兜底：node 逐文件复制（cpSync 崩溃的保险）
- */
+
 function copyTree(src, dst) {
   const platform = process.platform;
   if (platform === "win32") {
-    // robocopy 返回码 0-7 均表示成功（1=有文件复制，0=无变化）；>=8 为失败
+    
     const r = spawnSync("robocopy", [src, dst, "/E", "/NFL", "/NDL", "/NJH", "/NJS", "/NP", "/R:1", "/W:1"], {
       encoding: "utf8", timeout: 1_800_000, windowsHide: true, maxBuffer: 64 * 1024 * 1024,
     });
@@ -268,7 +215,7 @@ function copyTree(src, dst) {
     if (r.status === 0) return;
     throw Object.assign(new Error(`cp failed: ${r.stderr || r.stdout || ""}`), { kind: "copy" });
   }
-  // 兜底：逐文件复制（不用 cpSync，避免崩溃）
+  
   copyTreeFallback(src, dst);
 }
 
@@ -286,7 +233,7 @@ function copyTreeFallback(src, dst) {
   walk(src, dst);
 }
 
-/** 清理 target 同级的旧 staging 残留（崩溃安全：崩溃后不累积垃圾） */
+
 function cleanStaleStaging(target) {
   const parent = dirname(target);
   let entries;
@@ -299,18 +246,12 @@ function cleanStaleStaging(target) {
     if (entry.isDirectory() && entry.name.startsWith(".dsh-runtime-staging-")) {
       try {
         rmSync(join(parent, entry.name), { recursive: true, force: true });
-      } catch { /* best effort */ }
+      } catch {  }
     }
   }
 }
 
-/** 从基线复制完整依赖树到 target（快，秒级）。baseline 接受两种形态：
- *  1) 直接是 node_modules 目录（含 @deepseek-ai/...）
- *  2) 是 dsh-baseline 根目录（含 node_modules/ 子目录）
- *
- * 用 staging + 原子改名：只复制一遍（src → staging），成功后 rename 到 target，
- * 避免「先复制到 staging 再复制到 target」的两遍拷贝（首启慢）。
- */
+
 function copyBaseline(target, baselineRoot) {
   let src = baselineRoot;
   if (existsSync(join(src, "node_modules")) && existsSync(join(src, "node_modules", "@deepseek-ai", "dsh", "lib", "bin.js"))) {
@@ -324,19 +265,19 @@ function copyBaseline(target, baselineRoot) {
   rmSync(stage, { recursive: true, force: true });
   mkdirSync(stage, { recursive: true });
   copyTree(src, join(stage, "node_modules"));
-  // 原子替换：删旧 target → rename stage → target（同卷，快；半成品不落盘）
+  
   rmSync(target, { recursive: true, force: true });
   renameSync(stage, target);
 }
 
-/** 调试日志（写 stderr，不进 stdout JSON 契约） */
+
 function log(msg) {
   try {
     process.stderr.write(`[install-dsh] ${msg}\n`);
-  } catch { /* ignore */ }
+  } catch {  }
 }
 
-/** 从备份恢复旧版本（更新失败回滚，R7/R10） */
+
 function restoreBackup(target, bakDir, hasBackup) {
   if (!hasBackup || !existsSync(bakDir)) {
     log("no backup to restore");
@@ -353,7 +294,7 @@ function restoreBackup(target, bakDir, hasBackup) {
   }
 }
 
-/** 冒烟：node <dsh>/lib/bin.js --version */
+
 function smokeTest(target) {
   const bin = join(target, "node_modules", "@deepseek-ai", "dsh", "lib", "bin.js");
   if (!existsSync(bin)) {
@@ -376,12 +317,12 @@ function readVersion(target) {
   try { return JSON.parse(readFileSync(manifest, "utf8")).version; } catch { return null; }
 }
 
-// ---- 输出 ----
+
 function out(obj) {
   console.log(JSON.stringify(obj));
 }
 
-// ============ 主流程 ============
+
 async function main() {
   const opts = parseArgs(process.argv.slice(2));
   const target = opts.target;
@@ -389,7 +330,7 @@ async function main() {
 
   switch (opts.mode) {
     case "prepare": {
-      // 启动路径：若有有效安装则复用；否则从基线复制（秒级）
+      
       const installed = readInstalled(target);
       if (installed && installed.version && smokeOk(target)) {
         out({ ok: true, action: "baseline-ok", version: installed.version, dir: target, source: "cache" });
@@ -420,10 +361,10 @@ async function main() {
     }
 
     case "check": {
-      // 后台：仅查询最新版本。目标版本选择：
-      //  - --pre（设置开启预发布更新）：正式版与预发布中更高者
-      //  - 无 --pre：优先正式版；但 DSH 可能还没有正式版（全部是预发布），
-      //    此时跟随最高预发布，保证始终能更新到当前发行中的最新版本
+      
+      
+      
+      
       const registries = [
         { label: opts.registry ? "custom" : "npmjs", url: opts.registry || DEFAULT_REGISTRY },
         { label: opts.mirror ? "custom" : "npmmirror", url: opts.mirror || DEFAULT_MIRROR },
@@ -442,18 +383,18 @@ async function main() {
       const stable = info.stable;
       const prerelease = info.prerelease;
       const cur = current ?? "0.0.0";
-      // 跟随目标
+      
       let follow = null;
       if (opts.pre && prerelease && stable && compareVersions(prerelease, stable) > 0) {
-        follow = prerelease; // 开启且预发布更高
+        follow = prerelease; 
       } else if (stable) {
         follow = stable;
       } else {
-        follow = prerelease; // 没有正式版：跟随最高预发布
+        follow = prerelease; 
       }
       const target_available = !!follow && follow !== cur && compareVersions(follow, cur) > 0;
       const pre_available = !!prerelease && prerelease !== cur && compareVersions(prerelease, cur) > 0;
-      // action：目标可用时，目标是预发布 → prerelease-available，否则 new-version-available
+      
       const is_pre_target = follow !== null && prerelease !== null && follow === prerelease && follow !== stable;
       const action = !target_available
         ? "up-to-date"
@@ -466,8 +407,8 @@ async function main() {
     }
 
     case "update": {
-      // 阶段一：下载到 staging 并校验（服务可继续运行，现有运行时不受影响）。
-      // 成功后输出 staging 路径；调用方停服务后调 swap 模式做原子替换。
+      
+      
       const registries = [
         { label: opts.registry ? "custom" : "npmjs", url: opts.registry || DEFAULT_REGISTRY },
         { label: opts.mirror ? "custom" : "npmmirror", url: opts.mirror || DEFAULT_MIRROR },
@@ -487,7 +428,7 @@ async function main() {
       const prerelease = info.prerelease;
       const cur = current ?? "0.0.0";
       const pre_available = !!prerelease && prerelease !== cur && compareVersions(prerelease, cur) > 0;
-      // 目标版本（与 check 一致）
+      
       let targetVersion = null;
       if (opts.pre && prerelease && stable && compareVersions(prerelease, stable) > 0) {
         targetVersion = prerelease;
@@ -501,7 +442,7 @@ async function main() {
         return;
       }
 
-      // 下载到 staging（换源重试）
+      
       let fetched = null, usedSource = null;
       const order = latestSource === "npmmirror" ? [registries[1], registries[0]] : [registries[0], registries[1]];
       for (const r of order) {
@@ -509,14 +450,14 @@ async function main() {
           fetched = fetchTo(target, r.url, targetVersion);
           usedSource = r.label;
           break;
-        } catch { /* 换源重试 */ }
+        } catch {  }
       }
       if (!fetched) {
         out({ ok: false, error: { kind: "install", message: "新版本下载失败，已保留当前版本。", detail: "download failed on both registries" } });
         process.exit(1);
       }
 
-      // 校验 staging 完整性（冒烟；失败清理 staging，现有运行时不受影响）
+      
       try {
         smokeTest(fetched.stage);
       } catch (e) {
@@ -534,8 +475,8 @@ async function main() {
     }
 
     case "swap": {
-      // 阶段二：把已下载并校验的 staging 原子替换到 target。
-      // 调用方须先停服务（释放文件占用）；失败尽力从 staging 恢复旧版本。
+      
+      
       if (!opts.staging || !existsSync(opts.staging)) {
         out({ ok: false, error: { kind: "install", message: "缺少已下载的暂存版本。", detail: "staging missing" } });
         process.exit(1);
@@ -546,7 +487,7 @@ async function main() {
         out({ ok: false, error: { kind: "install", message: "新版本没有装好，已保留旧版本。", detail: String(e.message ?? e) } });
         process.exit(1);
       }
-      // 替换成功：写状态（冒烟已在下载阶段校验过，这里再确认一次）
+      
       let smoke;
       try {
         smoke = smokeTest(opts.target);
@@ -570,8 +511,8 @@ async function main() {
   }
 }
 
-// 测试钩子：被 install-dsh.test.mjs import 时不执行 main（argv[1] 是测试文件）；
-// 直接运行时（argv[1] 是自身）执行 main。
+
+
 const invokedByTest = process.argv[1]?.endsWith?.("install-dsh.test.mjs");
 if (!invokedByTest) {
   main().catch((e) => {
@@ -580,5 +521,5 @@ if (!invokedByTest) {
   });
 }
 
-// 导出供测试（顶层 export 是 ESM 静态约束）
+
 export { restoreBackup, copyTree, copyTreeFallback, smokeTest, readInstalled, writeInstalled, compareVersions, splitVersions };

@@ -1,7 +1,4 @@
-/**
- * 插件页（FR-18）：DeepSeek Harness 插件管理器 + 应用市场。
- * 独立脚本模块，由 settings.html 以第二个 <script type="module"> 加载。
- */
+
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { SETTINGS_STRINGS, detectLang, tr } from "./i18n";
@@ -101,9 +98,9 @@ function sourceLabel(p: PluginInfo): string {
   }
 }
 
-// ---------------------------------------------------------------------------
-// 已安装页
-// ---------------------------------------------------------------------------
+
+
+
 
 async function renderList() {
   try {
@@ -212,7 +209,7 @@ function renderRow(r: PluginRow): HTMLElement {
   return row;
 }
 
-/** 是否属于第三方代码来源（安装前弹确认） */
+
 function isThirdParty(spec: string): boolean {
   const s = spec.trim();
   return (
@@ -246,9 +243,9 @@ async function doAdd(spec: string) {
   }
 }
 
-// ---------------------------------------------------------------------------
-// 应用市场页
-// ---------------------------------------------------------------------------
+
+
+
 
 async function renderMarket() {
   els.marketList.replaceChildren(el("div", "hint", T("加载中…")));
@@ -319,9 +316,9 @@ function switchTab(which: "installed" | "market") {
   }
 }
 
-// ---------------------------------------------------------------------------
-// 初始化
-// ---------------------------------------------------------------------------
+
+
+
 
 function applyPlaceholders() {
   document.querySelectorAll<HTMLInputElement>("[data-i18n-placeholder]").forEach((input) => {
@@ -358,7 +355,7 @@ applyPlaceholders();
 bind();
 renderList();
 
-// 与设置页其他数据一样：窗口在启动时即创建（hidden），页面加载早于
-// 插件环境初始化（默认插件安装是后台异步完成的），首次渲染可能是
-// "尚未初始化插件"。窗口每次打开时（settings://refresh）重新拉取列表。
+
+
+
 listen("settings://refresh", () => renderList());

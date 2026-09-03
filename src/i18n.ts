@@ -1,8 +1,3 @@
-/**
- * 轻量 i18n（NFR-10）：按浏览器语言返回中/英文文案。
- * 中文环境（zh-*）显示中文，其余显示英文。
- */
-
 export type Lang = "zh" | "en";
 
 export function detectLang(): Lang {
@@ -34,6 +29,16 @@ export const BOOT_STRINGS = {
     "开始使用": "开始使用",
     "一键修复": "一键修复",
     "正在修复…": "正在修复…",
+    "部分已安装的插件与当前 DSH 版本不兼容，导致服务无法启动。":
+      "部分已安装的插件与当前 DSH 版本不兼容，导致服务无法启动。",
+    "移除不兼容插件": "移除不兼容插件",
+    "正在移除不兼容插件，请稍候…": "正在移除不兼容插件，请稍候…",
+    "正在移除并重试…": "正在移除并重试…",
+    "移除完成，正在重启服务…": "移除完成，正在重启服务…",
+    "移除失败：": "移除失败：",
+    "没有需要移除的插件，请重试。": "没有需要移除的插件，请重试。",
+    "残留的锁文件仍在阻止服务启动，可手动删除后重试：":
+      "残留的锁文件仍在阻止服务启动，可手动删除后重试：",
   },
   en: {
     "正在准备程序…": "Preparing…",
@@ -54,6 +59,16 @@ export const BOOT_STRINGS = {
     "开始使用": "Get Started",
     "一键修复": "Repair",
     "正在修复…": "Repairing…",
+    "部分已安装的插件与当前 DSH 版本不兼容，导致服务无法启动。":
+      "Some installed plugins are incompatible with this version of DSH and prevent the service from starting.",
+    "移除不兼容插件": "Remove incompatible plugins",
+    "正在移除不兼容插件，请稍候…": "Removing incompatible plugins, please wait…",
+    "正在移除并重试…": "Removing and retrying…",
+    "移除完成，正在重启服务…": "Removed. Restarting the service…",
+    "移除失败：": "Removal failed: ",
+    "没有需要移除的插件，请重试。": "Nothing to remove. Please retry.",
+    "残留的锁文件仍在阻止服务启动，可手动删除后重试：":
+      "A leftover lock file still blocks startup. Delete it and retry:",
   },
 } as const;
 
@@ -200,7 +215,6 @@ export const SETTINGS_STRINGS = {
   },
 } as const;
 
-/** 用当前语言翻译 key（若 key 无英文翻译则原样返回） */
 export function tr(dict: Record<string, string>, key: string): string {
   return dict[key] ?? key;
 }

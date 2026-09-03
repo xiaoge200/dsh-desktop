@@ -4,20 +4,18 @@ use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
 
-/// 用户可配置项（FR-14：设置页）。
-/// 存为 appData/config.json，默认值即 0 门槛最优解。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
-    /// 是否自动更新 DSH 包（默认 true）
+
     pub auto_update_dsh: bool,
-    /// 是否自动更新应用壳（默认 true）
+
     pub auto_update_app: bool,
-    /// 是否更新预发布版本（默认 false：只跟随正式发布；开启后检查/自动更新都含预发布）
+
     #[serde(default)]
     pub pre_release: bool,
-    /// 自定义端口（0 = 自动，默认 3080 优先）
+
     pub port: u16,
-    /// 更新源（"auto" 自动探测 / "npmjs" 官方 / "npmmirror" 国内镜像）
+
     pub registry_source: String,
 }
 
@@ -33,7 +31,6 @@ impl Default for AppConfig {
     }
 }
 
-/// 配置文件读写（轻量，无外部依赖）
 pub struct ConfigStore {
     path: PathBuf,
     inner: Mutex<AppConfig>,
@@ -91,7 +88,7 @@ mod tests {
         c.auto_update_dsh = false;
         c.port = 4000;
         store.set(c.clone()).unwrap();
-        // 重新加载（模拟重启后读取）
+
         let reloaded = ConfigStore::new(&dir);
         assert_eq!(reloaded.get().auto_update_dsh, false);
         assert_eq!(reloaded.get().port, 4000);

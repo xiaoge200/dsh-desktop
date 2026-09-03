@@ -1,12 +1,12 @@
 import { defineConfig } from "vite";
 import { resolve } from "path";
 
-// @ts-expect-error process is a nodejs global
+
 const host = process.env.TAURI_DEV_HOST;
 
-// https://vite.dev/config/
+
 export default defineConfig(async () => ({
-  // 多页面入口：boot 页（index.html）+ 设置页（settings.html）
+  
   build: {
     rollupOptions: {
       input: {
@@ -16,11 +16,11 @@ export default defineConfig(async () => ({
     },
   },
 
-  // Vite options tailored for Tauri development and only applied in `tauri dev` or `tauri build`
-  //
-  // 1. prevent Vite from obscuring rust errors
+  
+  
+  
   clearScreen: false,
-  // 2. tauri expects a fixed port, fail if that port is not available
+  
   server: {
     port: 1420,
     strictPort: true,
@@ -33,11 +33,11 @@ export default defineConfig(async () => ({
         }
       : undefined,
     watch: {
-      // 3. tell Vite to ignore watching `src-tauri`
+      
       ignored: [
         "**/src-tauri/**",
-        // 编辑器/工具链原子写入的临时目录（形如 .settings.html.<pid>.<uuid>.tmpdir）。
-        // Windows 上其临时文件可能被短暂占用，fs.watch 会报 EBUSY 使 watcher 崩溃。
+        
+        
         "**/.*.tmpdir",
         "**/.*.tmpdir/**",
       ],

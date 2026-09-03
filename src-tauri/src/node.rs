@@ -1,9 +1,6 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// Windows 上 Tauri 的 resource_dir() 会返回 `\\?\C:\...` 形式的 verbatim 路径，
-/// 而 Node 24 无法用这种路径作为入口脚本（EISDIR lstat 'C:' 崩溃）。
-/// 这里去掉 `\\?\` 前缀，转回普通路径。
 pub(crate) fn normalize_for_node(p: &Path) -> PathBuf {
     #[cfg(windows)]
     {
@@ -20,7 +17,6 @@ pub(crate) fn normalize_for_node(p: &Path) -> PathBuf {
     }
 }
 
-/// Node 二进制在当前平台的相对资源路径（相对 resources 根）
 pub fn node_rel_path() -> PathBuf {
     let platform = if cfg!(target_os = "windows") {
         "win-x64"
@@ -35,7 +31,6 @@ pub fn node_rel_path() -> PathBuf {
     Path::new("node").join(platform).join(exe)
 }
 
-/// 解析内置 Node 的绝对路径（resources/<rel>）
 pub fn resolve_node(resource_dir: &Path) -> std::io::Result<PathBuf> {
     let path = resource_dir.join(node_rel_path());
     if !path.exists() {
@@ -47,15 +42,14 @@ pub fn resolve_node(resource_dir: &Path) -> std::io::Result<PathBuf> {
     Ok(path)
 }
 
-/// 冒烟：node --version
 pub fn smoke(node: &Path) -> Result<String, String> {
     let mut cmd = Command::new(normalize_for_node(node));
     cmd.arg("--version");
-    // Windows 下禁止子进程弹控制台窗口（CREATE_NO_WINDOW）
+
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
-        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+        cmd.creation_flags(0x0800_0000);
     }
     let out = cmd
         .output()
@@ -73,7 +67,6 @@ pub fn smoke(node: &Path) -> Result<String, String> {
     Ok(v)
 }
 
-/// 用内置 Node 运行 install-dsh.mjs 的 prepare 模式（启动路径：基线复制/复用）
 pub fn run_prepare(
     node: &Path,
     installer_js: &Path,
@@ -89,9 +82,6 @@ pub fn run_prepare(
     ])
 }
 
-/// 用内置 Node 运行 install-dsh.mjs 的 check 模式（后台：仅查询最新版）
-/// `source` 可选："npmjs" / "npmmirror" / 其他（自动）
-/// `pre`：是否把预发布版本当作可用更新（设置页「更新预发布版本」开启时传 true）
 pub fn run_check(node: &Path, installer_js: &Path, target: &Path, source: &str, pre: bool) -> Result<String, String> {
     let mut args = vec![
         "check".to_string(),
@@ -105,10 +95,6 @@ pub fn run_check(node: &Path, installer_js: &Path, target: &Path, source: &str, 
     run_installer(node, installer_js, &args)
 }
 
-/// 用内置 Node 运行 install-dsh.mjs 的 update 模式（阶段一：下载到 staging 并校验；
-/// 服务可继续运行，现有运行时不受影响）。返回输出（含 staging 路径），调用方解析。
-/// `source` 可选："npmjs" / "npmmirror" / 其他（自动）
-/// `pre`：允许安装到预发布版本（设置页「更新预发布版本」开启时传 true）
 pub fn run_update(node: &Path, installer_js: &Path, target: &Path, source: &str, pre: bool) -> Result<String, String> {
     let mut args = vec![
         "update".to_string(),
@@ -122,8 +108,6 @@ pub fn run_update(node: &Path, installer_js: &Path, target: &Path, source: &str,
     run_installer(node, installer_js, &args)
 }
 
-/// 用内置 Node 运行 install-dsh.mjs 的 swap 模式（阶段二：把已下载并校验过的
-/// staging 原子替换到 target）。调用方须已停服务（释放文件占用）。
 pub fn run_swap(node: &Path, installer_js: &Path, target: &Path, staging: &Path) -> Result<String, String> {
     let args = vec![
         "swap".to_string(),
@@ -135,7 +119,6 @@ pub fn run_swap(node: &Path, installer_js: &Path, target: &Path, staging: &Path)
     run_installer(node, installer_js, &args)
 }
 
-/// 根据用户选择的更新源构造 registry 参数（默认自动=不传，由安装器探测）
 fn registry_args(source: &str) -> Vec<String> {
     match source {
         "npmjs" => vec![
@@ -150,19 +133,16 @@ fn registry_args(source: &str) -> Vec<String> {
             "--mirror".to_string(),
             "https://registry.npmmirror.com".to_string(),
         ],
-        // auto 或未知：不传，安装器内部 npmjs 优先、失败切 npmmirror
+
         _ => vec![],
     }
 }
 
-/// 用内置 Node 运行 install-dsh.mjs；返回 stdout 全文（调用方解析末行 JSON）
 fn run_installer(node: &Path, installer_js: &Path, args: &[String]) -> Result<String, String> {
     let mut full_args: Vec<String> = vec![normalize_for_node(installer_js).to_string_lossy().to_string()];
     full_args.extend(args.iter().cloned());
     log::info!("installer: {:?} {:?}", normalize_for_node(node), full_args);
 
-    // 平台相关启动：Windows 用「隐藏控制台」+ 匿名管道（install-dsh.mjs 派生的
-    // npm 子进程同样不弹窗口）；Unix 用 std Command 捕获输出。
     #[cfg(windows)]
     let (success, stdout, stderr) = {
         use crate::winproc::{create_pipe, spawn_hidden, SpawnOpts};
@@ -178,7 +158,7 @@ fn run_installer(node: &Path, installer_js: &Path, args: &[String]) -> Result<St
             process_group: false,
         })
         .map_err(|e| format!("cannot start installer: {e}"))?;
-        // 边跑边排空管道，避免输出撑满缓冲区卡死
+
         let t_out = std::thread::spawn(move || {
             use std::io::Read;
             let mut buf = String::new();
@@ -217,9 +197,9 @@ fn run_installer(node: &Path, installer_js: &Path, args: &[String]) -> Result<St
         log::warn!("installer stderr: {}", stderr.trim());
     }
     if !success {
-        // 安装器失败时，stdout 末行仍是 JSON（含白话错误）
+
         if let Some(line) = stdout.lines().last() {
-            return Ok(line.to_string()); // 让调用方解析 ok:false
+            return Ok(line.to_string());
         }
         return Err(format!(
             "installer exited: {}",
@@ -229,7 +209,6 @@ fn run_installer(node: &Path, installer_js: &Path, args: &[String]) -> Result<St
     Ok(stdout)
 }
 
-/// 读取 .installed.json 中的版本（若有）
 pub fn read_installed_version(runtime_dir: &Path) -> Option<String> {
     let file = runtime_dir.join(".installed.json");
     let text = std::fs::read_to_string(file).ok()?;
@@ -237,29 +216,27 @@ pub fn read_installed_version(runtime_dir: &Path) -> Option<String> {
     json.get("version")?.as_str().map(|s| s.to_string())
 }
 
-/// install-dsh.mjs 输出的解析结果（stdout 末行 JSON）
 #[derive(Debug, Clone, Default)]
 pub struct InstallerResult {
     pub ok: bool,
-    /// "up-to-date" | "new-version-available" | "prerelease-available" | "downloaded" | "updated" | ...
+
     pub action: String,
-    /// 最新/下载/更新后版本（正式版 stable）
+
     pub version: Option<String>,
-    /// 最新预发布版本（dist-tags 非 latest 中最高；可能为 None）
+
     pub prerelease: Option<String>,
-    /// 预发布版本是否比当前新（可更新到预发布）
+
     pub pre_available: bool,
-    /// 当前版本（检查到新版本时附带）
+
     pub current: Option<String>,
-    /// update 阶段一输出的 staging 路径（下载+校验成功后，供 swap 使用）
+
     pub staging: Option<String>,
-    /// 白话错误信息（ok=false 时）
+
     pub message: Option<String>,
-    /// 技术细节
+
     pub detail: Option<String>,
 }
 
-/// 解析 install-dsh.mjs 的 stdout 末行 JSON（失败时返回默认值，调用方按未知结果处理）
 pub fn parse_installer_output(out: &str) -> InstallerResult {
     let mut res = InstallerResult::default();
     let Some(line) = out.lines().last() else { return res };
@@ -292,7 +269,7 @@ mod tests {
         let s = p.to_string_lossy().to_string();
         let prefix = format!("node{}", std::path::MAIN_SEPARATOR);
         assert!(s.starts_with(&prefix));
-        // Windows: node/win-x64/node.exe；macOS: node/mac-arm64/node；Linux: node/linux-x64/node
+
         if cfg!(windows) {
             assert!(s.ends_with("node.exe"));
             assert!(s.contains("win-x64"));
@@ -304,7 +281,7 @@ mod tests {
             assert!(s.contains("linux-"));
         }
     }
-
+ 
     #[test]
     fn read_installed_version_parses_json() {
         let dir = std::env::temp_dir().join(format!("dsh-node-test-{}", std::process::id()));

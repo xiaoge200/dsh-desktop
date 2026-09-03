@@ -17,8 +17,17 @@ interface StatusSnapshot {
   message: string;
   error: string | null;
   port: number;
+  service_url: string | null;
+  recovery: BootErrorOptions | null;
   dsh_version: string | null;
   node_version: string | null;
+}
+
+interface BootErrorOptions {
+  kind: "plugins" | "stale-lock" | "unknown";
+  plugins: string[];
+  lock_path?: string | null;
+  detail?: string;
 }
 
 const els = {
@@ -28,6 +37,9 @@ const els = {
   progressTrack: document.querySelector("#progress-track") as HTMLElement,
   errorBox: document.querySelector("#error-box") as HTMLElement,
   errorMessage: document.querySelector("#error-message") as HTMLElement,
+  recoveryDesc: document.querySelector("#recovery-desc") as HTMLElement,
+  badPluginList: document.querySelector("#bad-plugin-list") as HTMLUListElement,
+  removePluginsBtn: document.querySelector("#remove-plugins-btn") as HTMLButtonElement,
   techDetail: document.querySelector("#tech-detail") as HTMLElement,
   repairBtn: document.querySelector("#repair-btn") as HTMLButtonElement,
   retryBtn: document.querySelector("#retry-btn") as HTMLButtonElement,
@@ -36,12 +48,12 @@ const els = {
   welcomeBtn: document.querySelector("#welcome-btn") as HTMLButtonElement,
 };
 
-// 语言（NFR-10）：中文环境显示中文，其余英文
+let recoveryOptions: BootErrorOptions | null = null;
+
 const lang = detectLang();
 const dict = BOOT_STRINGS[lang];
 const T = (k: string) => tr(dict, k);
 
-// 阶段 → 白话标题 + 进度百分比
 const PHASE_TEXT: Record<string, { title: string; message: string; pct: number }> = {
   "node-check": {
     title: T("正在准备程序…"),
@@ -70,6 +82,40 @@ const PHASE_TEXT: Record<string, { title: string; message: string; pct: number }
   },
 };
 
+function renderRecovery() {
+  els.recoveryDesc.classList.add("hidden");
+  els.badPluginList.replaceChildren();
+  els.removePluginsBtn.classList.add("hidden");
+  els.repairBtn.classList.remove("hidden");
+  const opts = recoveryOptions;
+  if (!opts) return;
+  if (opts.kind === "plugins" && opts.plugins.length > 0) {
+    els.errorMessage.textContent = T("部分已安装的插件与当前 DSH 版本不兼容，导致服务无法启动。");
+    for (const name of opts.plugins) {
+      const li = document.createElement("li");
+      li.textContent = name;
+      els.badPluginList.appendChild(li);
+    }
+    els.badPluginList.classList.remove("hidden");
+    els.removePluginsBtn.classList.remove("hidden");
+    els.repairBtn.classList.add("hidden");
+  } else if (opts.kind === "stale-lock" && opts.lock_path) {
+    els.errorMessage.textContent = T("残留的锁文件仍在阻止服务启动，可手动删除后重试：");
+    els.recoveryDesc.textContent = opts.lock_path;
+    els.recoveryDesc.classList.remove("hidden");
+  }
+}
+
+function clearRecovery() {
+  recoveryOptions = null;
+  els.recoveryDesc.classList.add("hidden");
+  els.badPluginList.replaceChildren();
+  els.badPluginList.classList.add("hidden");
+  els.removePluginsBtn.classList.add("hidden");
+  els.removePluginsBtn.disabled = false;
+  els.removePluginsBtn.textContent = T("移除不兼容插件");
+}
+
 function showError(message: string, detail?: string) {
   els.title.textContent = T("遇到了一点问题");
   els.errorBox.classList.remove("hidden");
@@ -80,8 +126,7 @@ function showError(message: string, detail?: string) {
   } else {
     els.techDetail.textContent = T("（无技术详情）");
   }
-  // 一键修复（FR-12）：服务类故障可修复时显示修复按钮
-  els.repairBtn.classList.remove("hidden");
+  renderRecovery();
 }
 
 function setPhase(phase: string, message?: string) {
@@ -96,12 +141,17 @@ function setPhase(phase: string, message?: string) {
 }
 
 async function navigate(url: string) {
-  // 就绪后跳转到本地 DSH 服务
+  try {
+    const u = new URL(url, window.location.href);
+    if (u.searchParams.has("token") && u.origin !== window.location.origin) {
+      window.location.href = u.origin + u.pathname;
+      return;
+    }
+  } catch {
+  }
   window.location.href = url;
 }
 
-// 首次使用引导（FR-16）：READY 后先显示白话引导，点「开始使用」才进入；
-// 用 localStorage 记录，仅首次显示。
 const WELCOME_KEY = "dsh-desktop.welcome-seen";
 let pendingUrl: string | null = null;
 
@@ -111,7 +161,6 @@ function showWelcome(url: string) {
   els.message.classList.add("hidden");
   els.progressTrack.classList.add("hidden");
   els.welcomeBox.classList.remove("hidden");
-  // 引导文案（FR-16 + NFR-10）
   const welcomeHeading = els.welcomeBox.querySelector("h2");
   const welcomeText = els.welcomeBox.querySelector(".welcome-text");
   const welcomeBtnText = els.welcomeBtn;
@@ -128,14 +177,12 @@ function bindActions() {
     window.location.reload();
   });
   els.repairBtn.addEventListener("click", async () => {
-    // 一键修复（FR-12）：重建运行时 + 重启服务；期间显示修复中状态
     els.repairBtn.disabled = true;
     els.repairBtn.textContent = lang === "zh" ? "正在修复…" : "Repairing…";
     els.errorMessage.textContent = lang === "zh" ? "正在修复，请稍候…" : "Repairing, please wait…";
     els.techDetail.textContent = "";
     try {
       await invoke("repair_service");
-      // 修复成功后 boot://ready 事件会触发跳转；这里兜底 reload
     } catch (e) {
       els.errorMessage.textContent =
         lang === "zh" ? "修复没有成功，请稍后再试或重新安装。" : "Repair failed. Please try again or reinstall.";
@@ -143,6 +190,33 @@ function bindActions() {
     } finally {
       els.repairBtn.disabled = false;
       els.repairBtn.textContent = lang === "zh" ? "一键修复" : "Repair";
+    }
+  });
+  els.removePluginsBtn.addEventListener("click", async () => {
+    const opts = recoveryOptions;
+    if (!opts) return;
+    els.removePluginsBtn.disabled = true;
+    els.removePluginsBtn.textContent = T("正在移除并重试…");
+    els.errorMessage.textContent = T("正在移除不兼容插件，请稍候…");
+    els.techDetail.textContent = "";
+    try {
+      const removed = await invoke<string[]>("plugins_remove_incompatible", {
+        names: opts.plugins,
+      });
+      if (!removed || removed.length === 0) {
+        els.errorMessage.textContent = T("没有需要移除的插件，请重试。");
+        renderRecovery();
+        return;
+      }
+      els.errorMessage.textContent = T("移除完成，正在重启服务…");
+      await invoke("restart_service");
+    } catch (e) {
+      console.error("remove incompatible plugins failed", e);
+      els.errorMessage.textContent = T("移除失败：") + String(e);
+      renderRecovery();
+    } finally {
+      els.removePluginsBtn.disabled = false;
+      els.removePluginsBtn.textContent = T("移除不兼容插件");
     }
   });
   els.quitBtn.addEventListener("click", async () => {
@@ -159,32 +233,41 @@ function bindActions() {
 async function main() {
   bindActions();
 
-  // 事件监听
   await listen<BootProgress>("boot://progress", (e) => {
     setPhase(e.payload.phase, e.payload.message);
   });
   await listen<BootReady>("boot://ready", (e) => {
     handleReady(e.payload.url);
   });
+  await listen<BootErrorOptions>("boot://error-options", (e) => {
+    recoveryOptions = e.payload;
+    if (!els.errorBox.classList.contains("hidden")) {
+      renderRecovery();
+    }
+  });
 
-  // 先拉一次快照（若 boot 已完成或已失败）
   try {
     const snap = await invoke<StatusSnapshot>("get_status");
     if (snap.phase === "ready" && snap.port > 0) {
-      handleReady(`http://127.0.0.1:${snap.port}`);
+      handleReady(snap.service_url ?? `http://127.0.0.1:${snap.port}`);
       return;
     }
     if (snap.phase === "error") {
+      recoveryOptions = snap.recovery;
       showError(snap.error ?? "遇到了一点问题，请重试。");
       return;
     }
     setPhase(snap.phase, snap.message);
   } catch (e) {
-    // 忽略：事件流会接管
   }
 }
 
 function handleReady(url: string) {
+  clearRecovery();
+  els.errorBox.classList.add("hidden");
+  els.progressTrack.classList.remove("hidden");
+  els.progressBar.style.width = "100%";
+  els.title.textContent = T("准备完成");
   let seen = false;
   try {
     seen = localStorage.getItem(WELCOME_KEY) === "1";

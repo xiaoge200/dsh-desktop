@@ -3,18 +3,16 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::Mutex;
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
-/// 平台相关的子进程句柄：Windows 用隐藏控制台的 ChildHandle（其子孙进程也不弹窗），
-/// 其他平台用 std::process::Child。
+use crate::serviceout::ServiceCapture;
+
 #[cfg(windows)]
 type SpawnedChild = crate::winproc::ChildHandle;
 #[cfg(not(windows))]
 type SpawnedChild = std::process::Child;
 
-/// Windows Job Object 封装：把服务进程树挂到主进程名下，主进程无论以何种方式
-/// 退出（含被强杀/崩溃），job 内进程随之终止，杜绝孤儿 node 进程。
 #[cfg(windows)]
 mod win {
     use std::mem::size_of;
@@ -33,7 +31,6 @@ mod win {
         JOBOBJECT_EXTENDED_LIMIT_INFORMATION, THREAD_SUSPEND_RESUME, HANDLE,
     };
 
-    /// Job 句柄。裸 HANDLE 不是 Send/Sync，这里包一层标记。
     pub struct Job(HANDLE);
     unsafe impl Send for Job {}
     unsafe impl Sync for Job {}
@@ -44,7 +41,6 @@ mod win {
         }
     }
 
-    /// 创建带 KILL_ON_JOB_CLOSE 的 Job；失败返回 None（调用方降级为 taskkill 清理）。
     pub fn create_kill_on_close_job() -> Option<Job> {
         unsafe {
             let h = CreateJobObjectW(std::ptr::null_mut(), std::ptr::null());
@@ -67,13 +63,10 @@ mod win {
         }
     }
 
-    /// 把子进程加入 job（Win8+ 允许嵌套 job，一般会成功；失败不致命）。
     pub fn assign(job: &Job, child_handle: HANDLE) -> bool {
         unsafe { AssignProcessToJobObject(job.0, child_handle) != 0 }
     }
 
-    /// 恢复被 CREATE_SUSPENDED 挂起的进程全部线程（Toolhelp 枚举）。
-    /// 刚创建即挂起的进程只有主线程，恢复后即正常运行。
     pub fn resume_threads(pid: u32) {
         unsafe {
             let snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
@@ -102,18 +95,15 @@ mod win {
         }
     }
 
-    /// 终止 job 内全部进程（正常 stop/退出路径；幂等）。
     pub fn terminate(job: &Job) {
         unsafe { TerminateJobObject(job.0, 1) };
     }
 }
 
-/// 127.0.0.1 的 SocketAddr（端口动态）
 fn loopback(port: u16) -> SocketAddr {
     SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port)
 }
 
-/// 去掉 Windows verbatim 路径前缀（`\\?\`），Node 24 无法以这种路径作为入口脚本
 fn normalize_for_node(p: &Path) -> PathBuf {
     #[cfg(windows)]
     {
@@ -130,27 +120,15 @@ fn normalize_for_node(p: &Path) -> PathBuf {
     }
 }
 
-/// 服务进程托管：spawn `dsh web --no-open`、健康检查、限次重启、退出清理。
-///
-/// 设计对应 dsh-desktop-plan.md §7：
-/// - 端口：优先 3080，被占用时自动探测空闲端口（用户无感）
-/// - 健康检查：TCP + HTTP GET / 探测
-/// - 重启退避：5 分钟内最多 3 次，超出进入降级态
-/// - 退出清理：Windows 挂 Job Object（KILL_ON_JOB_CLOSE）——主进程无论以何种方式
-///   退出（含强杀/崩溃）服务进程树都随之终止；再叠加 taskkill /T /F 兜底
 pub struct Supervisor {
     child: Mutex<Option<SpawnedChild>>,
-    /// 服务实际监听端口
     port: AtomicU32,
-    /// 5 分钟滑动窗口内的重启计数
     restarts: Mutex<Vec<Instant>>,
-    /// 是否已进入降级态（超过重启上限）
     degraded: Mutex<bool>,
-    /// 服务日志目录（stdout/stderr 落盘，FR-09）
     log_dir: Mutex<Option<PathBuf>>,
-    /// dsh 入口脚本绝对路径（用于按命令行标记清理残留/孤儿服务进程）
+    capture: Mutex<Option<Arc<ServiceCapture>>>,
+    reader_done: Mutex<Option<(mpsc::Receiver<()>, mpsc::Receiver<()>)>>,
     dsh_bin: Mutex<Option<PathBuf>>,
-    /// Windows Job 对象（KILL_ON_JOB_CLOSE）：主进程被强杀时服务进程树随之终止
     #[cfg(windows)]
     job: Mutex<Option<win::Job>>,
 }
@@ -167,13 +145,14 @@ impl Supervisor {
             restarts: Mutex::new(Vec::new()),
             degraded: Mutex::new(false),
             log_dir: Mutex::new(None),
+            capture: Mutex::new(None),
+            reader_done: Mutex::new(None),
             dsh_bin: Mutex::new(None),
             #[cfg(windows)]
             job: Mutex::new(None),
         }
     }
 
-    /// 设置服务日志目录（启动前调用；stdout/stderr 会落盘到 <dir>/service.log）
     pub fn set_log_dir(&self, dir: PathBuf) {
         *self.log_dir.lock().unwrap() = Some(dir);
     }
@@ -182,18 +161,14 @@ impl Supervisor {
         self.port.load(Ordering::SeqCst) as u16
     }
 
-    /// 是否已进入降级态（超过重启上限）
-    #[allow(dead_code)]
     pub fn is_degraded(&self) -> bool {
         *self.degraded.lock().unwrap()
     }
 
-    /// 探测一个空闲端口（默认 3080，被占用则系统分配）
     pub fn pick_free_port(preferred: u16) -> u16 {
         if TcpStream::connect(loopback(preferred)).is_err() {
             return preferred;
         }
-        // 被占用：让 OS 分配一个临时端口
         match std::net::TcpListener::bind(loopback(0)) {
             Ok(l) => match l.local_addr() {
                 Ok(addr) => addr.port(),
@@ -203,8 +178,6 @@ impl Supervisor {
         }
     }
 
-    /// 启动服务：node <dsh>/lib/bin.js web --no-open --port <port> [extra_args...]
-    /// 返回实际使用的端口（0 表示启动失败）。extra_args 为高级用户透传的 dsh 参数（FR-15）。
     pub fn start(
         &mut self,
         node: &Path,
@@ -213,7 +186,6 @@ impl Supervisor {
         preferred_port: u16,
         extra_args: &[String],
     ) -> Result<u16, String> {
-        // 先记录入口脚本，stop() 才能按命令行标记清理残留进程（须在 stop 之前）
         *self.dsh_bin.lock().unwrap() = Some(dsh_bin.to_path_buf());
         self.stop();
 
@@ -222,33 +194,39 @@ impl Supervisor {
             return Err("无法确定可用端口".into());
         }
 
-        // stdout/stderr 落盘（FR-09）：不 pipe——pipe 且不读取会导致缓冲填满后
-        // dsh 的 write 永久阻塞（服务卡死）。直接重定向到 service.log（每次启动截断）。
-        let mut stdout_file: Option<std::fs::File> = None;
-        let mut stderr_file: Option<std::fs::File> = None;
+        let mut sink: Option<(std::fs::File, std::fs::File)> = None;
         if let Some(dir) = self.log_dir.lock().unwrap().clone() {
             if let Err(e) = std::fs::create_dir_all(&dir) {
                 log::warn!("create service log dir: {e}");
             }
             let log_path = dir.join("service.log");
-            let open = || std::fs::OpenOptions::new().create(true).truncate(true).write(true).open(&log_path);
-            match open() {
-                Ok(f) => {
-                    let _ = f.set_len(0);
-                    stdout_file = Some(f);
-                    // stderr 复用同一文件：单独再开一个句柄（同为截断写）
-                    stderr_file = open().ok();
-                }
+            let _ = std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(true)
+                .write(true)
+                .open(&log_path);
+            match std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .write(true)
+                .open(&log_path)
+            {
+                Ok(f) => match f.try_clone() {
+                    Ok(g) => sink = Some((f, g)),
+                    Err(e) => log::warn!("clone service log handle: {e}"),
+                },
                 Err(e) => log::warn!("open service log: {e}"),
             }
         }
+        let capture: Arc<ServiceCapture> =
+            Arc::new(ServiceCapture::new(crate::serviceout::DEFAULT_LIMIT));
+        *self.capture.lock().unwrap() = None;
+        *self.reader_done.lock().unwrap() = None;
 
-        // 确保工作区目录存在（current_dir 必须存在，否则 spawn 报 os error 267）
         if let Err(e) = std::fs::create_dir_all(workspace) {
             log::warn!("ensure workspace dir: {e}");
         }
 
-        // 组装命令行参数（两平台共用）：node <dsh_bin> web --no-open --port N [extra...]
         let mut args: Vec<String> = vec![
             normalize_for_node(dsh_bin).to_string_lossy().to_string(),
             "web".to_string(),
@@ -260,61 +238,96 @@ impl Supervisor {
             args.push(a.clone());
         }
 
-        // Windows：用「隐藏控制台」启动——node 自身及其全部后代（dsh worker、
-        // npm 脚本等）都继承同一个隐藏控制台，整棵进程树都不弹命令行窗口。
-        // （CREATE_NO_WINDOW 只隐藏直接进程，node 的后代没有可继承控制台时会
-        //   各自新建可见控制台 → 插件更新/重启时闪黑窗。详见 winproc 模块注释。）
-        // CREATE_SUSPENDED：先挂起，等挂进 Job 后再恢复，避免启动竞态。
         #[cfg(windows)]
         let child: SpawnedChild = {
-            use crate::winproc::{spawn_hidden, SpawnOpts};
-            let child = spawn_hidden(SpawnOpts {
-                program: normalize_for_node(node),
-                args,
-                cwd: Some(normalize_for_node(workspace)),
-                stdout: stdout_file,
-                stderr: stderr_file,
-                suspend: true,
-                process_group: true,
-            })
-            .map_err(|e| format!("启动服务失败: {e}"))?;
-            log::info!("service spawned (hidden console), pid={}", child.id());
+            use crate::winproc::{create_pipe, spawn_hidden, SpawnOpts};
+            let pipe_res: Result<(crate::winproc::ChildHandle, std::fs::File, std::fs::File), String> =
+                (|| {
+                    let (out_r, out_w) =
+                        create_pipe().map_err(|e| format!("create stdout pipe: {e}"))?;
+                    let (err_r, err_w) =
+                        create_pipe().map_err(|e| format!("create stderr pipe: {e}"))?;
+                    let c = spawn_hidden(SpawnOpts {
+                        program: normalize_for_node(node),
+                        args: args.clone(),
+                        cwd: Some(normalize_for_node(workspace)),
+                        stdout: Some(out_w),
+                        stderr: Some(err_w),
+                        suspend: true,
+                        process_group: true,
+                    })
+                    .map_err(|e| format!("启动服务失败: {e}"))?;
+                    Ok((c, out_r, err_r))
+                })();
+            match pipe_res {
+                Ok((child, out_r, err_r)) => {
+                    log::info!("service spawned (hidden console, pipe capture), pid={}", child.id());
 
-            // 把服务挂进 KILL_ON_JOB_CLOSE 的 Job——主进程无论以何种方式退出
-            // （含强杀/崩溃），整棵服务进程树都会随之终止，杜绝孤儿进程。
-            let job = win::create_kill_on_close_job();
-            if let Some(ref j) = job {
-                if win::assign(j, child.as_raw_handle()) {
-                    log::info!("service attached to kill-on-close job");
-                } else {
-                    log::warn!("assign service to job failed; falling back to taskkill cleanup");
+                    let job = win::create_kill_on_close_job();
+                    if let Some(ref j) = job {
+                        if win::assign(j, child.as_raw_handle()) {
+                            log::info!("service attached to kill-on-close job");
+                        } else {
+                            log::warn!("assign service to job failed; falling back to taskkill cleanup");
+                        }
+                    }
+                    *self.job.lock().unwrap() = job;
+
+                    self.spawn_readers(out_r, err_r, sink, capture.clone());
+                    win::resume_threads(child.id());
+                    child
+                }
+                Err(e) if e.starts_with("启动服务失败") => return Err(e),
+                Err(e) => {
+                    log::warn!("{e}; falling back to direct log redirect");
+                    let stdout_f = sink.as_ref().and_then(|(a, _)| a.try_clone().ok());
+                    let stderr_f = sink.as_ref().and_then(|(_, b)| b.try_clone().ok());
+                    if stdout_f.is_none() || stderr_f.is_none() {
+                        log::warn!("open service log (fallback redirect) failed");
+                    }
+                    let child = spawn_hidden(SpawnOpts {
+                        program: normalize_for_node(node),
+                        args: args.clone(),
+                        cwd: Some(normalize_for_node(workspace)),
+                        stdout: stdout_f,
+                        stderr: stderr_f,
+                        suspend: true,
+                        process_group: true,
+                    })
+                    .map_err(|e| format!("启动服务失败: {e}"))?;
+                    log::info!("service spawned (hidden console, direct log), pid={}", child.id());
+                    let job = win::create_kill_on_close_job();
+                    if let Some(ref j) = job {
+                        if win::assign(j, child.as_raw_handle()) {
+                            log::info!("service attached to kill-on-close job");
+                        } else {
+                            log::warn!("assign service to job failed; falling back to taskkill cleanup");
+                        }
+                    }
+                    *self.job.lock().unwrap() = job;
+                    win::resume_threads(child.id());
+                    child
                 }
             }
-            // 无论 job 是否创建成功，都要恢复被挂起的进程
-            win::resume_threads(child.id());
-            *self.job.lock().unwrap() = job;
-            child
         };
 
-        // Unix：进程组便于退出时整组清理；stdout/stderr 落盘或丢弃
         #[cfg(unix)]
         let child: SpawnedChild = {
             let mut cmd = Command::new(normalize_for_node(node));
-            cmd.args(&args).current_dir(normalize_for_node(workspace));
-            if let Some(f) = stdout_file {
-                cmd.stdout(f);
-            } else {
-                cmd.stdout(Stdio::null());
-            }
-            if let Some(f) = stderr_file {
-                cmd.stderr(f);
-            } else {
-                cmd.stderr(Stdio::null());
-            }
+            cmd.args(&args)
+                .current_dir(normalize_for_node(workspace))
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
             use std::os::unix::process::CommandExt;
             cmd.process_group(0);
             log::info!("spawn: {:?}", cmd);
-            cmd.spawn().map_err(|e| format!("启动服务失败: {e}"))?
+            let mut child = cmd.spawn().map_err(|e| format!("启动服务失败: {e}"))?;
+            log::info!("service spawned, pid={}", child.id());
+            match (child.stdout.take(), child.stderr.take()) {
+                (Some(out), Some(err)) => self.spawn_readers(out, err, sink, capture.clone()),
+                _ => log::warn!("service pipes unavailable; capture disabled"),
+            }
+            child
         };
 
         *self.child.lock().unwrap() = Some(child);
@@ -323,7 +336,6 @@ impl Supervisor {
         Ok(port)
     }
 
-    /// 健康检查：HTTP GET /，成功返回 true。失败返回 false。
     pub fn health_check(&self) -> bool {
         let port = self.port();
         if port == 0 {
@@ -351,8 +363,6 @@ impl Supervisor {
         }
     }
 
-    /// 检查子进程是否已退出（返回 true 表示已退出）。
-    #[allow(dead_code)]
     pub fn is_exited(&self) -> bool {
         let mut guard = self.child.lock().unwrap();
         if let Some(child) = guard.as_mut() {
@@ -369,7 +379,64 @@ impl Supervisor {
         }
     }
 
-    /// 记录一次崩溃并判断是否允许重启。
+    pub fn captured_url(&self) -> Option<String> {
+        let cap = self.capture.lock().unwrap().clone()?;
+        let port = self.port();
+        if port == 0 {
+            return None;
+        }
+        cap.captured_url(port)
+    }
+
+    pub fn failure_classify(&self) -> Option<crate::serviceout::FailureKind> {
+        let cap = self.capture.lock().unwrap().clone()?;
+        Some(cap.classify())
+    }
+
+    pub fn output_tail(&self, max: usize) -> String {
+        let cap = match self.capture.lock().unwrap().clone() {
+            Some(c) => c,
+            None => return String::new(),
+        };
+        let text = cap.text();
+        if text.len() <= max {
+            return text;
+        }
+        let mut start = text.len() - max;
+        while !text.is_char_boundary(start) {
+            start += 1;
+        }
+        text[start..].to_string()
+    }
+
+    fn spawn_readers<R1: std::io::Read + Send + 'static, R2: std::io::Read + Send + 'static>(
+        &self,
+        out_r: R1,
+        err_r: R2,
+        sink: Option<(std::fs::File, std::fs::File)>,
+        cap: Arc<ServiceCapture>,
+    ) {
+        *self.capture.lock().unwrap() = Some(cap.clone());
+        let (tx_out, rx_out) = mpsc::channel();
+        let (tx_err, rx_err) = mpsc::channel();
+        let (sink_out, sink_err) = sink.map(|(a, b)| (Some(a), Some(b))).unwrap_or((None, None));
+        let cap_out = cap.clone();
+        let cap_err = cap.clone();
+        let t_out = std::thread::Builder::new()
+            .name("service-out".into())
+            .spawn(move || reader_loop(out_r, sink_out, cap_out, tx_out));
+        let t_err = std::thread::Builder::new()
+            .name("service-err".into())
+            .spawn(move || reader_loop(err_r, sink_err, cap_err, tx_err));
+        if t_out.is_err() {
+            log::warn!("spawn stdout reader thread failed; capture degraded");
+        }
+        if t_err.is_err() {
+            log::warn!("spawn stderr reader thread failed; capture degraded");
+        }
+        *self.reader_done.lock().unwrap() = Some((rx_out, rx_err));
+    }
+
     fn allow_restart(&self) -> bool {
         let now = Instant::now();
         let mut window = self.restarts.lock().unwrap();
@@ -383,7 +450,6 @@ impl Supervisor {
         }
     }
 
-    /// 重启服务：先记录崩溃，若未超限则重启。
     pub fn restart(&mut self, node: &Path, dsh_bin: &Path, workspace: &Path, preferred_port: u16, extra_args: &[String]) -> Result<u16, String> {
         if !self.allow_restart() {
             log::warn!("service exceeded restart limit; degraded mode");
@@ -393,9 +459,7 @@ impl Supervisor {
         self.start(node, dsh_bin, workspace, preferred_port, extra_args)
     }
 
-    /// 停止服务并清理进程树。
     pub fn stop(&mut self) {
-        // Windows：先终止 Job 内全部进程（含游离子进程），再走常规清理兜底
         #[cfg(windows)]
         {
             if let Some(j) = self.job.lock().unwrap().take() {
@@ -409,7 +473,6 @@ impl Supervisor {
             #[cfg(windows)]
             {
                 use std::os::windows::process::CommandExt;
-                // taskkill /T /F 杀整棵树（CREATE_NO_WINDOW：避免闪黑窗口）
                 let _ = Command::new("taskkill")
                     .args(["/PID", &pid.to_string(), "/T", "/F"])
                     .stdout(Stdio::null())
@@ -420,7 +483,6 @@ impl Supervisor {
             }
             #[cfg(unix)]
             {
-                // 向进程组发 SIGTERM，最多等 5s，超时 SIGKILL 兜底（避免 Drop 阻塞）
                 unsafe {
                     libc::kill(-(pid as i32), libc::SIGTERM);
                 }
@@ -439,16 +501,20 @@ impl Supervisor {
             let _ = child.wait();
             log::info!("service stopped");
         }
-        // 清理残留的 dsh 进程（上一会话异常退出遗留的孤儿进程、taskkill /T
-        // 未覆盖的游离进程）。它们占着端口/运行时，会导致新服务启动失败。
         self.kill_stale_dsh();
+
+        if let Some((rx_out, rx_err)) = self.reader_done.lock().unwrap().take() {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            for rx in [rx_out, rx_err] {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() || rx.recv_timeout(remaining).is_err() {
+                    log::warn!("service reader thread did not exit in time");
+                    break;
+                }
+            }
+        }
     }
 
-    /// 按命令行标记清理残留的 dsh 服务进程。
-    ///
-    /// 只匹配命令行里含本应用 dsh 入口脚本（bin.js 绝对路径）的 node 进程，
-    /// 不碰安装器（install-dsh.mjs）、其他程序的 node 进程。
-    /// Windows 上对每个命中进程再 taskkill /T，连其派生的子进程一起杀。
     fn kill_stale_dsh(&self) {
         let marker = match self.dsh_bin.lock().unwrap().clone() {
             Some(p) => normalize_for_node(&p).to_string_lossy().to_lowercase(),
@@ -458,7 +524,6 @@ impl Supervisor {
         sys.refresh_processes_specifics(
             sysinfo::ProcessesToUpdate::All,
             true,
-            // 只需命令行，避免 everything() 额外枚举环境变量等开销
             sysinfo::ProcessRefreshKind::nothing().with_cmd(sysinfo::UpdateKind::Always),
         );
         let current = sysinfo::get_current_pid().ok();
@@ -477,7 +542,6 @@ impl Supervisor {
             #[cfg(windows)]
             {
                 use std::os::windows::process::CommandExt;
-                // CREATE_NO_WINDOW：避免杀进程时闪黑窗口
                 let _ = Command::new("taskkill")
                     .args(["/PID", &pid.as_u32().to_string(), "/T", "/F"])
                     .stdout(Stdio::null())
@@ -499,6 +563,30 @@ impl Drop for Supervisor {
     }
 }
 
+fn reader_loop<R: std::io::Read>(
+    mut r: R,
+    mut sink: Option<std::fs::File>,
+    cap: Arc<ServiceCapture>,
+    done: mpsc::Sender<()>,
+) {
+    let mut buf = [0u8; 8192];
+    loop {
+        match r.read(&mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                let chunk = &buf[..n];
+                if let Some(f) = sink.as_mut() {
+                    if f.write_all(chunk).is_ok() {
+                        let _ = f.flush();
+                    }
+                }
+                cap.push_bytes(chunk);
+            }
+        }
+    }
+    let _ = done.send(());
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -512,7 +600,6 @@ mod tests {
 
     #[test]
     fn normalize_for_node_strips_verbatim_prefix() {
-        // `\\?\C:\path` → `C:\path`
         let verbatim = PathBuf::from(r"\\?\C:\Users\test\dsh");
         let n = normalize_for_node(&verbatim);
         let s = n.to_string_lossy().to_string();
@@ -529,14 +616,12 @@ mod tests {
 
     #[test]
     fn pick_free_port_returns_preferred_when_free() {
-        // 3080 通常未被占用；若占用则返回别的端口（也是有效值）
         let port = Supervisor::pick_free_port(3080);
         assert!(port > 0);
     }
 
     #[test]
     fn pick_free_port_returns_alternative_when_occupied() {
-        // 占用一个端口后，pick_free_port 应返回另一个空闲端口
         let listener = std::net::TcpListener::bind(loopback(0)).unwrap();
         let occupied = listener.local_addr().unwrap().port();
         let picked = Supervisor::pick_free_port(occupied);
@@ -546,7 +631,6 @@ mod tests {
 
     #[test]
     fn health_check_fails_on_closed_port() {
-        // 绑定后立即关闭：该端口应不可连接
         let listener = std::net::TcpListener::bind(loopback(0)).unwrap();
         let port = listener.local_addr().unwrap().port();
         drop(listener);
@@ -557,7 +641,6 @@ mod tests {
 
     #[test]
     fn health_check_succeeds_on_http_server() {
-        // 起一个简易 HTTP 服务，验证 health_check 能识别
         let listener = std::net::TcpListener::bind(loopback(0)).unwrap();
         let port = listener.local_addr().unwrap().port();
         std::thread::spawn(move || {
@@ -569,7 +652,6 @@ mod tests {
         });
         let sup = Supervisor::new();
         sup.port.store(port as u32, Ordering::SeqCst);
-        // 等待服务接受连接
         let deadline = Instant::now() + Duration::from_secs(3);
         while Instant::now() < deadline {
             if sup.health_check() {

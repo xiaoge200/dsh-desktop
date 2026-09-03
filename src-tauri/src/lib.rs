@@ -2,25 +2,25 @@ mod config;
 mod logging;
 mod node;
 mod plugins;
+mod serviceout;
 mod state;
 mod supervisor;
 #[cfg(windows)]
 mod winproc;
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
-use state::{AppState, BootPhase, DshUpdateStatus, StatusSnapshot};
+use state::{AppState, BootPhase, DshUpdateStatus, RecoveryInfo, StatusSnapshot};
 use supervisor::Supervisor;
 use tauri::{AppHandle, Emitter, Manager, State};
 
-/// 应用数据目录下的子目录
 const RUNTIME_DIR: &str = "dsh-runtime";
 const WORKSPACE_DIR: &str = "workspace";
 const LOG_FILE: &str = "dsh-desktop.log";
 
-/// 显示主窗口（从托盘/单实例等入口复用）
 fn show_main_window(app: &AppHandle) {
     if let Some(w) = app.get_webview_window("main") {
         let _ = w.show();
@@ -29,7 +29,6 @@ fn show_main_window(app: &AppHandle) {
     }
 }
 
-/// 更新托盘 tooltip（FR-07：服务运行/降级状态提示）
 fn update_tray_tooltip(app: &AppHandle) {
     let state = app.state::<AppState>();
     let phase = state.phase();
@@ -54,7 +53,6 @@ fn update_tray_tooltip(app: &AppHandle) {
     }
 }
 
-/// 显示设置窗口（隐藏后再次打开仍有效——窗口关闭时是隐藏而非销毁）
 fn show_settings_window(app: &AppHandle) {
     if let Some(w) = app.get_webview_window("settings") {
         let _ = w.show();
@@ -62,7 +60,6 @@ fn show_settings_window(app: &AppHandle) {
         let _ = w.set_focus();
     } else {
         log::warn!("settings window not found; creating");
-        // 窗口意外被销毁（极端情况）：重新创建
         if let Err(e) = tauri::WebviewWindowBuilder::new(
             app,
             "settings",
@@ -77,19 +74,14 @@ fn show_settings_window(app: &AppHandle) {
             log::error!("create settings window failed: {e}");
         }
     }
-    // 设置窗口在应用启动时即已创建（hidden），页面加载早于 boot 完成，
-    // 首次拉取到的 DSH 版本/运行环境/工作区/服务状态可能是空值。
-    // 每次打开窗口都通知页面重新拉取最新数据。
     let _ = app.emit("settings://refresh", ());
 }
 
-/// 主界面设置按钮入口（由注入到 DSH 页面的按钮调用）
 #[tauri::command]
 fn open_settings(app: AppHandle) {
     show_settings_window(&app);
 }
 
-/// 主界面右键菜单（由注入到 DSH 页面的 contextmenu 监听调用）
 #[tauri::command]
 fn open_context_menu(app: AppHandle) -> Result<(), String> {
     use tauri::menu::{ContextMenu, Menu as CtxMenu, MenuItem as CtxMenuItem};
@@ -115,7 +107,6 @@ fn open_context_menu(app: AppHandle) -> Result<(), String> {
     Ok(())
 }
 
-/// 把阶段映射为白话文案（前端也有映射，这里用于日志）
 fn phase_text(p: BootPhase) -> &'static str {
     match p {
         BootPhase::NodeCheck => "正在准备程序…",
@@ -126,17 +117,11 @@ fn phase_text(p: BootPhase) -> &'static str {
     }
 }
 
-/// 系统语言是否为中文（NFR-10：托盘菜单等原生 UI 文案）
 fn is_zh_locale() -> bool {
     #[cfg(windows)]
     {
-        // Windows 优先读系统 UI 语言（注册表）：从 Git Bash 等环境启动时
-        // LANG/LC_ALL 可能被设为 en_US，若环境变量优先会导致托盘误显示英文
-        // （与网页端 navigator.language 不一致）。非中文系统再回退环境变量，
-        // 保留用户用 LANG=zh_* 强制中文的能力。
         use winapi::um::winnls::GetUserDefaultUILanguage;
         let lang = unsafe { GetUserDefaultUILanguage() };
-        // 0x0804 = 简体中文，0x1004 = 简体中文（新加坡），0x0404 = 繁体中文（台湾），0x0C04 = 繁体中文（香港）
         if matches!(lang, 0x0804 | 0x1004 | 0x0404 | 0x0C04) {
             return true;
         }
@@ -155,7 +140,6 @@ fn emit_progress(app: &AppHandle, phase: BootPhase, message: &str) {
     );
 }
 
-/// 设置错误状态并广播给前端
 fn fail(app: &AppHandle, state: &AppState, message: impl Into<String>, detail: &str) {
     state.set_error(message.into());
     let msg = state.error().unwrap_or_default();
@@ -164,10 +148,15 @@ fn fail(app: &AppHandle, state: &AppState, message: impl Into<String>, detail: &
     log::error!("boot failed: {detail}");
 }
 
-/// 启动流程：校验 Node → 安装/更新 DSH → 启动服务 → 就绪
 fn boot(app: AppHandle) {
     let state = app.state::<AppState>();
-    // 1) Node 校验
+    if let Some(w) = app.get_webview_window("main") {
+        if let Ok(u) = w.url() {
+            state.set_boot_page_url(u.to_string());
+        }
+    }
+    state.clear_recovery();
+    state.set_pending_auth_url(None);
     state.set_phase(BootPhase::NodeCheck);
     emit_progress(&app, BootPhase::NodeCheck, phase_text(BootPhase::NodeCheck));
     let resource_dir = match app.path().resource_dir() {
@@ -187,7 +176,6 @@ fn boot(app: AppHandle) {
     match node::smoke(&node_path) {
         Ok(v) => log::info!("node ok: {v}"),
         Err(e) => {
-            // FR-12 自修复：瞬时故障自动重试一次（如被杀软临时拦截）
             log::warn!("node smoke failed (retrying once): {e}");
             std::thread::sleep(Duration::from_millis(800));
             match node::smoke(&node_path) {
@@ -206,7 +194,6 @@ fn boot(app: AppHandle) {
     }
     state.set_node_path(node_path);
 
-    // 2) DSH 运行时安装/更新
     state.set_phase(BootPhase::DshInstall);
     emit_progress(&app, BootPhase::DshInstall, phase_text(BootPhase::DshInstall));
     let app_data = match app.path().app_data_dir() {
@@ -224,7 +211,6 @@ fn boot(app: AppHandle) {
     state.set_runtime_dir(runtime_dir.clone());
     state.set_workspace_dir(workspace_dir);
 
-    // 服务日志目录（FR-09：dsh stdout/stderr 落盘）
     state.supervisor.lock().unwrap().set_log_dir(app_data.join("logs"));
 
     let installer_js = resource_dir.join("installer").join("install-dsh.mjs");
@@ -236,7 +222,6 @@ fn boot(app: AppHandle) {
             return;
         }
     };
-    // 解析安装器输出（末行 JSON）
     if let Some(line) = install_out.lines().last() {
         if let Ok(json) = serde_json::from_str::<serde_json::Value>(line) {
             if json.get("ok").and_then(|v| v.as_bool()) != Some(true) {
@@ -254,7 +239,6 @@ fn boot(app: AppHandle) {
         }
     }
 
-    // 3) 启动服务
     state.set_phase(BootPhase::ServiceStart);
     emit_progress(&app, BootPhase::ServiceStart, phase_text(BootPhase::ServiceStart));
     let dsh_bin = runtime_dir
@@ -268,62 +252,83 @@ fn boot(app: AppHandle) {
         return;
     }
 
-    let cfg_port = state.config.lock().unwrap().get().port;
-    let preferred_port = if cfg_port > 0 { cfg_port } else { 3080u16 };
-    let port = {
-        let mut sup = state.supervisor.lock().unwrap();
-        let extra = state.dsh_extra_args.lock().unwrap().clone();
-        match sup.start(&state.node_path(), &dsh_bin, &state.workspace_dir(), preferred_port, &extra) {
-            Ok(p) => p,
-            Err(e) => {
-                drop(sup);
-                fail(&app, &state, "启动没有成功，请重试。", &format!("service start: {e}"));
+    let preferred_port = preferred_port(&state);
+    let extra = state.dsh_extra_args.lock().unwrap().clone();
+    let started = start_service_with_heal(
+        &app,
+        &state,
+        &state.node_path(),
+        &dsh_bin,
+        &state.workspace_dir(),
+        preferred_port,
+        &extra,
+        true,
+    );
+    match started {
+        Ok(()) => {}
+        Err(issue) if issue.spawn_error => {
+            let msg = if issue.detail.contains("多次启动失败") {
+                "程序多次启动失败，请稍后再试。"
+            } else {
+                "启动没有成功，请重试。"
+            };
+            fail(&app, &state, msg, &format!("service start: {}", issue.detail));
+            return;
+        }
+        Err(issue) => {
+            if issue.kind == serviceout::FailureKind::PluginTree {
+                fail(
+                    &app,
+                    &state,
+                    "部分已安装插件与当前 DSH 版本不兼容，服务无法启动。",
+                    &issue.detail,
+                );
+                emit_error_options(&app, &state, &issue);
                 return;
             }
-        }
-    };
-    state.set_port(port);
-    log::info!("service on 127.0.0.1:{port}");
-
-    // 健康检查（首次等待 30s；不持锁轮询，避免拖住 get_settings 等主线程命令）
-    let ready = wait_service_ready(&state, Duration::from_secs(30));
-    if !ready {
-        // 尝试重启一次（可能是端口竞态等瞬时问题）
-        log::warn!("service not healthy after 30s; restarting once");
-        let port = {
-            let mut sup = state.supervisor.lock().unwrap();
-            let extra = state.dsh_extra_args.lock().unwrap().clone();
-            match sup.restart(&state.node_path(), &dsh_bin, &state.workspace_dir(), preferred_port, &extra) {
-                Ok(p) => p,
-                Err(e) => {
-                    fail(&app, &state, "程序多次启动失败，请稍后再试。", &format!("restart: {e}"));
+            log::warn!("service not healthy after start; restarting once");
+            match start_service_with_heal(
+                &app,
+                &state,
+                &state.node_path(),
+                &dsh_bin,
+                &state.workspace_dir(),
+                preferred_port,
+                &extra,
+                false,
+            ) {
+                Ok(()) => {}
+                Err(issue2) => {
+                    let msg = if issue2.spawn_error {
+                        if issue2.detail.contains("多次启动失败") {
+                            "程序多次启动失败，请稍后再试。"
+                        } else {
+                            "程序没有正常启动，点这里修复。"
+                        }
+                    } else {
+                        "程序没有正常启动，点这里修复。"
+                    };
+                    fail(&app, &state, msg, &issue2.detail);
+                    if !issue2.spawn_error {
+                        emit_error_options(&app, &state, &issue2);
+                    }
                     return;
                 }
             }
-        };
-        state.set_port(port);
-        if !wait_service_ready(&state, Duration::from_secs(30)) {
-            fail(&app, &state, "程序没有正常启动，点这里修复。", "service unhealthy after restart");
-            return;
         }
     }
 
-    // 4) 就绪
+    wait_service_url(&state, Duration::from_secs(2));
     state.set_phase(BootPhase::Ready);
     state.clear_error();
-    // 记录当前 bundle 集合（插件页据此提示"重启后生效"）
     plugins::record_restart(&state);
-    let port = state.port();
-    log::info!("READY http://127.0.0.1:{port}");
+    let url = service_url(&state);
+    state.set_pending_auth_url(Some(url.clone()));
+    log::info!("READY {url}");
     update_tray_tooltip(&app);
-    let _ = app.emit(
-        "boot://ready",
-        serde_json::json!({ "url": format!("http://127.0.0.1:{port}") }),
-    );
+    let _ = app.emit("boot://ready", serde_json::json!({ "url": url }));
+    spawn_service_watch(&app);
 
-    // 5) 后台检查/更新 DSH（不阻塞使用；结果写入状态，设置页可见，失败不打扰）。
-    //    延迟执行：等用户先正常进入工作台（服务就绪后 30s 再查更新），避免启动阶段
-    //    网络查询/更新替换与首次使用抢时间。
     let bg_node = state.node_path();
     let bg_installer = installer_js.clone();
     let bg_runtime = runtime_dir.clone();
@@ -349,7 +354,6 @@ fn boot(app: AppHandle) {
             return;
         }
         std::thread::sleep(Duration::from_secs(30));
-        // 先检查是否有新版本（--pre 由设置「更新预发布版本」决定）
         let check = match node::run_check(&bg_node, &bg_installer, &bg_runtime, &registry_source, pre_release) {
             Ok(o) => o,
             Err(e) => {
@@ -377,8 +381,6 @@ fn boot(app: AppHandle) {
             });
             return;
         }
-        // 有可用更新：正式版更新（new-version-available），或开启预发布时仅预发布更新
-        // （prerelease-available）
         let has_update =
             check_res.action == "new-version-available" || check_res.action == "prerelease-available";
         if !has_update {
@@ -389,13 +391,11 @@ fn boot(app: AppHandle) {
                 latest: check_res.version.clone(),
                 prerelease: check_res.prerelease.clone(),
                 pre_available: check_res.pre_available,
-                message: format!("已是最新版本（{}）", check_res.version.unwrap_or_default()),
+                message: up_to_date_message(&check_res.version),
             });
             log::info!("bg update: up-to-date");
             return;
         }
-        // 有新版：先停服务（释放运行时目录文件占用——Windows 上替换运行时必须），
-        // 再后台安装（installer 用 staging 原子替换，失败不损坏现有运行时），最后重启服务。
         log::info!("bg update: new version available, installing");
         let latest = check_res.version.clone();
         state.set_dsh_update(DshUpdateStatus {
@@ -407,7 +407,6 @@ fn boot(app: AppHandle) {
             pre_available: check_res.pre_available,
             message: format!("发现新版本 {}，正在后台更新…", latest.unwrap_or_default()),
         });
-        // 阶段一：下载到 staging 并校验（服务继续运行，失败不影响现有运行时）
         let update_out = match node::run_update(&bg_node, &bg_installer, &bg_runtime, &registry_source, pre_release) {
             Ok(o) => o,
             Err(e) => {
@@ -425,7 +424,6 @@ fn boot(app: AppHandle) {
         };
         let u = node::parse_installer_output(&update_out);
         if !u.ok || u.action != "downloaded" {
-            // 下载/校验失败：现有运行时未动，服务继续运行，无需重启
             let message = u.message.unwrap_or_else(|| "更新结果未知，请查看日志".into());
             state.set_dsh_update(DshUpdateStatus {
                 ok: u.ok,
@@ -439,7 +437,6 @@ fn boot(app: AppHandle) {
             log::warn!("bg update download failed: {}", update_out.lines().last().unwrap_or("?"));
             return;
         }
-        // 阶段二：停服务（释放文件占用）→ 原子替换 → 重启服务
         log::info!("bg update downloaded {} to staging, swapping", u.version.clone().unwrap_or_default());
         state.supervisor.lock().unwrap().stop();
         let staging = match &u.staging {
@@ -453,7 +450,7 @@ fn boot(app: AppHandle) {
                     message: "更新缺少暂存目录，已保留当前版本。".into(),
                     ..Default::default()
                 });
-                restart_dsh_service(&state, &bg_node, &bg_runtime, &bg_workspace, &bg_extra);
+                restart_dsh_service(&bg_app, &state, &bg_node, &bg_runtime, &bg_workspace, &bg_extra);
                 return;
             }
         };
@@ -470,7 +467,7 @@ fn boot(app: AppHandle) {
                     ..Default::default()
                 });
                 log::warn!("bg update swap failed: {e}");
-                restart_dsh_service(&state, &bg_node, &bg_runtime, &bg_workspace, &bg_extra);
+                restart_dsh_service(&bg_app, &state, &bg_node, &bg_runtime, &bg_workspace, &bg_extra);
                 return;
             }
         };
@@ -493,12 +490,9 @@ fn boot(app: AppHandle) {
             message,
         });
         log::info!("bg update result: {}", swap_out.as_deref().unwrap_or("?").lines().last().unwrap_or("?"));
-        // 无论替换成功与否都重启服务（成功加载新版本，失败恢复旧版本继续用）
-        restart_dsh_service(&state, &bg_node, &bg_runtime, &bg_workspace, &bg_extra);
+        restart_dsh_service(&bg_app, &state, &bg_node, &bg_runtime, &bg_workspace, &bg_extra);
     });
 
-    // 6) 后台确保默认插件（FR-18：dshmarket 市场插件，装进 dsh 网页设置。
-    //    失败静默，下次启动重试；安装后需重启服务才生效——插件页会给出提示）
     let ap_node = state.node_path();
     let ap_runtime = runtime_dir;
     let ap_data = app_data;
@@ -508,7 +502,6 @@ fn boot(app: AppHandle) {
     });
 }
 
-/// 前端拉取状态
 #[tauri::command]
 fn get_status(state: State<'_, AppState>) -> StatusSnapshot {
     let phase = state.phase();
@@ -519,21 +512,32 @@ fn get_status(state: State<'_, AppState>) -> StatusSnapshot {
         message: phase_text(phase).to_string(),
         error: state.error(),
         port: state.port(),
+        service_url: if phase == BootPhase::Ready {
+            let u = service_url(&state);
+            if u.contains("?token=") {
+                state.set_pending_auth_url(Some(u.clone()));
+            }
+            Some(u)
+        } else {
+            None
+        },
+        recovery: state.last_recovery(),
         dsh_version,
         node_version,
     }
 }
 
-/// 服务重启/修复成功后刷新主窗口：
-/// - 主窗口若已加载 DSH 页面（127.0.0.1 本地服务），旧页面已随服务停止而失效，
-///   直接导航到新地址（重启后端口可能已变化）；
-/// - 若还在启动页，广播 boot://ready 由启动页自行跳转（保留首次引导流程）；
-/// - 设置页也监听 boot://ready，借此刷新服务状态。
-fn refresh_main_after_restart(app: &AppHandle, port: u16) {
-    let url = format!("http://127.0.0.1:{port}");
-    // 广播给所有页面（设置页刷新状态；启动页跳转）
+fn up_to_date_message(version: &Option<String>) -> String {
+    match version {
+        Some(v) if !v.trim().is_empty() => format!("已是最新版本（{v}）"),
+        _ => "已是最新版本".to_string(),
+    }
+}
+
+fn refresh_main_after_restart(app: &AppHandle, state: &AppState) {
+    let url = service_url(state);
+    state.set_pending_auth_url(Some(url.clone()));
     let _ = app.emit("boot://ready", serde_json::json!({ "url": url }));
-    // 主窗口已加载 DSH 页面时直接导航（该页面没有 boot://ready 监听）
     if let Some(w) = app.get_webview_window("main") {
         let on_dsh_page = w
             .url()
@@ -541,37 +545,341 @@ fn refresh_main_after_restart(app: &AppHandle, port: u16) {
             .map(|u| u.host_str() == Some("127.0.0.1"))
             .unwrap_or(false);
         if on_dsh_page {
-            match url.parse::<tauri::Url>() {
+            let target = bare_service_url(&url);
+            match target.parse::<tauri::Url>() {
                 Ok(u) => {
-                    log::info!("main window reload -> {url}");
+                    log::info!("main window reload -> {target}");
                     let _ = w.navigate(u);
                 }
-                Err(e) => log::warn!("bad main window url {url}: {e}"),
+                Err(e) => log::warn!("bad main window url {target}: {e}"),
             }
         }
     }
+    spawn_service_watch(app);
 }
 
-/// 等待服务就绪（轮询健康检查，最多 timeout）。
-///
-/// 每次 health_check 只短暂拿锁（TCP 探测，≤800ms），整体等待期间不长期持有
-/// supervisor 锁——否则主线程的 get_settings（同样要拿锁做 health_check）会被
-/// 拖住最多 30s，导致窗口无响应。
-fn wait_service_ready(state: &AppState, timeout: Duration) -> bool {
+fn bare_service_url(url: &str) -> String {
+    match url.parse::<tauri::Url>() {
+        Ok(mut u) => {
+            u.set_query(None);
+            u.to_string()
+        }
+        Err(_) => url.to_string(),
+    }
+}
+
+fn menu_restart(app: &AppHandle, tag: &'static str) {
+    let app = app.clone();
+    std::thread::spawn(move || {
+        let state = app.state::<AppState>();
+        let runtime_dir = state.runtime_dir();
+        if runtime_dir.as_os_str().is_empty() {
+            return;
+        }
+        let dsh_bin = runtime_dir
+            .join("node_modules")
+            .join("@deepseek-ai")
+            .join("dsh")
+            .join("lib")
+            .join("bin.js");
+        let extra = state.dsh_extra_args.lock().unwrap().clone();
+        let preferred = preferred_port(&state);
+        match start_service_with_heal(
+            &app,
+            &state,
+            &state.node_path(),
+            &dsh_bin,
+            &state.workspace_dir(),
+            preferred,
+            &extra,
+            false,
+        ) {
+            Ok(()) => {
+                wait_service_url(&state, Duration::from_secs(2));
+                state.set_phase(BootPhase::Ready);
+                state.clear_error();
+                log::info!("{tag} restart ready: {}", service_url(&state));
+                refresh_main_after_restart(&app, &state);
+            }
+            Err(issue) => {
+                log::warn!(
+                    "{tag} restart failed ({}): {}",
+                    issue.kind.kind_str(),
+                    issue.detail
+                );
+            }
+        }
+    });
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WaitOutcome {
+    Ready,
+    Exited,
+    Timeout,
+}
+
+fn wait_service_outcome(state: &AppState, timeout: Duration) -> WaitOutcome {
     let deadline = std::time::Instant::now() + timeout;
-    while std::time::Instant::now() < deadline {
+    loop {
         if state.supervisor.lock().unwrap().health_check() {
-            return true;
+            return WaitOutcome::Ready;
+        }
+        if state.supervisor.lock().unwrap().is_exited() {
+            return WaitOutcome::Exited;
+        }
+        if std::time::Instant::now() >= deadline {
+            return WaitOutcome::Timeout;
         }
         std::thread::sleep(Duration::from_millis(300));
     }
-    state.supervisor.lock().unwrap().health_check()
 }
 
-/// 用当前（可能刚更新过的）运行时重启 dsh 服务。
-/// 供后台自动更新 / 手动 update_dsh 在更新完成后调用：无论更新成败都拉起服务，
-/// 更新成功加载新版本，失败则继续用旧版本。不阻塞主线程（调用方应在后台线程）。
+fn service_url(state: &AppState) -> String {
+    state
+        .supervisor
+        .lock()
+        .unwrap()
+        .captured_url()
+        .unwrap_or_else(|| format!("http://127.0.0.1:{}", state.port()))
+}
+
+fn preferred_port(state: &AppState) -> u16 {
+    let p = state.config.lock().unwrap().get().port;
+    if p > 0 { p } else { 3080 }
+}
+
+fn wait_service_url(state: &AppState, timeout: Duration) {
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline {
+        if state.supervisor.lock().unwrap().captured_url().is_some() {
+            return;
+        }
+        if state.supervisor.lock().unwrap().is_exited() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+struct BootIssue {
+    kind: serviceout::FailureKind,
+    plugins: Vec<String>,
+    lock_path: Option<String>,
+    detail: String,
+    spawn_error: bool,
+}
+
+fn boot_issue(state: &AppState) -> BootIssue {
+    let kind = state
+        .supervisor
+        .lock()
+        .unwrap()
+        .failure_classify()
+        .unwrap_or(serviceout::FailureKind::Unknown);
+    let tail = state.supervisor.lock().unwrap().output_tail(4096);
+    let mut issue = BootIssue {
+        kind,
+        plugins: Vec::new(),
+        lock_path: None,
+        detail: tail.clone(),
+        spawn_error: false,
+    };
+    match &issue.kind {
+        serviceout::FailureKind::PluginTree => {
+            let candidates = serviceout::plugin_candidates(&tail);
+            issue.plugins = plugins::removable_plugin_names(&candidates);
+        }
+        serviceout::FailureKind::StaleLock { lock_path } => {
+            issue.lock_path = lock_path.clone();
+        }
+        serviceout::FailureKind::Unknown => {}
+    }
+    issue
+}
+
+fn emit_error_options(app: &AppHandle, state: &AppState, issue: &BootIssue) {
+    state.set_last_recovery(RecoveryInfo {
+        kind: issue.kind.kind_str().to_string(),
+        plugins: issue.plugins.clone(),
+        lock_path: issue.lock_path.clone(),
+        detail: issue.detail.clone(),
+    });
+    let _ = app.emit(
+        "boot://error-options",
+        serde_json::json!({
+            "kind": issue.kind.kind_str(),
+            "plugins": issue.plugins,
+            "lock_path": issue.lock_path,
+            "detail": issue.detail,
+        }),
+    );
+}
+
+fn spawn_service_watch(app: &AppHandle) {
+    let app = app.clone();
+    std::thread::spawn(move || {
+        let guard_state = app.state::<AppState>();
+        if guard_state
+            .service_watch_active
+            .swap(true, Ordering::SeqCst)
+        {
+            return;
+        }
+        drop(guard_state);
+        std::thread::sleep(Duration::from_secs(3));
+        loop {
+            let state = app.state::<AppState>();
+            if state.phase() != BootPhase::Ready {
+                state.service_watch_active.store(false, Ordering::SeqCst);
+                return;
+            }
+            let healthy = state.supervisor.lock().unwrap().health_check();
+            if healthy {
+                std::thread::sleep(Duration::from_secs(2));
+                continue;
+            }
+            let exited = state.supervisor.lock().unwrap().is_exited();
+            if !exited {
+                std::thread::sleep(Duration::from_secs(2));
+                continue;
+            }
+            let issue = boot_issue(&state);
+            let msg = match &issue.kind {
+                serviceout::FailureKind::PluginTree => {
+                    "服务因插件不兼容意外停止，请移除不兼容插件后重试。"
+                }
+                serviceout::FailureKind::StaleLock { .. } => {
+                    "服务意外停止（残留锁文件可能仍在阻止启动），请重试。"
+                }
+                serviceout::FailureKind::Unknown => "服务意外停止，请点击重试。",
+            };
+            state.service_watch_active.store(false, Ordering::SeqCst);
+            let _ = app.emit(
+                "boot://progress",
+                serde_json::json!({ "phase": BootPhase::Error, "message": msg }),
+            );
+            state.set_error(msg);
+            emit_error_options(&app, &state, &issue);
+            log::warn!(
+                "service crashed after ready ({}): {}",
+                issue.kind.kind_str(),
+                issue.detail
+            );
+            if let Some(w) = app.get_webview_window("main") {
+                let on_service = w
+                    .url()
+                    .ok()
+                    .map(|u| u.host_str() == Some("127.0.0.1"))
+                    .unwrap_or(false);
+                if on_service {
+                    if let Some(bp) = state.boot_page_url() {
+                        if let Ok(u) = bp.parse::<tauri::Url>() {
+                            log::info!("service crashed; main window -> boot page");
+                            let _ = w.navigate(u);
+                        }
+                    }
+                }
+            }
+            update_tray_tooltip(&app);
+            return;
+        }
+    });
+}
+
+fn is_safe_lock_path(path: &Path) -> bool {
+    let name_ok = path
+        .file_name()
+        .map(|f| f.to_string_lossy().ends_with(".lock"))
+        .unwrap_or(false);
+    if !name_ok {
+        return false;
+    }
+    let home = plugins::dsh_home();
+    let p = path.to_string_lossy();
+    let h = home.to_string_lossy();
+    let (p, h) = if cfg!(windows) {
+        (p.to_lowercase(), h.to_lowercase())
+    } else {
+        (p.into_owned(), h.into_owned())
+    };
+    p.starts_with(&h)
+        && p[h.len()..]
+            .chars()
+            .next()
+            .map(|c| c == '\\' || c == '/')
+            .unwrap_or(false)
+}
+
+fn start_service_with_heal(
+    app: &AppHandle,
+    state: &AppState,
+    node: &Path,
+    dsh_bin: &Path,
+    workspace: &Path,
+    preferred: u16,
+    extra: &[String],
+    first_spawn: bool,
+) -> Result<(), BootIssue> {
+    let mut healed = false;
+    let mut first = first_spawn;
+    loop {
+        let port = {
+            let mut sup = state.supervisor.lock().unwrap();
+            if first {
+                sup.start(node, dsh_bin, workspace, preferred, extra)
+            } else {
+                sup.restart(node, dsh_bin, workspace, preferred, extra)
+            }
+        };
+        first = false;
+        let port = match port {
+            Ok(p) => p,
+            Err(e) => {
+                return Err(BootIssue {
+                    kind: serviceout::FailureKind::Unknown,
+                    plugins: Vec::new(),
+                    lock_path: None,
+                    detail: e,
+                    spawn_error: true,
+                });
+            }
+        };
+        state.set_port(port);
+        log::info!("service on 127.0.0.1:{port}");
+
+        match wait_service_outcome(state, Duration::from_secs(30)) {
+            WaitOutcome::Ready => return Ok(()),
+            _ => {}
+        }
+        let issue = boot_issue(state);
+        if !healed {
+            if let serviceout::FailureKind::StaleLock { lock_path: Some(path) } = &issue.kind {
+                let p = PathBuf::from(path);
+                if is_safe_lock_path(&p) {
+                    healed = true;
+                    match std::fs::remove_file(&p) {
+                        Ok(_) => {
+                            log::warn!("auto-removed stale lock: {path}");
+                            let msg = if is_zh_locale() {
+                                "已自动清理残留锁文件，正在重试…"
+                            } else {
+                                "Cleaned up a stale lock file, retrying…"
+                            };
+                            emit_progress(app, BootPhase::ServiceStart, msg);
+                            continue;
+                        }
+                        Err(e) => log::warn!("remove stale lock {path}: {e}"),
+                    }
+                }
+            }
+        }
+        return Err(issue);
+    }
+}
+
 fn restart_dsh_service(
+    app: &AppHandle,
     state: &AppState,
     node: &Path,
     runtime: &Path,
@@ -584,32 +892,26 @@ fn restart_dsh_service(
         .join("dsh")
         .join("lib")
         .join("bin.js");
-    let cfg_port = state.config.lock().unwrap().get().port;
-    let preferred = if cfg_port > 0 { cfg_port } else { 3080 };
-    let port = {
-        let mut sup = state.supervisor.lock().unwrap();
-        match sup.start(node, &dsh_bin, workspace, preferred, extra) {
-            Ok(p) => p,
-            Err(e) => {
-                log::error!("restart dsh service after update failed: {e}");
-                return;
-            }
+    let preferred = preferred_port(state);
+    match start_service_with_heal(app, state, node, &dsh_bin, workspace, preferred, extra, true) {
+        Ok(()) => {
+            wait_service_url(state, Duration::from_secs(2));
+            state.set_phase(BootPhase::Ready);
+            state.clear_error();
+            log::info!("service restarted after dsh update");
+            spawn_service_watch(app);
         }
-    };
-    state.set_port(port);
-    if wait_service_ready(state, Duration::from_secs(30)) {
-        state.set_phase(BootPhase::Ready);
-        state.clear_error();
-    } else {
-        state.set_error("更新后服务没有正常启动，请稍后再试。");
-        log::warn!("service not healthy after dsh update");
+        Err(issue) => {
+            state.set_error("更新后服务没有正常启动，请稍后再试。");
+            log::warn!(
+                "service not healthy after dsh update ({}): {}",
+                issue.kind.kind_str(),
+                issue.detail
+            );
+        }
     }
 }
 
-/// 手动重启服务（设置页/诊断页）。
-///
-/// 异步 + spawn_blocking：重启（杀旧进程树 + 拉起新进程）与最多 30s 的就绪等待
-/// 全部放到线程池执行，避免阻塞 Tauri 主线程导致窗口无响应。
 #[tauri::command]
 async fn restart_service(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
     let runtime_dir = state.runtime_dir();
@@ -624,40 +926,62 @@ async fn restart_service(app: AppHandle, state: State<'_, AppState>) -> Result<(
         .join("bin.js");
     let node = state.node_path();
     let workspace = state.workspace_dir();
+    let extra = state.dsh_extra_args.lock().unwrap().clone();
+    let preferred = preferred_port(&state);
     let app2 = app.clone();
     tauri::async_runtime::spawn_blocking(move || {
         let state = app2.state::<AppState>();
-        let port = {
-            let mut sup = state.supervisor.lock().unwrap();
-            let extra = state.dsh_extra_args.lock().unwrap().clone();
-            match sup.restart(&node, &dsh_bin, &workspace, 3080, &extra) {
-                Ok(p) => p,
-                Err(e) => return Err(e),
+        match start_service_with_heal(&app2, &state, &node, &dsh_bin, &workspace, preferred, &extra, false) {
+            Ok(()) => {
+                wait_service_url(&state, Duration::from_secs(2));
+                state.set_phase(BootPhase::Ready);
+                state.clear_error();
+                plugins::record_restart(&state);
+                refresh_main_after_restart(&app2, &state);
+                Ok(())
             }
-        };
-        state.set_port(port);
-        // 不持锁等就绪：health_check 不依赖内部状态，锁内只做极短的 TCP 探测，
-        // 避免 UI 线程的 get_settings（同样要拿这把锁）被拖住。
-        if wait_service_ready(&state, Duration::from_secs(30)) {
-            state.set_phase(BootPhase::Ready);
-            state.clear_error();
-            plugins::record_restart(&state);
-            refresh_main_after_restart(&app2, port);
-            Ok(())
-        } else {
-            state.set_error("服务没有正常启动，请稍后再试。");
-            Err("服务未就绪".into())
+            Err(issue) => {
+                if issue.spawn_error {
+                    return Err(issue.detail);
+                }
+                let zh = is_zh_locale();
+                let text: &str = match &issue.kind {
+                    serviceout::FailureKind::PluginTree => {
+                        if zh {
+                            "插件与当前 DSH 版本不兼容，服务无法启动。请重新打开应用，在启动页移除不兼容插件。"
+                        } else {
+                            "Some plugins are incompatible with this version of DSH. Reopen the app to remove them on the startup screen."
+                        }
+                    }
+                    serviceout::FailureKind::StaleLock { .. } => {
+                        if zh {
+                            "服务没有正常启动（残留锁文件可能仍在阻止启动），请稍后再试。"
+                        } else {
+                            "Service did not start (a leftover lock file may still block it). Please retry."
+                        }
+                    }
+                    serviceout::FailureKind::Unknown => {
+                        if zh {
+                            "服务没有正常启动，请稍后再试。"
+                        } else {
+                            "Service did not start. Please retry."
+                        }
+                    }
+                };
+                state.set_error(text);
+                log::warn!(
+                    "restart_service failed ({}): {}",
+                    issue.kind.kind_str(),
+                    issue.detail
+                );
+                Err(text.into())
+            }
         }
     })
     .await
     .map_err(|e| format!("重启任务异常: {e}"))?
 }
 
-/// 一键修复（FR-12）：强制重建 dsh 运行时（重新 prepare）+ 重启服务。
-/// 用于服务反复崩溃/安装损坏的降级态修复。
-///
-/// 异步 + spawn_blocking：prepare（可能联网下载，耗时数分钟）与就绪等待都在
-/// 线程池执行，不阻塞主进程/窗口。
 #[tauri::command]
 async fn repair_service(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
     let resource_dir = app.path().resource_dir().map_err(|e| e.to_string())?;
@@ -670,8 +994,6 @@ async fn repair_service(app: AppHandle, state: State<'_, AppState>) -> Result<()
     tauri::async_runtime::spawn_blocking(move || {
         let state = app2.state::<AppState>();
 
-        // 1) 强制重建运行时（install-dsh.mjs prepare --force 未实现，用 update --force 重建基线等价物：
-        //    直接重新 prepare 到临时目录再替换，或简化：prepare 已幂等，这里 stop 后重跑 prepare）
         state.supervisor.lock().unwrap().stop();
         let install_out = node::run_prepare(&node_path, &installer_js, &runtime_dir, &baseline_dir)
             .map_err(|e| format!("修复失败：{e}"))?;
@@ -686,7 +1008,6 @@ async fn repair_service(app: AppHandle, state: State<'_, AppState>) -> Result<()
             }
         }
 
-        // 2) 重启服务
         let dsh_bin = runtime_dir
             .join("node_modules")
             .join("@deepseek-ai")
@@ -696,44 +1017,41 @@ async fn repair_service(app: AppHandle, state: State<'_, AppState>) -> Result<()
         if !dsh_bin.exists() {
             return Err("修复后服务仍不完整，请重新安装。".into());
         }
-        let port = {
-            let mut sup = state.supervisor.lock().unwrap();
-            let extra = state.dsh_extra_args.lock().unwrap().clone();
-            let cfg_port = state.config.lock().unwrap().get().port;
-            let preferred = if cfg_port > 0 { cfg_port } else { 3080 };
-            match sup.start(&node_path, &dsh_bin, &workspace, preferred, &extra) {
-                Ok(p) => p,
-                Err(e) => {
-                    state.set_error("修复后服务启动失败，请稍后再试。");
-                    return Err(e);
-                }
+        let preferred = preferred_port(&state);
+        let extra = state.dsh_extra_args.lock().unwrap().clone();
+        match start_service_with_heal(&app2, &state, &node_path, &dsh_bin, &workspace, preferred, &extra, true) {
+            Ok(()) => {
+                wait_service_url(&state, Duration::from_secs(2));
+                state.set_phase(BootPhase::Ready);
+                state.clear_error();
+                plugins::record_restart(&state);
+                update_tray_tooltip(&app2);
+                refresh_main_after_restart(&app2, &state);
+                Ok(())
             }
-        };
-        state.set_port(port);
-        // 不持锁等就绪（同 restart_service）
-        if wait_service_ready(&state, Duration::from_secs(30)) {
-            state.set_phase(BootPhase::Ready);
-            state.clear_error();
-            plugins::record_restart(&state);
-            update_tray_tooltip(&app2);
-            refresh_main_after_restart(&app2, port);
-            Ok(())
-        } else {
-            state.set_error("修复后服务仍未启动，请稍后再试。");
-            Err("服务未就绪".into())
+            Err(issue) => {
+                if issue.spawn_error {
+                    return Err(issue.detail);
+                }
+                state.set_error("修复后服务没有正常启动，请稍后再试。");
+                log::warn!(
+                    "repair_service start failed ({}): {}",
+                    issue.kind.kind_str(),
+                    issue.detail
+                );
+                Err("服务未就绪".into())
+            }
         }
     })
     .await
     .map_err(|e| format!("修复任务异常: {e}"))?
 }
 
-/// 读取最近一次应用壳更新状态（手动检查/更新的结果，无网络开销）
 #[tauri::command]
 fn get_app_update_status(state: State<'_, AppState>) -> Option<DshUpdateStatus> {
     state.app_update()
 }
 
-/// 判断 updater 是否配置了真实端点（占位符 <OWNER>/your-update-server 视为未配置）
 fn updater_configured(app: &AppHandle) -> bool {
     let config = app.config();
     let endpoints = config
@@ -756,7 +1074,6 @@ fn updater_configured(app: &AppHandle) -> bool {
     configured && !placeholder
 }
 
-/// 应用壳更新：检查是否有新版本（不安装）。结果写入 state，设置页展示。
 #[tauri::command]
 async fn check_app_update(
     app: AppHandle,
@@ -804,7 +1121,6 @@ async fn check_app_update(
     Ok(status)
 }
 
-/// 应用壳更新：下载并安装新版本（静默；安装后由 updater 处理重启提示）。
 #[tauri::command]
 async fn update_app(app: AppHandle, state: State<'_, AppState>) -> Result<DshUpdateStatus, String> {
     use tauri_plugin_updater::UpdaterExt;
@@ -870,16 +1186,13 @@ async fn update_app(app: AppHandle, state: State<'_, AppState>) -> Result<DshUpd
     Ok(status)
 }
 
-/// 设置页数据（白话展示）
 #[derive(serde::Serialize)]
 struct SettingsData {
     app_version: String,
     node_version: Option<String>,
     dsh_version: Option<String>,
     port: u16,
-    /// 服务是否真正在运行（对监听端口做实时健康检查，而非仅看记录的端口）
     service_running: bool,
-    /// 当前启动阶段（前端据此显示"正在启动…/启动失败"等）
     phase: BootPhase,
     error: Option<String>,
     workspace_dir: String,
@@ -914,7 +1227,6 @@ fn get_settings(app: AppHandle, state: State<'_, AppState>) -> Result<SettingsDa
     })
 }
 
-/// 设置开机自启
 #[tauri::command]
 fn set_autostart(app: AppHandle, enabled: bool) -> Result<(), String> {
     use tauri_plugin_autostart::ManagerExt;
@@ -931,7 +1243,6 @@ fn set_autostart(app: AppHandle, enabled: bool) -> Result<(), String> {
     Ok(())
 }
 
-/// 打开日志目录（系统文件管理器）
 #[tauri::command]
 fn open_log_dir(state: State<'_, AppState>) -> Result<(), String> {
     let log_file = state.log_file();
@@ -942,7 +1253,6 @@ fn open_log_dir(state: State<'_, AppState>) -> Result<(), String> {
     Ok(())
 }
 
-/// 打开工作区目录（用户数据）
 #[tauri::command]
 fn open_workspace_dir(state: State<'_, AppState>) -> Result<(), String> {
     let ws = state.workspace_dir();
@@ -953,25 +1263,21 @@ fn open_workspace_dir(state: State<'_, AppState>) -> Result<(), String> {
     Ok(())
 }
 
-/// 读取用户配置
 #[tauri::command]
 fn get_config(state: State<'_, AppState>) -> Result<config::AppConfig, String> {
     Ok(state.config.lock().unwrap().get())
 }
 
-/// 保存用户配置
 #[tauri::command]
 fn set_config(state: State<'_, AppState>, config: config::AppConfig) -> Result<(), String> {
     state.config.lock().unwrap().set(config)
 }
 
-/// 读取最近一次 DSH 更新状态（后台自动更新 / 手动检查的结果，无网络开销）
 #[tauri::command]
 fn get_dsh_update_status(state: State<'_, AppState>) -> Option<DshUpdateStatus> {
     state.dsh_update()
 }
 
-/// 手动检查 DSH 更新（联网查询最新版本；较慢，放线程池执行）
 #[tauri::command]
 async fn check_dsh_update(
     app: AppHandle,
@@ -1003,7 +1309,6 @@ async fn check_dsh_update(
                         ..Default::default()
                     }
                 } else if r.action == "new-version-available" || r.action == "prerelease-available" {
-                    // 有可用更新：正式版更新，或（无正式版/开启预发布时）预发布更新
                     let ver = r.version.clone().or_else(|| r.prerelease.clone());
                     let msg = if r.action == "prerelease-available" {
                         format!("发现预发布版本 {}", r.prerelease.clone().unwrap_or_default())
@@ -1020,7 +1325,6 @@ async fn check_dsh_update(
                         message: msg,
                     }
                 } else {
-                    // 已是最新：展示实际跟随的版本（正式版；无正式版则预发布）
                     let ver = r.version.clone().or_else(|| r.prerelease.clone());
                     DshUpdateStatus {
                         ok: true,
@@ -1029,7 +1333,7 @@ async fn check_dsh_update(
                         latest: r.version.clone(),
                         prerelease: r.prerelease.clone(),
                         pre_available: r.pre_available,
-                        message: format!("已是最新版本（{}）", ver.unwrap_or_default()),
+                        message: up_to_date_message(&ver),
                     }
                 }
             }
@@ -1049,7 +1353,6 @@ async fn check_dsh_update(
     .map_err(|e| format!("检查更新任务异常: {e}"))?)
 }
 
-/// 手动更新 DSH 到最新版（联网安装，可能耗时数分钟；完成后需重启服务生效）
 #[tauri::command]
 async fn update_dsh(
     app: AppHandle,
@@ -1071,7 +1374,6 @@ async fn update_dsh(
     let app2 = app.clone();
     Ok(tauri::async_runtime::spawn_blocking(move || {
         let state = app2.state::<AppState>();
-        // 阶段一：下载到 staging 并校验（服务继续运行；失败不影响现有运行时）
         let u = match node::run_update(&node, &installer, &runtime, &registry_source, pre_release) {
             Ok(out) => node::parse_installer_output(&out),
             Err(e) => {
@@ -1088,7 +1390,6 @@ async fn update_dsh(
             }
         };
         if !u.ok || u.action != "downloaded" {
-            // 下载/校验失败：现有运行时未动，服务继续运行
             let status = DshUpdateStatus {
                 ok: u.ok,
                 update_available: false,
@@ -1101,7 +1402,6 @@ async fn update_dsh(
             state.set_dsh_update(status.clone());
             return status;
         }
-        // 阶段二：停服务（释放文件占用）→ 原子替换 → 重启服务
         log::info!("update_dsh: downloaded {} to staging, swapping", u.version.clone().unwrap_or_default());
         state.supervisor.lock().unwrap().stop();
         let staging = match &u.staging {
@@ -1116,7 +1416,7 @@ async fn update_dsh(
                     ..Default::default()
                 };
                 state.set_dsh_update(status.clone());
-                restart_dsh_service(&state, &node, &runtime, &workspace, &extra);
+                restart_dsh_service(&app2, &state, &node, &runtime, &workspace, &extra);
                 return status;
             }
         };
@@ -1153,8 +1453,7 @@ async fn update_dsh(
             },
         };
         state.set_dsh_update(status.clone());
-        // 无论替换成功与否都重启服务（成功加载新版本，失败恢复旧版本继续用）
-        restart_dsh_service(&state, &node, &runtime, &workspace, &extra);
+        restart_dsh_service(&app2, &state, &node, &runtime, &workspace, &extra);
         status
     })
     .await
@@ -1164,13 +1463,11 @@ async fn update_dsh(
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let logger = Arc::new(logging::FileLogger::new());
-    // log::set_boxed_logger 需要 Box::leak 提供 'static
     let _ = log::set_logger(Box::leak(Box::new(logging::TauriLogBridge(logger.clone()))));
     log::set_max_level(log::LevelFilter::Info);
 
     tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
-            // 第二实例：聚焦已有主窗口
             show_main_window(app);
         }))
         .plugin(tauri_plugin_updater::Builder::new().build())
@@ -1192,16 +1489,18 @@ pub fn run() {
             dsh_extra_args: std::sync::Mutex::new(Vec::new()),
             dsh_update: std::sync::Mutex::new(None),
             app_update: std::sync::Mutex::new(None),
+            boot_page_url: std::sync::Mutex::new(None),
+            service_watch_active: std::sync::atomic::AtomicBool::new(false),
+            last_recovery: std::sync::Mutex::new(None),
+            pending_auth_url: std::sync::Mutex::new(None),
         })
         .setup(move |app| {
-            // 配置存储（appData/config.json）+ 应用数据目录（插件快照等）
             if let Ok(data) = app.path().app_data_dir() {
                 let store = config::ConfigStore::new(&data);
                 let state = app.state::<AppState>();
                 *state.config.lock().unwrap() = store;
                 state.set_app_data_dir(data);
             }
-            // 日志文件
             if let Ok(data) = app.path().app_data_dir() {
                 let log_path = data.join(LOG_FILE);
                 if let Err(e) = logger.init(&log_path) {
@@ -1211,8 +1510,6 @@ pub fn run() {
                 state.set_log_file(log_path);
                 log::info!("dsh-desktop starting; platform={}", std::env::consts::OS);
 
-                // 高级入口（FR-15）：解析 `--dsh-args "<参数>"` 透传给 dsh
-                // 支持两种形式：`--dsh-args --patch a.yml` 或 `--dsh-args="--patch a.yml"`
                 let mut extra: Vec<String> = Vec::new();
                 let mut iter = std::env::args().skip(1);
                 while let Some(a) = iter.next() {
@@ -1234,7 +1531,6 @@ pub fn run() {
                 }
             }
 
-            // 托盘（NFR-10：按系统语言显示菜单文案）
             use tauri::menu::{Menu, MenuItem};
             use tauri::tray::TrayIconBuilder;
             let zh = is_zh_locale();
@@ -1251,7 +1547,6 @@ pub fn run() {
             let _tray = TrayIconBuilder::with_id("main-tray")
                 .icon(app.default_window_icon().unwrap().clone())
                 .menu(&menu)
-                // 左键点击托盘图标 → 打开/聚焦主窗口；右键 → 弹出菜单
                 .show_menu_on_left_click(false)
                 .on_tray_icon_event(|tray, event| {
                     use tauri::tray::{MouseButton, MouseButtonState, TrayIconEvent};
@@ -1273,44 +1568,9 @@ pub fn run() {
                         show_settings_window(app);
                     }
                     "restart" => {
-                        let handle = app.clone();
-                        std::thread::spawn(move || {
-                            let state = handle.state::<AppState>();
-                            let runtime_dir = state.runtime_dir();
-                            if runtime_dir.as_os_str().is_empty() {
-                                return;
-                            }
-                            let dsh_bin = runtime_dir
-                                .join("node_modules")
-                                .join("@deepseek-ai")
-                                .join("dsh")
-                                .join("lib")
-                                .join("bin.js");
-                            let port = {
-                                let mut sup = state.supervisor.lock().unwrap();
-                                let extra = state.dsh_extra_args.lock().unwrap().clone();
-                                match sup.restart(&state.node_path(), &dsh_bin, &state.workspace_dir(), 3080, &extra) {
-                                    Ok(p) => p,
-                                    Err(e) => {
-                                        log::error!("tray restart failed: {e}");
-                                        return;
-                                    }
-                                }
-                            };
-                            state.set_port(port);
-                            if wait_service_ready(&state, Duration::from_secs(30)) {
-                                state.set_phase(BootPhase::Ready);
-                                state.clear_error();
-                                log::info!("tray restart -> 127.0.0.1:{port}");
-                                // 主窗口若已加载 DSH 页面，刷新到新地址
-                                refresh_main_after_restart(&handle, port);
-                            } else {
-                                log::warn!("tray restart: service not healthy");
-                            }
-                        });
+                        menu_restart(app, "tray");
                     }
                     "quit" => {
-                        // 先停服务（杀进程树），再退出；避免残留 dsh/node 进程
                         let handle = app.clone();
                         std::thread::spawn(move || {
                             let state = handle.state::<AppState>();
@@ -1323,11 +1583,6 @@ pub fn run() {
                 })
                 .build(app)?;
 
-            // 右键菜单（主界面设置入口）：DSH 页面上右键弹出原生菜单
-            // 设置 / 重启服务 / 退出——菜单在 open_context_menu 时按需构建
-            // （无常驻菜单栏，符合"右击"入口）
-
-            // 启动 boot（后台线程）
             let app_handle = app.handle().clone();
             std::thread::spawn(move || {
                 boot(app_handle);
@@ -1339,41 +1594,7 @@ pub fn run() {
                 show_settings_window(app);
             }
             "ctx-restart" => {
-                let handle = app.clone();
-                std::thread::spawn(move || {
-                    let state = handle.state::<AppState>();
-                    let runtime_dir = state.runtime_dir();
-                    if runtime_dir.as_os_str().is_empty() {
-                        return;
-                    }
-                    let dsh_bin = runtime_dir
-                        .join("node_modules")
-                        .join("@deepseek-ai")
-                        .join("dsh")
-                        .join("lib")
-                        .join("bin.js");
-                    let port = {
-                        let mut sup = state.supervisor.lock().unwrap();
-                        let extra = state.dsh_extra_args.lock().unwrap().clone();
-                        match sup.restart(&state.node_path(), &dsh_bin, &state.workspace_dir(), 3080, &extra) {
-                            Ok(p) => p,
-                            Err(e) => {
-                                log::error!("ctx restart failed: {e}");
-                                return;
-                            }
-                        }
-                    };
-                    state.set_port(port);
-                    if wait_service_ready(&state, Duration::from_secs(30)) {
-                        state.set_phase(BootPhase::Ready);
-                        state.clear_error();
-                        log::info!("ctx restart -> 127.0.0.1:{port}");
-                        // 主窗口若已加载 DSH 页面，刷新到新地址
-                        refresh_main_after_restart(&handle, port);
-                    } else {
-                        log::warn!("ctx restart: service not healthy");
-                    }
-                });
+                menu_restart(app, "ctx");
             }
             "ctx-quit" => {
                 let handle = app.clone();
@@ -1387,8 +1608,6 @@ pub fn run() {
             _ => {}
         })
         .on_page_load(|webview, payload| {
-            // 主界面右键入口：DSH 页面加载完成后挂接 contextmenu 监听，
-            // 右键弹出原生菜单（设置/重启服务/退出）——无任何常驻 UI
             if let tauri::webview::PageLoadEvent::Finished = payload.event() {
                 if payload.url().scheme() == "http" && webview.label() == "main" {
                     let script = r#"
@@ -1406,11 +1625,25 @@ pub fn run() {
 })();
 "#;
                     let _ = webview.eval(script);
+                    if payload.url().query().is_none() {
+                        let app = webview.app_handle();
+                        let state = app.state::<AppState>();
+                        if let Some(pending) = state.pending_auth_url() {
+                            if pending.contains("?token=") {
+                                state.set_pending_auth_url(None);
+                                let js = format!(
+                                    "window.location.href = {};",
+                                    serde_json::to_string(&pending).unwrap_or_default()
+                                );
+                                log::info!("two-hop auth exchange on service origin");
+                                let _ = webview.eval(&js);
+                            }
+                        }
+                    }
                 }
             }
         })
         .on_window_event(|window, event| {
-            // 关闭窗口 → 隐藏（不销毁、不退出），以便再次从托盘/菜单打开
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 match window.label() {
                     "main" => {
@@ -1446,6 +1679,7 @@ pub fn run() {
             plugins::plugins_list,
             plugins::plugins_add,
             plugins::plugins_remove,
+            plugins::plugins_remove_incompatible,
             plugins::plugins_set_enabled,
             plugins::plugins_marketplace
         ])

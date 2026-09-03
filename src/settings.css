@@ -116,7 +116,6 @@ h1 {
   flex-shrink: 0;
 }
 
-/* 版本 + 更新状态合并行（应用版本 / DSH 版本） */
 .about-update-row {
   align-items: center;
 }
@@ -178,7 +177,6 @@ h1 {
   cursor: default;
 }
 
-/* 高级区（FR-14） */
 .advanced summary {
   cursor: pointer;
   font-size: 14px;
@@ -207,7 +205,6 @@ h1 {
   font-size: 13px;
 }
 
-/* 开关 */
 .switch {
   position: relative;
   display: inline-block;
@@ -251,7 +248,6 @@ h1 {
   transform: translateX(20px);
 }
 
-/* 插件页（FR-18） */
 .tabs {
   display: flex;
   gap: 6px;

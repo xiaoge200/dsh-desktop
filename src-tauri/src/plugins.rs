@@ -1,21 +1,3 @@
-//! 插件管理（FR-18）：安装 / 移除 / 启停 DeepSeek Harness 插件 + 应用市场。
-//!
-//! 设计原则：不另起炉灶，直接复用 dsh 自带的 Cordis 插件体系。
-//! - 插件实体 = 声明了 `"dsh": { "bundle": { "patch": ... } }` 的 npm 包（bundle），
-//!   安装在 `$DSH_HOME/profiles/web`（桌面端运行的 `web` profile，dsh 运行时更新
-//!   不会动这里，天然持久）。
-//! - 安装后端用内置 Node 自带的 npm（`npm-cli.js`），并复刻上游
-//!   `dsh plugin` 的 `reconcilePlugins`（bundle 注册进 `dsh.profile.bundles`）
-//!   与 `initProfile`（profile 模板初始化）——语义与
-//!   `@deepseek-ai/dsh/lib/plugin-*.js` / `@deepseek-ai/dsh-app-boot` 完全一致。
-//! - `--legacy-peer-deps` 对齐上游 pnpm 的 `autoInstallPeers: false`：插件依赖的
-//!   同名前缀包从 dsh 安装树解析，避免 npm 把 peer 树复制进 profile 造成遮蔽。
-//! - 启用/禁用 = 在 profile 的 `cordis.patch.yml` 追加 `- id: <id> disabled: <bool>`
-//!   行（后写覆盖先写）。dsh 的 `watchUserPatches` 热重载，无需重启。
-//! - 新增/移除 bundle 只在下一次服务启动时读取 → 用「重启快照」对比最近一次
-//!   就绪时的 bundle 集合，向前端提示需要重启。
-//! - 补丁文件用 `serde_yaml::Value` 解析，容忍 `!!js` 自定义标签；且只做
-//!   文本追加、从不整文件重序列化用户补丁（注释与标签原样保留）。
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -28,86 +10,52 @@ use tauri::State;
 
 use crate::state::AppState;
 
-/// 桌面端运行/管理的 profile（dsh web 的别名 profile）
 const PROFILE_NAME: &str = "web";
-/// profile 内的用户补丁层文件名（dsh-app-boot 的 PROFILE_PATCH_FILENAME）
 const PROFILE_PATCH_FILENAME: &str = "cordis.patch.yml";
-/// 重启快照（appData 下，壳自己维护）
 const SNAPSHOT_FILE: &str = "plugins-state.json";
-/// 默认自动安装的插件：dsh-market 市场插件（npm 包名 dshmarket），
-/// 装进 dsh 网页设置里的插件市场，桌面端无需自建市场数据源
 const DEFAULT_PLUGIN: &str = "dshmarket";
-/// 默认插件安装标记（appData 下）：安装成功后写入——用户之后手动移除
-/// 不会被自动装回；失败不写，下次启动重试
 const DEFAULT_PLUGIN_MARKER: &str = "default-plugin.json";
 
-/// 上游 PROFILE_TEMPLATES.web（dsh-app-boot/lib/index.js:323）
 const TEMPLATE_BUNDLES: [&str; 2] = ["@deepseek-ai/dsh-base", "@deepseek-ai/dsh-web-app"];
 
-/// 上游 PROFILE_PATCH_TEMPLATE（dsh-app-boot/lib/index.js:335，逐字复制）
 const PROFILE_PATCH_TEMPLATE: &str = "# Your patch layer for this dsh profile, applied after every bundle layer:\n\
 # a top-level YAML array of loader patch entries (id-targeted config\n\
 # overrides, disables, and insert lists; `!!js` expressions allowed).\n\
 []\n";
 
-/// 上游 PROFILE_PNPM_WORKSPACE（dsh-app-boot/lib/index.js:340，逐字复制；
-/// npm 不读它，保留是为了与 CLI 手工管理时 pnpm 的行为一致）
 const PROFILE_PNPM_WORKSPACE: &str = "packages:\n  - .\n\nnodeLinker: hoisted\nautoInstallPeers: false\n";
 
-/// 远端（registry）安装超时；git/本地路径安装超时（prepare 脚本可能很慢）
 const NPM_TIMEOUT: Duration = Duration::from_secs(600);
 const GIT_TIMEOUT: Duration = Duration::from_secs(1800);
 
-/// 插件操作的全局串行锁（安装/卸载/启停/快照互斥；与 supervisor 锁无关）
 static PLUGIN_OPS: Mutex<()> = Mutex::new(());
 
-// ---------------------------------------------------------------------------
-// 前端数据结构
-// ---------------------------------------------------------------------------
-
-/// 插件的某一行（patch row）的启用状态
 #[derive(Serialize)]
 pub struct PluginRow {
-    /// 行 id（cordis patch 行的标识）
     pub id: String,
-    /// 行声明的入口名（模块 spec，可能为空）
     pub name: Option<String>,
-    /// 组合后的启用状态（最后一层 disabled 取反）
     pub enabled: bool,
-    /// 是否可以在设置页切换（被 home 层禁用时不可切换）
     pub managed: bool,
-    /// 是否被 home 层（$DSH_HOME/cordis.patch.yml）覆盖（优先级高于 profile 层）
     pub home_layer: bool,
 }
 
-/// 一个已安装插件（内置 bundle 或用户依赖）
 #[derive(Serialize)]
 pub struct PluginInfo {
-    /// 依赖名（npm 安装写入的真实包名）
     pub name: String,
-    /// 解析出的版本（无法解析时为 "-"）
     pub version: String,
-    /// profile 依赖里的原始 spec
     pub spec: String,
-    /// "builtin" | "npm" | "git" | "file"
     pub source: String,
-    /// 内置模板 bundle（只读展示，不可移除/不展开行）
     pub builtin: bool,
-    /// 是否声明了 dsh.bundle（会作为功能层加载）
     pub is_bundle: bool,
-    /// bundle 补丁里声明的行（含启用状态；内置 bundle 为空）
     pub rows: Vec<PluginRow>,
-    /// 需要重启服务后生效（相对最近一次就绪快照有变化）
     pub restart_required: bool,
 }
 
 #[derive(Serialize)]
 pub struct PluginsListData {
     pub plugins: Vec<PluginInfo>,
-    /// 任一插件需要重启（前端显示总提示条）
     pub service_restart_required: bool,
     pub profile_dir: String,
-    /// profile 是否已初始化（首次安装时自动创建）
     pub initialized: bool,
 }
 
@@ -115,9 +63,7 @@ pub struct PluginsListData {
 pub struct PluginAddResult {
     pub name: String,
     pub version: String,
-    /// 新 bundle 行只在启动时读取 → 恒为 true
     pub restart_required: bool,
-    /// 该包未声明 dsh.bundle 时的提示（不是错误）
     pub warning: Option<String>,
 }
 
@@ -125,9 +71,7 @@ pub struct PluginAddResult {
 pub struct MarketplaceItem {
     pub name: String,
     pub description: String,
-    /// "npm" | "github"
     pub source: String,
-    /// 可直接传给 plugins_add 的 spec
     pub spec: String,
     pub url: String,
 }
@@ -135,15 +79,9 @@ pub struct MarketplaceItem {
 #[derive(Serialize)]
 pub struct MarketplaceResult {
     pub items: Vec<MarketplaceItem>,
-    /// 非致命错误（限流/网络），列表仍可用
     pub errors: Vec<String>,
 }
 
-// ---------------------------------------------------------------------------
-// 路径与 profile 初始化（复刻 dsh-home-paths / dsh-app-boot 的 initProfile）
-// ---------------------------------------------------------------------------
-
-/// 展开 `~` / `~/` / `~\` 前缀（复刻 dsh-home-paths 的 expandHomePath）
 fn expand_tilde(path: &str) -> PathBuf {
     if path == "~" {
         if let Some(h) = dirs::home_dir() {
@@ -169,8 +107,6 @@ fn make_absolute(p: PathBuf) -> PathBuf {
     }
 }
 
-/// 解析 Harness 主目录（复刻 dsh-home-paths 的 resolveDshHome）：
-/// `$DSH_HOME`（非空）优先，否则 `~/.dsh`。
 pub fn dsh_home() -> PathBuf {
     let configured = std::env::var("DSH_HOME").ok().filter(|v| !v.trim().is_empty());
     match configured {
@@ -181,12 +117,10 @@ pub fn dsh_home() -> PathBuf {
     }
 }
 
-/// profile 目录：`$DSH_HOME/profiles/web`
 pub fn profile_dir(home: &Path) -> PathBuf {
     home.join("profiles").join(PROFILE_NAME)
 }
 
-/// 初始化 profile 目录（复刻 dsh-app-boot 的 initProfile：已存在的文件绝不覆盖）
 pub fn ensure_profile(dir: &Path) -> Result<(), String> {
     std::fs::create_dir_all(dir).map_err(|e| format!("创建 profile 目录失败: {e}"))?;
     let manifest_path = dir.join("package.json");
@@ -248,12 +182,6 @@ fn read_version(dir: &Path) -> Option<String> {
     v.get("version").and_then(|s| s.as_str()).map(|s| s.to_string())
 }
 
-// ---------------------------------------------------------------------------
-// bundle 解析与注册（复刻 dsh-app-boot 的 packageDirFromAnchor / resolveBundleDir
-// 与 dsh/lib/plugin-*.js 的 exportsPatch / reconcilePlugins）
-// ---------------------------------------------------------------------------
-
-/// 从锚点文件出发的 Node 模块查找：逐级向上探测 `<d>/node_modules/<name>`。
 fn package_dir_from_anchor(anchor_file: &Path, package_name: &str) -> Option<PathBuf> {
     let mut d = anchor_file.parent()?;
     loop {
@@ -265,7 +193,6 @@ fn package_dir_from_anchor(anchor_file: &Path, package_name: &str) -> Option<Pat
     }
 }
 
-/// 解析 bundle 包目录：先 dsh 安装树，再 profile 目录（上游的安装锚点优先契约）。
 fn resolve_bundle_dir(runtime: &Path, profile: &Path, package_name: &str) -> Option<PathBuf> {
     let install_anchor = runtime
         .join("node_modules")
@@ -280,7 +207,6 @@ fn resolve_bundle_dir(runtime: &Path, profile: &Path, package_name: &str) -> Opt
     None
 }
 
-/// 依赖是否声明了 `dsh.bundle.patch`（即是一个 bundle 插件）。
 fn exports_patch(runtime: &Path, profile: &Path, package_name: &str) -> bool {
     let Some(dir) = resolve_bundle_dir(runtime, profile, package_name) else {
         return false;
@@ -298,9 +224,6 @@ fn exports_patch(runtime: &Path, profile: &Path, package_name: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// 复刻上游 reconcilePlugins：把声明了 dsh.bundle 的依赖注册进
-/// `dsh.profile.bundles`；被移除或不再声明 bundle 的依赖退出层栈。
-/// 内置模板 bundle 不在依赖里，永不触碰。返回是否有变化。
 fn reconcile(
     before_deps: &HashSet<String>,
     runtime: &Path,
@@ -321,7 +244,6 @@ fn reconcile(
             bundles.push(name.clone());
             changed = true;
         } else if !is_bundle && !before_deps.contains(name) {
-            // 与上游一致的提示（仅提示，不是错误）
             log::warn!(
                 "dsh: warning: {name} declares no dsh.bundle — installed as a plain dependency, not a profile layer (a later update that gains one activates it automatically)"
             );
@@ -360,11 +282,6 @@ fn reconcile(
     Ok(true)
 }
 
-// ---------------------------------------------------------------------------
-// 补丁文件（cordis.patch.yml）解析与追加
-// ---------------------------------------------------------------------------
-
-/// 一行的补丁状态（某个层对该行的声明）
 struct RowPatch {
     id: String,
     name: Option<String>,
@@ -375,7 +292,6 @@ fn yaml_get<'a>(map: &'a serde_yaml::Mapping, key: &str) -> Option<&'a serde_yam
     map.iter().find(|(k, _)| k.as_str() == Some(key)).map(|(_, v)| v)
 }
 
-/// 解析一个补丁层为「行声明」序列（直接 id 行与 insert 列表中的行）。
 fn row_patches(entries: &[serde_yaml::Value]) -> Vec<RowPatch> {
     let mut out = Vec::new();
     let push = |v: &serde_yaml::Value, out: &mut Vec<RowPatch>| {
@@ -401,8 +317,6 @@ fn row_patches(entries: &[serde_yaml::Value]) -> Vec<RowPatch> {
     out
 }
 
-/// 解析补丁文件（容忍 `!!js` 标签——serde_yaml 会保成 TaggedValue，不会失败）。
-/// 失败时返回 None 并记日志（列表页降级展示，启停操作则给出修复提示）。
 fn parse_patch_file_opt(path: &Path) -> Option<Vec<serde_yaml::Value>> {
     let text = std::fs::read_to_string(path).ok()?;
     let text = text.trim_start_matches('\u{feff}');
@@ -419,7 +333,6 @@ fn parse_patch_file_opt(path: &Path) -> Option<Vec<serde_yaml::Value>> {
     }
 }
 
-/// bundle 补丁里声明的行（入口 spec + 是否显式 disabled）
 fn bundle_row_patches(dir: &Path) -> Vec<RowPatch> {
     let Ok(raw) = std::fs::read_to_string(dir.join("package.json")) else {
         return Vec::new();
@@ -437,9 +350,6 @@ fn bundle_row_patches(dir: &Path) -> Vec<RowPatch> {
     row_patches(&entries)
 }
 
-/// 在补丁文件末尾追加一行 `- id: <id>\n  disabled: <bool>`（后写覆盖先写）。
-/// 只做文本追加，从不整文件重序列化（保留用户注释与 `!!js` 表达式）；
-/// 罕见流式写法才回退到整文件重写并记日志。
 fn append_disable_row(patch_path: &Path, id: &str, enabled: bool) -> Result<(), String> {
     let text = std::fs::read_to_string(patch_path)
         .map_err(|e| format!("读取补丁文件失败（{}）: {e}", patch_path.display()))?;
@@ -449,7 +359,6 @@ fn append_disable_row(patch_path: &Path, id: &str, enabled: bool) -> Result<(), 
         return Err("cordis.patch.yml 必须是顶层 YAML 数组（补丁条目列表）。".into());
     }
 
-    // 用 serde_yaml 序列化单行，保证 id 的引号/转义正确
     let mut m = serde_yaml::Mapping::new();
     m.insert(serde_yaml::Value::String("id".into()), serde_yaml::Value::String(id.to_string()));
     m.insert(
@@ -474,8 +383,6 @@ fn append_disable_row(patch_path: &Path, id: &str, enabled: bool) -> Result<(), 
         .ok_or("cordis.patch.yml 内容为空，请先修复。")?;
     let last_line = file_lines[last_idx].trim();
 
-    // YAML 块序列没有收尾符：空流式 `[]`（模板形态）就地展开为块式条目；
-    // 块式文件直接追加；其余流式写法整文件重写（注释/!!js 标签可能丢失）。
     let new_text = if last_line == "[]" {
         let mut out: Vec<String> = file_lines.iter().map(|l| l.to_string()).collect();
         out[last_idx] = block;
@@ -493,16 +400,11 @@ fn append_disable_row(patch_path: &Path, id: &str, enabled: bool) -> Result<(), 
             .map_err(|e| format!("重写补丁文件失败: {e}"))?
     };
 
-    // 原子写（与 dsh Include._writeFile 同思路：tmp + rename）
     let tmp = patch_path.with_extension("yml.tmp");
     std::fs::write(&tmp, &new_text).map_err(|e| format!("写入补丁文件失败: {e}"))?;
     std::fs::rename(&tmp, patch_path).map_err(|e| format!("替换补丁文件失败: {e}"))?;
     Ok(())
 }
-
-// ---------------------------------------------------------------------------
-// 重启快照（最近一次服务就绪时的 bundle 集合；用于判断是否需要重启）
-// ---------------------------------------------------------------------------
 
 #[derive(serde::Serialize, serde::Deserialize)]
 struct Snapshot {
@@ -526,7 +428,6 @@ fn read_snapshot(app_data: &Path) -> Option<Snapshot> {
     serde_json::from_str(&raw).ok()
 }
 
-/// bundle 是否相对快照缺失或版本变化（需要重启）
 fn snapshot_differs(snap: &Option<Snapshot>, name: &str, version: &str) -> bool {
     let Some(s) = snap else { return false };
     match s.bundles.iter().find(|b| b.name == name) {
@@ -535,8 +436,6 @@ fn snapshot_differs(snap: &Option<Snapshot>, name: &str, version: &str) -> bool 
     }
 }
 
-/// 服务就绪后记录快照（boot / restart_service / repair_service 成功后调用）。
-/// 不阻塞调用方：拿不到锁或写盘失败都只是少一次提示，下次重启会修正。
 pub fn record_restart(state: &AppState) {
     let Ok(_guard) = PLUGIN_OPS.try_lock() else {
         log::warn!("plugins: snapshot skipped (plugin op in progress)");
@@ -579,30 +478,20 @@ pub fn record_restart(state: &AppState) {
     }
 }
 
-// ---------------------------------------------------------------------------
-// npm 调用（内置 Node 的 npm-cli.js，不依赖系统 PATH）
-// ---------------------------------------------------------------------------
-
-/// 复刻 install-dsh.mjs 的 resolveNpmCli 三候选布局
 fn npm_cli_path(node: &Path) -> Option<PathBuf> {
     let node_dir = node.parent()?;
     let candidates = [
-        // Windows 官方发行版：<nodeDir>/node_modules/npm/bin/npm-cli.js
         node_dir.join("node_modules").join("npm").join("bin").join("npm-cli.js"),
-        // mac/Linux 官方发行版（bin 在 nodeDir）：<nodeDir>/../lib/node_modules/npm
         node_dir.join("..").join("lib").join("node_modules").join("npm").join("bin").join("npm-cli.js"),
-        // 本项目资源布局：node 二进制与 lib 平级
         node_dir.join("lib").join("node_modules").join("npm").join("bin").join("npm-cli.js"),
     ];
     candidates.into_iter().find(|p| p.exists())
 }
 
-/// 根据用户选择的更新源构造 registry 参数（与 node.rs 的 registry_args 同语义）
 fn registry_flag(source: &str) -> Vec<String> {
     match source {
         "npmjs" => vec!["--registry".into(), "https://registry.npmjs.org".into()],
         "npmmirror" => vec!["--registry".into(), "https://registry.npmmirror.com".into()],
-        // auto 或未知：不传，npm 默认源（尊重用户级 .npmrc）
         _ => vec![],
     }
 }
@@ -615,7 +504,6 @@ fn tail(text: &str, n: usize) -> String {
     text.chars().skip(count - n).collect()
 }
 
-/// 把 npm 的报错提炼成可读的几句（npm 9+ 用 "npm error"，旧版用 "npm ERR!"）
 fn friendly_npm_error(stderr: &str, stdout: &str) -> String {
     let combined = format!("{stderr}\n{stdout}");
     let errs: Vec<&str> = combined
@@ -631,7 +519,6 @@ fn friendly_npm_error(stderr: &str, stdout: &str) -> String {
     format!("安装失败：\n{detail}")
 }
 
-/// 用内置 Node 运行 npm-cli.js（cwd = profile 目录），带超时杀树。
 fn run_npm(node: &Path, cwd: &Path, args: &[String], timeout: Duration) -> Result<(), String> {
     let npm_cli = npm_cli_path(node).ok_or("内置 npm 不完整，请重新安装本应用。")?;
     let node_n = crate::node::normalize_for_node(node);
@@ -641,8 +528,6 @@ fn run_npm(node: &Path, cwd: &Path, args: &[String], timeout: Duration) -> Resul
     full_args.extend(args.iter().cloned());
     log::info!("npm: {:?} {:?}", node_n, full_args);
 
-    // 平台相关启动：Windows 用「隐藏控制台」+ 匿名管道（npm 及其派生的 cmd/node
-    // 子进程都不弹窗口）；Unix 用 std Command + 进程组便于整组清理。
     #[cfg(windows)]
     let (mut child, pipes): (
         crate::winproc::ChildHandle,
@@ -661,7 +546,6 @@ fn run_npm(node: &Path, cwd: &Path, args: &[String], timeout: Duration) -> Resul
             process_group: true,
         })
         .map_err(|e| format!("无法启动 npm: {e}"))?;
-        // 父进程关闭写端：子进程退出后读端才能 EOF
         let pipes: Vec<(bool, Option<Box<dyn std::io::Read + Send>>)> = vec![
             (false, Some(Box::new(out_r) as Box<dyn std::io::Read + Send>)),
             (true, Some(Box::new(err_r) as Box<dyn std::io::Read + Send>)),
@@ -686,7 +570,6 @@ fn run_npm(node: &Path, cwd: &Path, args: &[String], timeout: Duration) -> Resul
         (child, pipes)
     };
 
-    // 边跑边排空管道，避免 npm 输出撑满缓冲区卡死
     let (tx, rx) = std::sync::mpsc::channel::<(bool, String)>();
     for (is_err, pipe) in pipes {
         let tx = tx.clone();
@@ -711,7 +594,7 @@ fn run_npm(node: &Path, cwd: &Path, args: &[String], timeout: Duration) -> Resul
                     match rx.recv_timeout(Duration::from_millis(500)) {
                         Ok((true, t)) => err.push_str(&t),
                         Ok((false, t)) => out.push_str(&t),
-                        Err(_) => break, // 超时或管道关闭：读取线程已结束
+                        Err(_) => break,
                     }
                 }
                 if status.success() {
@@ -725,12 +608,10 @@ fn run_npm(node: &Path, cwd: &Path, args: &[String], timeout: Duration) -> Resul
             Err(e) => return Err(format!("npm 进程异常: {e}")),
         }
         if Instant::now() >= deadline {
-            // 超时：杀整棵树（与 Supervisor::stop 同策略）
             let pid = child.id();
             #[cfg(windows)]
             {
                 use std::os::windows::process::CommandExt;
-                // CREATE_NO_WINDOW：避免超时杀进程时闪黑窗口
                 let _ = Command::new("taskkill")
                     .args(["/PID", &pid.to_string(), "/T", "/F"])
                     .stdout(Stdio::null())
@@ -752,10 +633,6 @@ fn run_npm(node: &Path, cwd: &Path, args: &[String], timeout: Duration) -> Resul
     }
 }
 
-// ---------------------------------------------------------------------------
-// 插件列表
-// ---------------------------------------------------------------------------
-
 fn classify_dep_source(spec: &str) -> String {
     if spec.starts_with("file:") || Path::new(spec).is_absolute() {
         "file".into()
@@ -770,13 +647,10 @@ fn classify_dep_source(spec: &str) -> String {
     }
 }
 
-/// 计算某行的组合启用状态：各层（bundle 层按顺序 → profile 层 → home 层）
-/// 最后一个带 disabled 的声明生效（后写覆盖先写，与 applyEntryPatches 一致）。
 fn composed_enabled(
     id: &str,
     layers: &[Vec<RowPatch>],
 ) -> (bool, bool) {
-    // (enabled, home_says) —— home 层声明过 disabled 时 profile 层无法切换
     let mut last: Option<bool> = None;
     let mut home_says = false;
     for (li, layer) in layers.iter().enumerate() {
@@ -821,7 +695,6 @@ fn list_impl(runtime: &Path, home: &Path, app_data: &Path) -> Result<PluginsList
 
     let snapshot = read_snapshot(app_data);
 
-    // 组合层：所有 bundle 补丁（按 bundles 顺序）→ profile 层 → home 层
     let mut layers: Vec<Vec<RowPatch>> = Vec::new();
     for name in &bundles {
         let patches = resolve_bundle_dir(runtime, &profile, name)
@@ -835,7 +708,6 @@ fn list_impl(runtime: &Path, home: &Path, app_data: &Path) -> Result<PluginsList
     let home_patches = parse_patch_file_opt(&home.join("cordis.patch.yml")).unwrap_or_default();
     layers.push(row_patches(&home_patches));
 
-    // 内置模板 bundle：只读展示（随 DSH 运行时更新，不展开行、不可移除）
     for name in TEMPLATE_BUNDLES {
         let version = resolve_bundle_dir(runtime, &profile, &name.to_string())
             .and_then(|d| read_version(&d))
@@ -856,7 +728,6 @@ fn list_impl(runtime: &Path, home: &Path, app_data: &Path) -> Result<PluginsList
         }
     }
 
-    // 用户依赖
     for (name, spec) in &deps {
         let is_bundle = exports_patch(runtime, &profile, name);
         let version = resolve_bundle_dir(runtime, &profile, name)
@@ -866,7 +737,6 @@ fn list_impl(runtime: &Path, home: &Path, app_data: &Path) -> Result<PluginsList
         if is_bundle {
             if let Some(dir) = resolve_bundle_dir(runtime, &profile, name) {
                 let patches = bundle_row_patches(&dir);
-                // 去重保序
                 let mut seen = HashSet::new();
                 for p in patches {
                     if !seen.insert(p.id.clone()) {
@@ -910,11 +780,6 @@ pub fn plugins_list(state: State<'_, AppState>) -> Result<PluginsListData, Strin
     list_impl(&runtime, &dsh_home(), &state.app_data_dir())
 }
 
-// ---------------------------------------------------------------------------
-// 安装 / 移除
-// ---------------------------------------------------------------------------
-
-/// 规格化用户输入的 spec（npm 包名 / github:owner/repo / 本地绝对路径）
 fn normalize_spec(spec: &str) -> Result<String, String> {
     let spec = spec.trim();
     if spec.is_empty() {
@@ -924,7 +789,6 @@ fn normalize_spec(spec: &str) -> Result<String, String> {
     if let Some(rest) = s.strip_prefix("file:") {
         s = rest.to_string();
     }
-    // 相对路径：桌面端没有"调用目录"语义，一律要求绝对路径
     if s == "."
         || s == ".."
         || s.starts_with("./")
@@ -944,7 +808,6 @@ fn normalize_spec(spec: &str) -> Result<String, String> {
         return Ok(s);
     }
     if s.contains('/') && !s.starts_with('@') {
-        // owner/repo 简写 → github:（与市场条目生成的 spec 一致；带 .git 后缀也归一化）
         return Ok(format!("github:{}", s.trim_end_matches(".git")));
     }
     if s.ends_with(".git") {
@@ -956,12 +819,10 @@ fn normalize_spec(spec: &str) -> Result<String, String> {
     Ok(s)
 }
 
-/// 依赖名与用户输入的 spec 是否对应（用于"已安装"提示）
 fn spec_matches_name(spec: &str, dep_name: &str) -> bool {
     if spec == dep_name {
         return true;
     }
-    // file: 形式 → 读目录内 package.json 的真实名
     if Path::new(spec).is_absolute() || spec.starts_with("file:") {
         let p = spec.strip_prefix("file:").unwrap_or(spec);
         return std::fs::read_to_string(Path::new(p).join("package.json"))
@@ -995,8 +856,6 @@ fn add_impl(
         "--no-fund".into(),
         "--no-update-notifier".into(),
         "--loglevel=error".into(),
-        // 对齐上游 pnpm 的 autoInstallPeers: false——插件依赖的 @deepseek-ai/* peer
-        // 由 dsh 安装树的 fallback 符号链接提供，npm 不得自行复制进 profile
         "--legacy-peer-deps".into(),
     ];
     args.extend(registry_flag(registry_source));
@@ -1010,7 +869,6 @@ fn add_impl(
     match run_npm(node, &profile, &args, timeout) {
         Ok(()) => {}
         Err(first) => {
-            // auto 模式网络失败兜底：换国内镜像重试一次（仅远端包名）
             if registry_source == "auto" && is_remote {
                 log::warn!("npm install failed ({first}); retrying once with npmmirror");
                 let mut retry = args.clone();
@@ -1057,7 +915,6 @@ fn add_impl(
     })
 }
 
-/// 安装插件（异步命令：npm 可能耗时数分钟，放线程池执行避免卡界面）
 #[tauri::command]
 pub async fn plugins_add(
     state: State<'_, AppState>,
@@ -1072,6 +929,21 @@ pub async fn plugins_add(
     tauri::async_runtime::spawn_blocking(move || add_impl(&node, &runtime, &spec, &registry_source))
         .await
         .map_err(|e| format!("安装任务异常: {e}"))?
+}
+
+pub fn removable_plugin_names(names: &[String]) -> Vec<String> {
+    let profile = profile_dir(&dsh_home());
+    removable_from_manifest(&profile, names)
+}
+
+fn removable_from_manifest(profile: &Path, names: &[String]) -> Vec<String> {
+    let Ok(manifest) = read_manifest(profile) else {
+        return Vec::new();
+    };
+    let deps = dep_keys(&manifest);
+    deps.into_iter()
+        .filter(|d| names.iter().any(|n| n == d))
+        .collect()
 }
 
 fn remove_impl(node: &Path, runtime: &Path, name: &str, registry_source: &str) -> Result<(), String> {
@@ -1096,7 +968,6 @@ fn remove_impl(node: &Path, runtime: &Path, name: &str, registry_source: &str) -
     Ok(())
 }
 
-/// 卸载插件（异步命令，与安装同理）
 #[tauri::command]
 pub async fn plugins_remove(state: State<'_, AppState>, name: String) -> Result<(), String> {
     let node = state.node_path();
@@ -1110,10 +981,37 @@ pub async fn plugins_remove(state: State<'_, AppState>, name: String) -> Result<
         .map_err(|e| format!("卸载任务异常: {e}"))?
 }
 
-/// 后台确保默认插件（dshmarket 市场插件）已安装。幂等：
-/// - 标记文件已存在 → 直接返回（用户已移除过也不会再装回）
-/// - 用户之前手动装过 → 只补写标记
-/// - 否则走 add_impl 安装（与手动安装同一条链路）；失败静默记日志，下次启动重试
+#[tauri::command]
+pub async fn plugins_remove_incompatible(
+    state: State<'_, AppState>,
+    names: Vec<String>,
+) -> Result<Vec<String>, String> {
+    let node = state.node_path();
+    let runtime = state.runtime_dir();
+    if runtime.as_os_str().is_empty() {
+        return Err("服务尚未初始化".into());
+    }
+    let registry_source = state.config.lock().unwrap().get().registry_source;
+    tauri::async_runtime::spawn_blocking(move || {
+        let targets = removable_plugin_names(&names);
+        let mut removed: Vec<String> = Vec::new();
+        for name in &targets {
+            match remove_impl(&node, &runtime, name, &registry_source) {
+                Ok(()) => {
+                    log::info!("plugins: removed incompatible plugin {name}");
+                    removed.push(name.clone());
+                }
+                Err(e) => {
+                    log::warn!("plugins: remove incompatible plugin {name} failed: {e}");
+                }
+            }
+        }
+        Ok(removed)
+    })
+    .await
+    .map_err(|e| format!("移除任务异常: {e}"))?
+}
+
 pub fn ensure_default_plugin(node: &Path, runtime: &Path, app_data: &Path, registry_source: &str) {
     let marker = app_data.join(DEFAULT_PLUGIN_MARKER);
     if marker.exists() {
@@ -1153,10 +1051,6 @@ pub fn ensure_default_plugin(node: &Path, runtime: &Path, app_data: &Path, regis
     }
 }
 
-// ---------------------------------------------------------------------------
-// 启用 / 禁用（热生效，无需重启）
-// ---------------------------------------------------------------------------
-
 fn set_enabled_impl(id: &str, enabled: bool) -> Result<(), String> {
     let _guard = PLUGIN_OPS.lock().unwrap();
     if id.trim().is_empty() {
@@ -1167,17 +1061,12 @@ fn set_enabled_impl(id: &str, enabled: bool) -> Result<(), String> {
     append_disable_row(&profile.join(PROFILE_PATCH_FILENAME), id.trim(), enabled)
 }
 
-/// 启用/禁用某一行（追加 profile 补丁行；dsh 热重载，立即生效）
 #[tauri::command]
 pub async fn plugins_set_enabled(id: String, enabled: bool) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || set_enabled_impl(&id, enabled))
         .await
         .map_err(|e| format!("切换任务异常: {e}"))?
 }
-
-// ---------------------------------------------------------------------------
-// 应用市场
-// ---------------------------------------------------------------------------
 
 async fn fetch_text(client: &reqwest::Client, url: &str) -> Result<String, String> {
     let resp = client
@@ -1193,7 +1082,6 @@ async fn fetch_text(client: &reqwest::Client, url: &str) -> Result<String, Strin
     resp.text().await.map_err(|e| e.to_string())
 }
 
-/// 解析 awesome 目录 README 的 markdown 链接行：`- [name](url) - 描述`
 fn parse_awesome_readme(text: &str) -> Vec<MarketplaceItem> {
     let mut out = Vec::new();
     for line in text.lines() {
@@ -1252,7 +1140,6 @@ struct GhRepo {
     html_url: String,
 }
 
-/// GitHub `dsh-plugin` 主题搜索（次源；API 有免费额度，失败不致命）
 async fn fetch_github_topic(client: &reqwest::Client) -> Result<Vec<MarketplaceItem>, String> {
     let url = "https://api.github.com/search/repositories?q=topic:dsh-plugin&sort=updated&per_page=30";
     let resp = client
@@ -1290,8 +1177,6 @@ async fn fetch_github_topic(client: &reqwest::Client) -> Result<Vec<MarketplaceI
     }
 }
 
-/// 应用市场：awesome 目录（主源，raw.githubusercontent 不走 API 限流）+
-/// GitHub 主题搜索（次源）。search 为空返回全部，否则本地过滤。
 #[tauri::command]
 pub async fn plugins_marketplace(search: Option<String>) -> Result<MarketplaceResult, String> {
     let client = reqwest::Client::new();
@@ -1332,10 +1217,6 @@ pub async fn plugins_marketplace(search: Option<String>) -> Result<MarketplaceRe
     Ok(MarketplaceResult { items, errors })
 }
 
-// ---------------------------------------------------------------------------
-// 测试
-// ---------------------------------------------------------------------------
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1349,7 +1230,54 @@ mod tests {
         std::fs::write(path, serde_json::to_string_pretty(v).unwrap() + "\n").unwrap();
     }
 
-    /// 造一个 runtime 骨架（dsh 安装锚点 + 一个 bundle）
+    fn profile_with_deps(profile: &Path) {
+        write_json(
+            &profile.join("package.json"),
+            &serde_json::json!({
+                "name": "dsh-profile-web", "private": true,
+                "dependencies": { "plugin-b": "^1.0.0", "plugin-a": "^1.0.0", "plugin-c": "^1.0.0" },
+                "dsh": { "profile": { "bundles": [] } }
+            }),
+        );
+    }
+
+    #[test]
+    fn removable_from_manifest_intersects_and_orders_deterministically() {
+        let root = temp("removable");
+        let _ = std::fs::remove_dir_all(&root);
+        let profile = root.join("profile");
+        profile_with_deps(&profile);
+        let names = vec![
+            "plugin-c".to_string(),
+            "ghost".to_string(),
+            "plugin-a".to_string(),
+            "plugin-b".to_string(),
+        ];
+        assert_eq!(
+            removable_from_manifest(&profile, &names),
+            vec!["plugin-a", "plugin-b", "plugin-c"]
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn removable_from_manifest_empty_when_no_overlap() {
+        let root = temp("removable-none");
+        let _ = std::fs::remove_dir_all(&root);
+        let profile = root.join("profile");
+        profile_with_deps(&profile);
+        assert!(removable_from_manifest(&profile, &["ghost".to_string()]).is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn removable_from_manifest_missing_profile_is_empty() {
+        let root = temp("removable-missing");
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(removable_from_manifest(&root.join("nope"), &["plugin-a".to_string()]).is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     fn make_runtime(root: &Path, bundle_name: &str, with_bundle: bool) {
         let dsh_dir = root.join("node_modules/@deepseek-ai/dsh");
         write_json(&dsh_dir.join("package.json"), &serde_json::json!({ "name": "@deepseek-ai/dsh", "version": "0.1.1-rc.2" }));
@@ -1373,7 +1301,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         make_runtime(&root.join("runtime"), "@scope/pkg-a", true);
         let profile = root.join("profile");
-        // profile 里也放一份同名包（应被安装树优先解析）
         let dir = profile.join("node_modules/@scope/pkg-a");
         write_json(
             &dir.join("package.json"),
@@ -1404,7 +1331,6 @@ mod tests {
         let runtime = root.join("runtime");
         make_runtime(&runtime, "plugin-a", true);
         let profile = root.join("profile");
-        // 非 bundle 依赖
         let plain = profile.join("node_modules/plain-b");
         write_json(&plain.join("package.json"), &serde_json::json!({ "name": "plain-b", "version": "1.0.0" }));
         write_json(
@@ -1431,7 +1357,6 @@ mod tests {
         assert!(!bundles.contains(&"plain-b".to_string()), "非 bundle 依赖不进层栈");
         assert!(bundles.contains(&"@deepseek-ai/dsh-base".to_string()), "内置 bundle 保留");
 
-        // 移除依赖后：plugin-a 应退出层栈
         write_json(
             &profile.join("package.json"),
             &serde_json::json!({
@@ -1470,7 +1395,6 @@ mod tests {
         assert!(profile.join("cordis.patch.yml").exists());
         assert!(profile.join("pnpm-workspace.yaml").exists());
 
-        // 幂等：已有文件绝不覆盖
         write_json(&profile.join("package.json"), &serde_json::json!({ "name": "mine" }));
         ensure_profile(&profile).unwrap();
         let manifest = read_manifest(&profile).unwrap();
@@ -1490,7 +1414,6 @@ mod tests {
         let text = std::fs::read_to_string(&patch).unwrap();
         assert!(text.contains("- id: row-x\n  disabled: true"));
         assert!(text.contains("- id: row-x\n  disabled: false"));
-        // 仍是合法补丁：顶层数组，两个条目（后写覆盖先写）
         let parsed: serde_yaml::Value = serde_yaml::from_str(&text).unwrap();
         let seq = parsed.as_sequence().unwrap();
         assert_eq!(seq.len(), 2);
@@ -1537,20 +1460,15 @@ mod tests {
 
     #[test]
     fn normalize_spec_cases() {
-        // npm 名
         assert_eq!(normalize_spec("dsh-plugin-manager").unwrap(), "dsh-plugin-manager");
         assert_eq!(normalize_spec("@scope/pkg").unwrap(), "@scope/pkg");
-        // owner/repo 简写 → github:
         assert_eq!(normalize_spec("some-org/my-plugin").unwrap(), "github:some-org/my-plugin");
         assert_eq!(normalize_spec("some-org/my-plugin.git").unwrap(), "github:some-org/my-plugin");
-        // git 显式形式原样通过
         assert_eq!(normalize_spec("github:a/b").unwrap(), "github:a/b");
         assert_eq!(normalize_spec("git+https://example.com/x.git").unwrap(), "git+https://example.com/x.git");
-        // 相对路径拒绝
         assert!(normalize_spec("./plugin").is_err());
         assert!(normalize_spec("../plugin").is_err());
         assert!(normalize_spec("").is_err());
-        // 绝对路径要求存在
         let root = temp("spec");
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
@@ -1569,13 +1487,11 @@ mod tests {
         let home = root.join("home");
         let profile = profile_dir(&home);
         ensure_profile(&profile).unwrap();
-        // 模拟"用户之前手动装过 dshmarket"：写进依赖即可
         let mut manifest = read_manifest(&profile).unwrap();
         manifest["dependencies"] = serde_json::json!({ "dshmarket": "^1.0.0" });
         write_manifest(&profile, &manifest).unwrap();
         let app_data = root.join("appdata");
         std::fs::create_dir_all(&app_data).unwrap();
-        // node/runtime 为空也没关系：已装路径不触发 npm
         ensure_default_plugin(&PathBuf::new(), &PathBuf::new(), &app_data, "auto");
         assert!(app_data.join(DEFAULT_PLUGIN_MARKER).exists(), "补写标记");
         let _ = std::fs::remove_dir_all(&root);
@@ -1588,7 +1504,6 @@ mod tests {
         let app_data = root.join("appdata");
         std::fs::create_dir_all(&app_data).unwrap();
         std::fs::write(app_data.join(DEFAULT_PLUGIN_MARKER), "{\"installed\":true}").unwrap();
-        // 标记存在 → 完全短路：profile 都不该被创建
         ensure_default_plugin(&PathBuf::new(), &PathBuf::new(), &app_data, "auto");
         assert!(!profile_dir(&root.join("home")).exists(), "标记短路，无副作用");
         let _ = std::fs::remove_dir_all(&root);
@@ -1596,11 +1511,7 @@ mod tests {
 
     #[test]
     fn parse_awesome_readme_classifies_entries() {
-        let text = "\
-# Awesome\n\
-- [My Plugin](https://github.com/someone/my-plugin) — does things\n\
-- [@scope/cool](https://www.npmjs.com/package/@scope%2Fcool)\n\
-- [skip me](https://example.com/other) — not a repo\n";
+        let text = "# Awesome\n- [My Plugin](https://github.com/someone/my-plugin)\n- [@scope/cool](https://www.npmjs.com/package/@scope/cool)\n- [skip me](https://example.com/nope)\n";
         let items = parse_awesome_readme(text);
         assert_eq!(items.len(), 2);
         assert_eq!(items[0].spec, "github:someone/my-plugin");

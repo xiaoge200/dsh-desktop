@@ -1,5 +1,5 @@
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU16, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU8, Ordering};
 use std::sync::Mutex;
 
 use serde::Serialize;
@@ -7,68 +7,52 @@ use serde::Serialize;
 use crate::config::ConfigStore;
 use crate::supervisor::Supervisor;
 
-/// 启动阶段（与前端 boot UI 对应，白话文案由前端映射）
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum BootPhase {
-    /// 校验内置 Node
     NodeCheck,
-    /// 安装/更新 DSH 运行时
     DshInstall,
-    /// 启动本地服务
     ServiceStart,
-    /// 服务就绪，WebView 装载
     Ready,
-    /// 失败（error 字段带白话信息）
     Error,
 }
 
-/// 壳的全局状态
 pub struct AppState {
-    /// 内置 Node 二进制绝对路径
     pub node_path: Mutex<PathBuf>,
-    /// 应用数据目录（appData，config.json / 插件快照等所在）
     pub app_data_dir: Mutex<PathBuf>,
-    /// DSH 运行时根目录（appData/dsh-runtime）
     pub runtime_dir: Mutex<PathBuf>,
-    /// 工作区目录（dsh 的 cwd）
     pub workspace_dir: Mutex<PathBuf>,
-    /// 日志文件路径
     pub log_file: Mutex<PathBuf>,
-    /// 当前监听端口（3080 或自动更换后的空闲端口）
     pub port: AtomicU16,
-    /// 启动阶段
     pub phase: AtomicU8,
-    /// 白话错误信息（phase == Error 时有效）
     pub error_message: Mutex<Option<String>>,
-    /// 服务进程托管
     pub supervisor: Mutex<Supervisor>,
-    /// 用户配置（设置页）
     pub config: Mutex<ConfigStore>,
-    /// 高级用户透传的 dsh CLI 参数（FR-15，`--dsh-args` 启动参数）
     pub dsh_extra_args: Mutex<Vec<String>>,
-    /// 最近一次 DSH 更新结果（后台自动更新 / 手动检查更新共用，设置页展示）
     pub dsh_update: Mutex<Option<DshUpdateStatus>>,
-    /// 最近一次应用壳更新结果（手动检查/更新，设置页展示）
     pub app_update: Mutex<Option<DshUpdateStatus>>,
+    pub boot_page_url: Mutex<Option<String>>,
+    pub service_watch_active: AtomicBool,
+    pub last_recovery: Mutex<Option<RecoveryInfo>>,
+    pub pending_auth_url: Mutex<Option<String>>,
 }
 
-/// 组件更新状态（DSH 运行时 / 应用壳共用，设置页「关于」区展示）
+#[derive(Debug, Clone, Serialize)]
+pub struct RecoveryInfo {
+    pub kind: String,
+    pub plugins: Vec<String>,
+    pub lock_path: Option<String>,
+    pub detail: String,
+}
+
 #[derive(Debug, Clone, Serialize, Default)]
 pub struct DshUpdateStatus {
-    /// 检查/更新是否成功
     pub ok: bool,
-    /// 是否有可用更新（待用户点击「立即更新」）
     pub update_available: bool,
-    /// 当前已安装版本（可能为 None：运行时未初始化）
     pub current: Option<String>,
-    /// 最新版本（检查成功时才有；正式版 latest）
     pub latest: Option<String>,
-    /// 最新预发布版本（可能为 None；仅 DSH 更新使用）
     pub prerelease: Option<String>,
-    /// 预发布版本是否比当前新（可更新到预发布）
     pub pre_available: bool,
-    /// 白话状态文案（已是最新 / 发现新版本 / 失败原因等）
     pub message: String,
 }
 
@@ -163,15 +147,44 @@ impl AppState {
     pub fn app_update(&self) -> Option<DshUpdateStatus> {
         self.app_update.lock().unwrap().clone()
     }
+
+    pub fn set_boot_page_url(&self, url: String) {
+        *self.boot_page_url.lock().unwrap() = Some(url);
+    }
+
+    pub fn boot_page_url(&self) -> Option<String> {
+        self.boot_page_url.lock().unwrap().clone()
+    }
+
+    pub fn set_last_recovery(&self, info: RecoveryInfo) {
+        *self.last_recovery.lock().unwrap() = Some(info);
+    }
+
+    pub fn last_recovery(&self) -> Option<RecoveryInfo> {
+        self.last_recovery.lock().unwrap().clone()
+    }
+
+    pub fn clear_recovery(&self) {
+        *self.last_recovery.lock().unwrap() = None;
+    }
+
+    pub fn set_pending_auth_url(&self, url: Option<String>) {
+        *self.pending_auth_url.lock().unwrap() = url;
+    }
+
+    pub fn pending_auth_url(&self) -> Option<String> {
+        self.pending_auth_url.lock().unwrap().clone()
+    }
 }
 
-/// 前端读取的状态快照
 #[derive(Debug, Serialize)]
 pub struct StatusSnapshot {
     pub phase: BootPhase,
     pub message: String,
     pub error: Option<String>,
     pub port: u16,
+    pub service_url: Option<String>,
+    pub recovery: Option<RecoveryInfo>,
     pub dsh_version: Option<String>,
     pub node_version: Option<String>,
 }
@@ -195,6 +208,10 @@ mod tests {
             dsh_extra_args: Mutex::new(Vec::new()),
             dsh_update: Mutex::new(None),
             app_update: Mutex::new(None),
+            boot_page_url: Mutex::new(None),
+            service_watch_active: AtomicBool::new(false),
+            last_recovery: Mutex::new(None),
+            pending_auth_url: Mutex::new(None),
         }
     }
 

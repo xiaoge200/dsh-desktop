@@ -2,12 +2,10 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { SETTINGS_STRINGS, detectLang, tr } from "./i18n";
 
-// 语言（NFR-10）
 const lang = detectLang();
 const dict = SETTINGS_STRINGS[lang];
 const T = (k: string) => tr(dict, k);
 
-// 应用翻译到静态 HTML 文本（data-i18n 标记的元素）
 function applyStaticI18n() {
   document.querySelectorAll<HTMLElement>("[data-i18n]").forEach((el) => {
     const key = el.getAttribute("data-i18n");
@@ -80,8 +78,6 @@ function setRowText(el: HTMLElement, text: string) {
   el.textContent = text;
 }
 
-// ---- DSH 更新（版本 + 状态合并展示；手动检查/更新） ----
-
 let lastUpdateStatus: DshUpdateStatus | null = null;
 let updateBusy = false;
 
@@ -92,10 +88,10 @@ function renderUpdateStatus() {
     els.applyUpdateBtn.hidden = true;
     return;
   }
-  // 状态文案：主 message +（若预发布可用且已开启预发布）附加预发布提示
+
   let msg = st.message;
   if (st.pre_available && st.prerelease && !st.update_available) {
-    // 正式版已最新（或无正式版），仅预发布更新可用
+
     msg = lang === "zh"
       ? `已是最新正式版；发现预发布版本 ${st.prerelease}（已开启预发布更新）`
       : `Latest stable installed; prerelease ${st.prerelease} available (prerelease updates on)`;
@@ -105,10 +101,9 @@ function renderUpdateStatus() {
       : `${st.message} (prerelease ${st.prerelease})`;
   }
   setRowText(els.updateState, msg);
-  // 只有发现新版本且当前没有更新任务时才显示「立即更新」
+
   els.applyUpdateBtn.hidden = !st.update_available || updateBusy;
-  // 「DSH 版本」与更新状态合并显示：优先展示检查/更新结果里的版本信息
-  // （无正式版时 latest 为 null，回退到预发布版本号）
+
   const ver = st.current ?? st.latest ?? st.prerelease;
   if (ver) setRowText(els.dshVersion, ver);
 }
@@ -176,8 +171,6 @@ async function doApplyUpdate() {
     renderUpdateStatus();
   }
 }
-
-// ---- 应用更新（版本 + 状态合并展示；手动检查/更新） ----
 
 let lastAppUpdateStatus: DshUpdateStatus | null = null;
 let appUpdateBusy = false;
@@ -259,7 +252,6 @@ async function doApplyAppUpdate() {
   }
 }
 
-/** 本地服务状态文案（实时健康检查 + 启动阶段） */
 function serviceStateText(s: SettingsData): string {
   if (s.service_running) {
     return lang === "zh" ? `运行中（端口 ${s.port}）` : `Running (port ${s.port})`;
@@ -284,17 +276,15 @@ async function loadSettings() {
     setRowText(els.workspacePath, s.workspace_dir);
     setRowText(els.logPath, s.log_file);
 
-    // 自动更新开关
     configCache = await invoke<AppConfig>("get_config");
     els.autoUpdate.checked = configCache.auto_update_dsh;
     els.preRelease.checked = configCache.pre_release;
-    // 高级区：端口 + 更新源
+
     els.portInput.value = configCache.port > 0 ? String(configCache.port) : "0";
     els.registrySelect.value = configCache.registry_source || "auto";
 
-    // DSH 更新状态（后台自动更新 / 上次检查结果，纯本地读取）
     await loadUpdateStatus();
-    // 应用更新状态（上次手动检查/更新的结果，纯本地读取）
+
     await loadAppUpdateStatus();
   } catch (e) {
     setRowText(els.serviceState, T("读取失败"));
@@ -304,7 +294,6 @@ async function loadSettings() {
 
 let refreshing = false;
 
-/** 重新拉取设置数据（去重，避免事件连发时重复请求） */
 async function refreshSettings() {
   if (refreshing) return;
   refreshing = true;
@@ -316,10 +305,7 @@ async function refreshSettings() {
 }
 
 async function bindRefreshEvents() {
-  // 设置窗口在应用启动时即已创建（hidden），页面加载早于 boot 完成，
-  // 首次读取到的 DSH 版本/运行环境/工作区/服务状态可能是空值。
-  // 因此：窗口每次打开（settings://refresh）以及 boot 进行中/完成时
-  // （boot://progress / boot://ready）都重新拉取最新数据。
+
   await listen("settings://refresh", refreshSettings);
   await listen("boot://progress", refreshSettings);
   await listen("boot://ready", refreshSettings);
@@ -336,7 +322,6 @@ function bind() {
     }
   });
 
-  // 高级区保存（端口 + 更新源）
   els.advancedSaveBtn.addEventListener("click", async () => {
     if (!configCache) return;
     const raw = els.portInput.value.trim();
@@ -375,7 +360,6 @@ function bind() {
     }
   });
 
-  // 更新预发布版本开关
   els.preRelease.addEventListener("change", async () => {
     if (!configCache) return;
     const next = { ...configCache, pre_release: els.preRelease.checked };
@@ -404,11 +388,9 @@ function bind() {
     }
   });
 
-  // DSH 更新：手动检查 / 立即更新
   els.checkUpdateBtn.addEventListener("click", doCheckUpdate);
   els.applyUpdateBtn.addEventListener("click", doApplyUpdate);
 
-  // 应用更新：手动检查 / 立即更新
   els.appCheckUpdateBtn.addEventListener("click", doCheckAppUpdate);
   els.appApplyUpdateBtn.addEventListener("click", doApplyAppUpdate);
 
