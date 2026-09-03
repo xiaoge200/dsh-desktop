@@ -11,9 +11,6 @@ pub struct AppConfig {
 
     pub auto_update_app: bool,
 
-    #[serde(default)]
-    pub pre_release: bool,
-
     pub port: u16,
 
     pub registry_source: String,
@@ -24,7 +21,6 @@ impl Default for AppConfig {
         Self {
             auto_update_dsh: true,
             auto_update_app: true,
-            pre_release: false,
             port: 3080,
             registry_source: "auto".to_string(),
         }
@@ -67,7 +63,6 @@ mod tests {
         let c = AppConfig::default();
         assert!(c.auto_update_dsh, "默认自动更新 DSH");
         assert!(c.auto_update_app, "默认自动更新应用壳");
-        assert!(!c.pre_release, "默认不更新预发布版本");
         assert_eq!(c.port, 3080, "默认端口 3080");
     }
 

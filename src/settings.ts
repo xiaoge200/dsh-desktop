@@ -30,7 +30,6 @@ interface SettingsData {
 interface AppConfig {
   auto_update_dsh: boolean;
   auto_update_app: boolean;
-  pre_release: boolean;
   port: number;
   registry_source: string;
 }
@@ -50,7 +49,6 @@ const $ = <T extends HTMLElement = HTMLElement>(id: string) => document.querySel
 const els = {
   autostart: document.querySelector("#autostart") as HTMLInputElement,
   autoUpdate: document.querySelector("#auto-update") as HTMLInputElement,
-  preRelease: document.querySelector("#pre-release") as HTMLInputElement,
   serviceState: $("#service-state"),
   restartBtn: $("#restart-btn") as HTMLButtonElement,
   appVersion: $("#app-version"),
@@ -278,8 +276,6 @@ async function loadSettings() {
 
     configCache = await invoke<AppConfig>("get_config");
     els.autoUpdate.checked = configCache.auto_update_dsh;
-    els.preRelease.checked = configCache.pre_release;
-
     els.portInput.value = configCache.port > 0 ? String(configCache.port) : "0";
     els.registrySelect.value = configCache.registry_source || "auto";
 
@@ -357,19 +353,6 @@ function bind() {
       console.error("auto-update toggle failed", e);
       els.autoUpdate.checked = !els.autoUpdate.checked;
       alert(lang === "zh" ? "切换自动更新失败，请稍后再试。" : "Failed to change auto-update setting. Please try again.");
-    }
-  });
-
-  els.preRelease.addEventListener("change", async () => {
-    if (!configCache) return;
-    const next = { ...configCache, pre_release: els.preRelease.checked };
-    try {
-      await invoke("set_config", { config: next });
-      configCache = next;
-    } catch (e) {
-      console.error("pre-release toggle failed", e);
-      els.preRelease.checked = !els.preRelease.checked;
-      alert(lang === "zh" ? "切换预发布更新失败，请稍后再试。" : "Failed to change prerelease setting. Please try again.");
     }
   });
 

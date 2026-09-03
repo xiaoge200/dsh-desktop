@@ -358,7 +358,6 @@ fn boot(app: AppHandle) {
     let bg_extra = state.dsh_extra_args.lock().unwrap().clone();
     let cfg = state.config.lock().unwrap().get();
     let auto_update = cfg.auto_update_dsh;
-    let pre_release = cfg.pre_release;
     let registry_source = cfg.registry_source.clone();
     let bg_app = app.clone();
     std::thread::spawn(move || {
@@ -376,7 +375,7 @@ fn boot(app: AppHandle) {
             return;
         }
         std::thread::sleep(Duration::from_secs(30));
-        let check = match node::run_check(&bg_node, &bg_installer, &bg_runtime, &registry_source, pre_release) {
+        let check = match node::run_check(&bg_node, &bg_installer, &bg_runtime, &registry_source, false) {
             Ok(o) => o,
             Err(e) => {
                 state.set_dsh_update(DshUpdateStatus {
@@ -429,7 +428,7 @@ fn boot(app: AppHandle) {
             pre_available: check_res.pre_available,
             message: format!("发现新版本 {}，正在后台更新…", latest.unwrap_or_default()),
         });
-        let update_out = match node::run_update(&bg_node, &bg_installer, &bg_runtime, &registry_source, pre_release) {
+        let update_out = match node::run_update(&bg_node, &bg_installer, &bg_runtime, &registry_source, false) {
             Ok(o) => o,
             Err(e) => {
                 state.set_dsh_update(DshUpdateStatus {
@@ -1314,11 +1313,10 @@ async fn check_dsh_update(
     let installer = resource_dir.join("installer").join("install-dsh.mjs");
     let cfg = state.config.lock().unwrap().get();
     let registry_source = cfg.registry_source;
-    let pre_release = cfg.pre_release;
     let current = node::read_installed_version(&runtime);
     let app2 = app.clone();
     Ok(tauri::async_runtime::spawn_blocking(move || {
-        let status = match node::run_check(&node, &installer, &runtime, &registry_source, pre_release) {
+        let status = match node::run_check(&node, &installer, &runtime, &registry_source, false) {
             Ok(out) => {
                 let r = node::parse_installer_output(&out);
                 if !r.ok {
@@ -1388,7 +1386,6 @@ async fn update_dsh(
     let installer = resource_dir.join("installer").join("install-dsh.mjs");
     let cfg = state.config.lock().unwrap().get();
     let registry_source = cfg.registry_source;
-    let pre_release = cfg.pre_release;
     let node = state.node_path();
     let workspace = state.workspace_dir();
     let extra = state.dsh_extra_args.lock().unwrap().clone();
@@ -1396,7 +1393,7 @@ async fn update_dsh(
     let app2 = app.clone();
     Ok(tauri::async_runtime::spawn_blocking(move || {
         let state = app2.state::<AppState>();
-        let u = match node::run_update(&node, &installer, &runtime, &registry_source, pre_release) {
+        let u = match node::run_update(&node, &installer, &runtime, &registry_source, false) {
             Ok(out) => node::parse_installer_output(&out),
             Err(e) => {
                 let status = DshUpdateStatus {
