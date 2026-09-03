@@ -82,6 +82,28 @@ fn open_settings(app: AppHandle) {
     show_settings_window(&app);
 }
 
+
+#[derive(serde::Deserialize)]
+struct NotifyReq {
+    title: String,
+    body: String,
+}
+
+fn show_notify(app: &AppHandle, req: NotifyReq) {
+    log::info!("notify: {} | {}", req.title, req.body);
+    use tauri_plugin_notification::NotificationExt;
+    match app
+        .notification()
+        .builder()
+        .title(&req.title)
+        .body(&req.body)
+        .show()
+    {
+        Ok(_) => log::info!("notify ok"),
+        Err(e) => log::warn!("notify failed: {e}"),
+    }
+}
+
 #[tauri::command]
 fn open_context_menu(app: AppHandle) -> Result<(), String> {
     use tauri::menu::{ContextMenu, Menu as CtxMenu, MenuItem as CtxMenuItem};
@@ -1471,6 +1493,7 @@ pub fn run() {
             show_main_window(app);
         }))
         .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_autostart::init(
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
             None,
@@ -1495,6 +1518,16 @@ pub fn run() {
             pending_auth_url: std::sync::Mutex::new(None),
         })
         .setup(move |app| {
+            {
+                use tauri::Listener;
+                let h1 = app.handle().clone();
+                let h2 = h1.clone();
+                h1.listen("dsh-notify-request", move |ev| {
+                    if let Ok(req) = serde_json::from_str::<NotifyReq>(ev.payload()) {
+                        show_notify(&h2, req);
+                    }
+                });
+            }
             if let Ok(data) = app.path().app_data_dir() {
                 let store = config::ConfigStore::new(&data);
                 let state = app.state::<AppState>();
@@ -1610,21 +1643,14 @@ pub fn run() {
         .on_page_load(|webview, payload| {
             if let tauri::webview::PageLoadEvent::Finished = payload.event() {
                 if payload.url().scheme() == "http" && webview.label() == "main" {
-                    let script = r#"
-(function () {
-  if (window.__dshCtxInstalled) return;
-  window.__dshCtxInstalled = true;
-  document.addEventListener('contextmenu', function (e) {
-    e.preventDefault();
-    try {
-      if (window.__TAURI__ && window.__TAURI__.core) {
-        window.__TAURI__.core.invoke('open_context_menu');
-      }
-    } catch (err) { console.error('context menu failed', err); }
-  }, true);
-})();
-"#;
-                    let _ = webview.eval(script);
+                    if let Err(e) = webview.eval(include_str!("../assets/ctx-menu.js")) {
+                        log::warn!("ctx script eval failed: {e}");
+                    }
+                    if payload.url().host_str() == Some("127.0.0.1") {
+                        if let Err(e) = webview.eval(include_str!("../assets/notify-shim.js")) {
+                            log::warn!("notify shim eval failed: {e}");
+                        }
+                    }
                     if payload.url().query().is_none() {
                         let app = webview.app_handle();
                         let state = app.state::<AppState>();

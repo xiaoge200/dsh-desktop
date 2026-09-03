@@ -24,6 +24,12 @@
 - 启动失败恢复 UI：插件树加载失败时错误页列出不兼容插件并给出「移除不兼容插件」
   按钮（离线可用，复用插件管理链路，移除后自动重启）；错误事件带快照持久副本，
   启动页晚于事件加载也不丢恢复入口
+- 浏览器通知支持：DSH 网页（如 dsh-notification 插件）走标准 Notification API 的
+  完成/出错等通知，在桌面窗口内同样弹出系统通知——主窗口注入 Notification 兼容
+  垫片（permission 恒 granted），经事件通道转发，由 tauri-plugin-notification 弹
+  真实 toast。页面权限授予：capabilities remote 显式放开 core:default（此前远端页
+  无 IPC，自定义命令在远端不可调，故用事件通道）。Windows 开发态以 PowerShell
+  身份显示、安装版为应用身份（官方限制）；点击行为依赖系统激活 + 单实例聚焦
 
 ### 内部
 - 新模块 `serviceout.rs`：输出捕获（有界滚动缓冲）与失败分类纯逻辑，含单测
