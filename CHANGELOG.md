@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.1.5] - 2026-09-06
+
+### 修复
+- dshmarket「立即重启」由壳接管：页内注入 restart-shim 拦截 restart 路由转
+  受管重启；watchdog 兜底接管探测（外部自杀式重启自动重新收编），任意插件
+  更新后重启不再卡「启动失败」
+- 设置页运行状态实时化（轻量状态轮询 + 重启中/恢复过渡态文案）
+- 插件增删/dsh 更新被运行进程占用文件失败：统一互斥（OPS_LOCK）、停服原子
+  操作自动重启、杀残留扩面等待（ensure_stopped）、installer 安全 swap
+  （旧版保留→回滚），全部排他操作收敛单一出口并自动同步托盘/按钮状态
+- 重启期间整窗卡死：TCP 探测去锁（probe_port）、重命令 async 化、node 版本
+  缓存；用户重启免 3 次/300s 配额（仅 watchdog 自动接管保留）
+- 托盘/设置/右键重启入口状态机一致（启动中禁灰、错误态可点）
+- Tauri 2.11 remote ACL：内部页面调用 restart_service/open_context_menu 显式
+  授权（permissions/app-commands.toml）
+- 启动失败诊断与 60s 就绪宽限；安装器 45min 超时；更新互斥与状态如实反映
+  重启结果
+
 ## [0.1.4] - 2026-09-03
 
 ### 修复
