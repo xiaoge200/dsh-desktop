@@ -361,12 +361,18 @@ fn boot(app: AppHandle) {
 
     spawn_bg_dsh_update(&app, &installer_js);
 
-    let ap_node = state.node_path();
-    let ap_runtime = runtime_dir;
-    let ap_data = app_data;
-    let ap_registry = state.config.lock().unwrap().get().registry_source;
+    spawn_ensure_default_plugin(&app);
+}
+
+fn spawn_ensure_default_plugin(app: &AppHandle) {
+    let app = app.clone();
     std::thread::spawn(move || {
-        plugins::ensure_default_plugin(&ap_node, &ap_runtime, &ap_data, &ap_registry);
+        let state = app.state::<AppState>();
+        let node = state.node_path();
+        let runtime = state.runtime_dir();
+        let app_data = state.app_data_dir();
+        let registry = state.config.lock().unwrap().get().registry_source;
+        plugins::ensure_default_plugin(&node, &runtime, &app_data, &registry);
     });
 }
 
@@ -392,6 +398,148 @@ fn get_status(state: State<'_, AppState>) -> StatusSnapshot {
         recovery: state.last_recovery(),
         dsh_version,
         node_version,
+    }
+}
+
+fn parse_dsh_extra_args() -> Vec<String> {
+    let mut extra: Vec<String> = Vec::new();
+    let mut iter = std::env::args().skip(1);
+    while let Some(a) = iter.next() {
+        if let Some(v) = a.strip_prefix("--dsh-args=") {
+            for part in v.split_whitespace() {
+                extra.push(part.to_string());
+            }
+        } else if a == "--dsh-args" {
+            if let Some(v) = iter.next() {
+                for part in v.split_whitespace() {
+                    extra.push(part.to_string());
+                }
+            }
+        }
+    }
+    extra
+}
+
+fn quit_app(app: &AppHandle) {
+    let handle = app.clone();
+    std::thread::spawn(move || {
+        let state = handle.state::<AppState>();
+        state.supervisor.lock().unwrap().stop();
+        std::thread::sleep(Duration::from_millis(300));
+        handle.exit(0);
+    });
+}
+
+fn build_tray(app: &AppHandle) -> tauri::Result<()> {
+    use tauri::menu::{Menu, MenuItem};
+    use tauri::tray::TrayIconBuilder;
+    let zh = is_zh_locale();
+    let (s_show, s_settings, s_restart, s_quit) = if zh {
+        ("打开界面", "设置", "重启服务", "退出")
+    } else {
+        ("Open", "Settings", "Restart service", "Quit")
+    };
+    let show_i = MenuItem::with_id(app, "show", s_show, true, None::<&str>)?;
+    let settings_i = MenuItem::with_id(app, "settings", s_settings, true, None::<&str>)?;
+    let restart_i = MenuItem::with_id(app, "restart", s_restart, true, None::<&str>)?;
+    let quit_i = MenuItem::with_id(app, "quit", s_quit, true, None::<&str>)?;
+    let menu = Menu::with_items(app, &[&show_i, &settings_i, &restart_i, &quit_i])?;
+    let _tray = TrayIconBuilder::with_id("main-tray")
+        .icon(app.default_window_icon().unwrap().clone())
+        .menu(&menu)
+        .show_menu_on_left_click(false)
+        .on_tray_icon_event(|tray, event| {
+            use tauri::tray::{MouseButton, MouseButtonState, TrayIconEvent};
+            if let TrayIconEvent::Click {
+                button: MouseButton::Left,
+                button_state: MouseButtonState::Up,
+                ..
+            } = event
+            {
+                let app = tray.app_handle();
+                show_main_window(app);
+            }
+        })
+        .on_menu_event(|app, event| match event.id.as_ref() {
+            "show" => {
+                show_main_window(app);
+            }
+            "settings" => {
+                show_settings_window(app);
+            }
+            "restart" => {
+                menu_restart(app, "tray");
+            }
+            "quit" => {
+                quit_app(app);
+            }
+            _ => {}
+        })
+        .build(app)?;
+    Ok(())
+}
+
+fn handle_menu_event(app: &AppHandle, event: tauri::menu::MenuEvent) {
+    match event.id.as_ref() {
+        "ctx-settings" => {
+            show_settings_window(app);
+        }
+        "ctx-restart" => {
+            menu_restart(app, "ctx");
+        }
+        "ctx-quit" => {
+            quit_app(app);
+        }
+        _ => {}
+    }
+}
+
+fn handle_page_load(
+    webview: &tauri::Webview<tauri::Wry>,
+    payload: &tauri::webview::PageLoadPayload<'_>,
+) {
+    if let tauri::webview::PageLoadEvent::Finished = payload.event() {
+        if payload.url().scheme() == "http" && webview.label() == "main" {
+            if let Err(e) = webview.eval(include_str!("../assets/ctx-menu.js")) {
+                log::warn!("ctx script eval failed: {e}");
+            }
+            if payload.url().host_str() == Some("127.0.0.1") {
+                if let Err(e) = webview.eval(include_str!("../assets/notify-shim.js")) {
+                    log::warn!("notify shim eval failed: {e}");
+                }
+            }
+            if payload.url().query().is_none() {
+                let app = webview.app_handle();
+                let state = app.state::<AppState>();
+                if let Some(pending) = state.pending_auth_url() {
+                    if pending.contains("?token=") {
+                        state.set_pending_auth_url(None);
+                        let js = format!(
+                            "window.location.href = {};",
+                            serde_json::to_string(&pending).unwrap_or_default()
+                        );
+                        log::info!("two-hop auth exchange on service origin");
+                        let _ = webview.eval(&js);
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn handle_window_event(window: &tauri::Window<tauri::Wry>, event: &tauri::WindowEvent) {
+    if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+        match window.label() {
+            "main" => {
+                let _ = window.hide();
+                api.prevent_close();
+            }
+            "settings" => {
+                let _ = window.hide();
+                api.prevent_close();
+            }
+            _ => {}
+        }
     }
 }
 
@@ -456,78 +604,14 @@ pub fn run() {
                 state.set_log_file(log_path);
                 log::info!("dsh-desktop starting; platform={}", std::env::consts::OS);
 
-                let mut extra: Vec<String> = Vec::new();
-                let mut iter = std::env::args().skip(1);
-                while let Some(a) = iter.next() {
-                    if let Some(v) = a.strip_prefix("--dsh-args=") {
-                        for part in v.split_whitespace() {
-                            extra.push(part.to_string());
-                        }
-                    } else if a == "--dsh-args" {
-                        if let Some(v) = iter.next() {
-                            for part in v.split_whitespace() {
-                                extra.push(part.to_string());
-                            }
-                        }
-                    }
-                }
+                let extra = parse_dsh_extra_args();
                 if !extra.is_empty() {
                     *state.dsh_extra_args.lock().unwrap() = extra.clone();
                     log::info!("dsh extra args: {:?}", extra);
                 }
             }
 
-            use tauri::menu::{Menu, MenuItem};
-            use tauri::tray::TrayIconBuilder;
-            let zh = is_zh_locale();
-            let (s_show, s_settings, s_restart, s_quit) = if zh {
-                ("打开界面", "设置", "重启服务", "退出")
-            } else {
-                ("Open", "Settings", "Restart service", "Quit")
-            };
-            let show_i = MenuItem::with_id(app, "show", s_show, true, None::<&str>)?;
-            let settings_i = MenuItem::with_id(app, "settings", s_settings, true, None::<&str>)?;
-            let restart_i = MenuItem::with_id(app, "restart", s_restart, true, None::<&str>)?;
-            let quit_i = MenuItem::with_id(app, "quit", s_quit, true, None::<&str>)?;
-            let menu = Menu::with_items(app, &[&show_i, &settings_i, &restart_i, &quit_i])?;
-            let _tray = TrayIconBuilder::with_id("main-tray")
-                .icon(app.default_window_icon().unwrap().clone())
-                .menu(&menu)
-                .show_menu_on_left_click(false)
-                .on_tray_icon_event(|tray, event| {
-                    use tauri::tray::{MouseButton, MouseButtonState, TrayIconEvent};
-                    if let TrayIconEvent::Click {
-                        button: MouseButton::Left,
-                        button_state: MouseButtonState::Up,
-                        ..
-                    } = event
-                    {
-                        let app = tray.app_handle();
-                        show_main_window(app);
-                    }
-                })
-                .on_menu_event(|app, event| match event.id.as_ref() {
-                    "show" => {
-                        show_main_window(app);
-                    }
-                    "settings" => {
-                        show_settings_window(app);
-                    }
-                    "restart" => {
-                        menu_restart(app, "tray");
-                    }
-                    "quit" => {
-                        let handle = app.clone();
-                        std::thread::spawn(move || {
-                            let state = handle.state::<AppState>();
-                            state.supervisor.lock().unwrap().stop();
-                            std::thread::sleep(Duration::from_millis(300));
-                            handle.exit(0);
-                        });
-                    }
-                    _ => {}
-                })
-                .build(app)?;
+            build_tray(app.handle())?;
 
             let app_handle = app.handle().clone();
             std::thread::spawn(move || {
@@ -535,68 +619,9 @@ pub fn run() {
             });
             Ok(())
         })
-        .on_menu_event(|app, event| match event.id.as_ref() {
-            "ctx-settings" => {
-                show_settings_window(app);
-            }
-            "ctx-restart" => {
-                menu_restart(app, "ctx");
-            }
-            "ctx-quit" => {
-                let handle = app.clone();
-                std::thread::spawn(move || {
-                    let state = handle.state::<AppState>();
-                    state.supervisor.lock().unwrap().stop();
-                    std::thread::sleep(Duration::from_millis(300));
-                    handle.exit(0);
-                });
-            }
-            _ => {}
-        })
-        .on_page_load(|webview, payload| {
-            if let tauri::webview::PageLoadEvent::Finished = payload.event() {
-                if payload.url().scheme() == "http" && webview.label() == "main" {
-                    if let Err(e) = webview.eval(include_str!("../assets/ctx-menu.js")) {
-                        log::warn!("ctx script eval failed: {e}");
-                    }
-                    if payload.url().host_str() == Some("127.0.0.1") {
-                        if let Err(e) = webview.eval(include_str!("../assets/notify-shim.js")) {
-                            log::warn!("notify shim eval failed: {e}");
-                        }
-                    }
-                    if payload.url().query().is_none() {
-                        let app = webview.app_handle();
-                        let state = app.state::<AppState>();
-                        if let Some(pending) = state.pending_auth_url() {
-                            if pending.contains("?token=") {
-                                state.set_pending_auth_url(None);
-                                let js = format!(
-                                    "window.location.href = {};",
-                                    serde_json::to_string(&pending).unwrap_or_default()
-                                );
-                                log::info!("two-hop auth exchange on service origin");
-                                let _ = webview.eval(&js);
-                            }
-                        }
-                    }
-                }
-            }
-        })
-        .on_window_event(|window, event| {
-            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
-                match window.label() {
-                    "main" => {
-                        let _ = window.hide();
-                        api.prevent_close();
-                    }
-                    "settings" => {
-                        let _ = window.hide();
-                        api.prevent_close();
-                    }
-                    _ => {}
-                }
-            }
-        })
+        .on_menu_event(handle_menu_event)
+        .on_page_load(handle_page_load)
+        .on_window_event(handle_window_event)
         .invoke_handler(tauri::generate_handler![
             get_status,
             restart_service,
