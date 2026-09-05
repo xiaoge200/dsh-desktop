@@ -216,6 +216,15 @@ pub fn read_installed_version(runtime_dir: &Path) -> Option<String> {
     json.get("version")?.as_str().map(|s| s.to_string())
 }
 
+pub fn dsh_bin(runtime_dir: &Path) -> PathBuf {
+    runtime_dir
+        .join("node_modules")
+        .join("@deepseek-ai")
+        .join("dsh")
+        .join("lib")
+        .join("bin.js")
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct InstallerResult {
     pub ok: bool,
