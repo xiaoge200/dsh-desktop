@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
+use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use crate::state::{AppState, BootPhase, RecoveryInfo};
@@ -10,6 +11,38 @@ const EXIT_TAIL_DRAIN: Duration = Duration::from_millis(500);
 const PROBE_TICK: Duration = Duration::from_millis(500);
 const PROBE_WINDOW: Duration = Duration::from_secs(20);
 const HEALTH_REAP_EVERY: u32 = 15;
+
+// 锁序约定：只允许 OPS_LOCK → supervisor 短锁；持 supervisor 锁时禁止阻塞取 OPS_LOCK。
+pub(crate) static OPS_LOCK: Mutex<()> = Mutex::new(());
+pub(crate) static OPS_ACTIVE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+pub(crate) struct OpGuard {
+    _lock: MutexGuard<'static, ()>,
+}
+
+impl Drop for OpGuard {
+    fn drop(&mut self) {
+        OPS_ACTIVE.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+pub(crate) fn ops_guard() -> OpGuard {
+    let lock = OPS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    OPS_ACTIVE.fetch_add(1, Ordering::SeqCst);
+    OpGuard { _lock: lock }
+}
+
+pub(crate) fn ops_active() -> usize {
+    OPS_ACTIVE.load(Ordering::SeqCst)
+}
+
+pub(crate) fn restart_action_allowed(state: &AppState) -> bool {
+    if ops_active() > 0 {
+        return false;
+    }
+    let phase = state.phase();
+    phase == BootPhase::Ready || phase == BootPhase::Error
+}
 
 fn refresh_main_after_restart(app: &AppHandle, state: &AppState) {
     let url = service_url(state);
@@ -49,6 +82,7 @@ fn restart_with_heal(
     app: &AppHandle,
     state: &AppState,
     tag: &'static str,
+    first_spawn: bool,
 ) -> Result<(), BootIssue> {
     let runtime_dir = state.runtime_dir();
     let dsh_bin = node::dsh_bin(&runtime_dir);
@@ -62,7 +96,7 @@ fn restart_with_heal(
         &state.workspace_dir(),
         preferred,
         &extra,
-        false,
+        first_spawn,
     ) {
         Ok(()) => {
             wait_service_url(state, Duration::from_secs(2));
@@ -75,6 +109,88 @@ fn restart_with_heal(
     }
 }
 
+fn mutation_failure_text(kind: &serviceout::FailureKind) -> &'static str {
+    let zh = is_zh_locale();
+    match kind {
+        serviceout::FailureKind::PluginTree => {
+            if zh {
+                "插件与当前 DSH 版本不兼容，服务无法启动。请重新打开应用，在启动页移除不兼容插件。"
+            } else {
+                "Some plugins are incompatible with this version of DSH. Reopen the app to remove them on the startup screen."
+            }
+        }
+        serviceout::FailureKind::StaleLock { .. } => {
+            if zh {
+                "服务没有正常启动（残留锁文件可能仍在阻止启动），请稍后再试。"
+            } else {
+                "Service did not start (a leftover lock file may still block it). Please retry."
+            }
+        }
+        serviceout::FailureKind::Unknown => {
+            if zh {
+                "服务没有正常启动，请稍后再试。"
+            } else {
+                "Service did not start. Please retry."
+            }
+        }
+    }
+}
+
+pub(crate) fn run_exclusive_mutation<T>(
+    app: &AppHandle,
+    state: &AppState,
+    op_label: &str,
+    op: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
+    let guard = ops_guard();
+    log::info!("{op_label}: exclusive mutation starts (service will be stopped)");
+    state.set_phase(BootPhase::ServiceStart);
+    state.supervisor.lock().unwrap().ensure_stopped();
+    update_tray_tooltip(app);
+    let op_result = op();
+    let node = state.node_path();
+    let runtime = state.runtime_dir();
+    let dsh_bin = node::dsh_bin(&runtime);
+    let workspace = state.workspace_dir();
+    let extra = state.dsh_extra_args.lock().unwrap().clone();
+    let preferred = preferred_port(state);
+    let start_result = start_service_with_heal(
+        app,
+        state,
+        &node,
+        &dsh_bin,
+        &workspace,
+        preferred,
+        &extra,
+        true,
+    );
+    match &start_result {
+        Ok(()) => {
+            wait_service_url(state, Duration::from_secs(2));
+            state.set_phase(BootPhase::Ready);
+            state.clear_error();
+            drop(guard);
+            plugins::record_restart(state);
+            update_tray_tooltip(app);
+            refresh_main_after_restart(app, state);
+        }
+        Err(issue) => {
+            log::warn!("{op_label}: service restart failed ({}): {}", issue.kind.kind_str(), issue.detail);
+            if issue.spawn_error {
+                fail_to_boot_page(app, state, issue, &issue.detail);
+            } else {
+                fail_to_boot_page(app, state, issue, mutation_failure_text(&issue.kind));
+            }
+        }
+    }
+    match (op_result, start_result) {
+        (Ok(v), Ok(())) => Ok(v),
+        (Err(e), Ok(())) => Err(format!("{e}\n服务已自动重启。")),
+        (Ok(_), Err(_)) => Err("操作已完成，但服务未能自动重启。".into()),
+        (Err(e), Err(_)) => Err(format!("{e}\n服务也未能自动重启。")),
+    }
+}
+
 pub(crate) fn menu_restart(app: &AppHandle, tag: &'static str) {
     let app = app.clone();
     std::thread::spawn(move || {
@@ -82,7 +198,9 @@ pub(crate) fn menu_restart(app: &AppHandle, tag: &'static str) {
         if state.runtime_dir().as_os_str().is_empty() {
             return;
         }
-        match restart_with_heal(&app, &state, tag) {
+        let _guard = ops_guard();
+        update_tray_tooltip(&app);
+        match restart_with_heal(&app, &state, tag, true) {
             Ok(()) => refresh_main_after_restart(&app, &state),
             Err(issue) => {
                 log::warn!(
@@ -95,6 +213,7 @@ pub(crate) fn menu_restart(app: &AppHandle, tag: &'static str) {
                 }
             }
         }
+        update_tray_tooltip(&app);
     });
 }
 
@@ -108,7 +227,7 @@ enum WaitOutcome {
 fn wait_service_outcome(state: &AppState, timeout: Duration) -> WaitOutcome {
     let deadline = std::time::Instant::now() + timeout;
     loop {
-        if state.supervisor.lock().unwrap().health_check() {
+        if state.service_health() {
             return WaitOutcome::Ready;
         }
         if state.supervisor.lock().unwrap().is_exited() {
@@ -294,7 +413,7 @@ pub(crate) fn spawn_service_watch(app: &AppHandle) {
                 state.service_watch_active.store(false, Ordering::SeqCst);
                 return;
             }
-            let healthy = state.supervisor.lock().unwrap().health_check();
+            let healthy = state.service_health();
             let exited = if healthy && reap_tick.is_multiple_of(HEALTH_REAP_EVERY) {
                 state.supervisor.lock().unwrap().is_exited()
             } else if healthy {
@@ -335,7 +454,7 @@ pub(crate) fn spawn_service_watch(app: &AppHandle) {
                     return;
                 }
                 let child_alive = !state.supervisor.lock().unwrap().is_exited();
-                let healthy = state.supervisor.lock().unwrap().health_check();
+                let healthy = state.service_health();
                 match probe_decision(child_alive, healthy, probe_start.elapsed(), PROBE_WINDOW) {
                     ProbeDecision::KeepProbing => std::thread::sleep(PROBE_TICK),
                     ProbeDecision::BackToWatch => break,
@@ -357,10 +476,13 @@ pub(crate) fn spawn_service_watch(app: &AppHandle) {
                 continue;
             }
             log::info!("external takeover on port {}; re-claiming", state.port());
-            match restart_with_heal(&app, &state, "auto-recover") {
+            let _guard = ops_guard();
+            update_tray_tooltip(&app);
+            match restart_with_heal(&app, &state, "auto-recover", false) {
                 Ok(()) => {
                     state.service_watch_active.store(false, Ordering::SeqCst);
                     refresh_main_after_restart(&app, &state);
+                    update_tray_tooltip(&app);
                     return;
                 }
                 Err(issue2) => {
@@ -435,6 +557,20 @@ mod tests {
             assert_eq!(msg, crash_message(&kind));
         }
     }
+
+    #[test]
+    fn mutation_failure_text_has_text_for_every_kind() {
+        let kinds = [
+            serviceout::FailureKind::PluginTree,
+            serviceout::FailureKind::StaleLock {
+                lock_path: Some("~/.dsh/x.lock".into()),
+            },
+            serviceout::FailureKind::Unknown,
+        ];
+        for kind in kinds {
+            assert!(!mutation_failure_text(&kind).is_empty());
+        }
+    }
 }
 
 fn is_safe_lock_path(path: &Path) -> bool {
@@ -498,7 +634,7 @@ pub(crate) fn start_service_with_heal(
         state.set_port(port);
         log::info!("service on 127.0.0.1:{port}");
 
-        match wait_service_outcome(state, Duration::from_secs(30)) {
+        match wait_service_outcome(state, Duration::from_secs(60)) {
             WaitOutcome::Ready => return Ok(()),
             _ => {}
         }
@@ -544,7 +680,7 @@ pub(crate) fn restart_dsh_service(
             state.set_phase(BootPhase::Ready);
             state.clear_error();
             log::info!("service restarted after dsh update");
-            spawn_service_watch(app);
+            refresh_main_after_restart(app, state);
         }
         Err(issue) => {
             state.set_error("更新后服务没有正常启动，请稍后再试。");
@@ -555,6 +691,7 @@ pub(crate) fn restart_dsh_service(
             );
         }
     }
+    update_tray_tooltip(app);
 }
 
 #[tauri::command]
@@ -570,14 +707,18 @@ pub(crate) async fn restart_service(app: AppHandle, state: State<'_, AppState>) 
     let preferred = preferred_port(&state);
     let app2 = app.clone();
     tauri::async_runtime::spawn_blocking(move || {
+        let guard = ops_guard();
+        update_tray_tooltip(&app2);
         let state = app2.state::<AppState>();
         match start_service_with_heal(&app2, &state, &node, &dsh_bin, &workspace, preferred, &extra, true) {
             Ok(()) => {
                 wait_service_url(&state, Duration::from_secs(2));
                 state.set_phase(BootPhase::Ready);
                 state.clear_error();
+                drop(guard);
                 plugins::record_restart(&state);
                 refresh_main_after_restart(&app2, &state);
+                update_tray_tooltip(&app2);
                 Ok(())
             }
             Err(issue) => {
@@ -588,30 +729,7 @@ pub(crate) async fn restart_service(app: AppHandle, state: State<'_, AppState>) 
                     update_tray_tooltip(&app2);
                     return Err(issue.detail);
                 }
-                let zh = is_zh_locale();
-                let text: &str = match &issue.kind {
-                    serviceout::FailureKind::PluginTree => {
-                        if zh {
-                            "插件与当前 DSH 版本不兼容，服务无法启动。请重新打开应用，在启动页移除不兼容插件。"
-                        } else {
-                            "Some plugins are incompatible with this version of DSH. Reopen the app to remove them on the startup screen."
-                        }
-                    }
-                    serviceout::FailureKind::StaleLock { .. } => {
-                        if zh {
-                            "服务没有正常启动（残留锁文件可能仍在阻止启动），请稍后再试。"
-                        } else {
-                            "Service did not start (a leftover lock file may still block it). Please retry."
-                        }
-                    }
-                    serviceout::FailureKind::Unknown => {
-                        if zh {
-                            "服务没有正常启动，请稍后再试。"
-                        } else {
-                            "Service did not start. Please retry."
-                        }
-                    }
-                };
+                let text = mutation_failure_text(&issue.kind);
                 state.set_error(text);
                 emit_error_options(&app2, &state, &issue);
                 navigate_main_to_boot(&app2, &state);
@@ -639,9 +757,11 @@ pub(crate) async fn repair_service(app: AppHandle, state: State<'_, AppState>) -
     let workspace = state.workspace_dir();
     let app2 = app.clone();
     tauri::async_runtime::spawn_blocking(move || {
+        let guard = ops_guard();
+        update_tray_tooltip(&app2);
         let state = app2.state::<AppState>();
 
-        state.supervisor.lock().unwrap().stop();
+        state.supervisor.lock().unwrap().ensure_stopped();
         let install_out = node::run_prepare(&node_path, &installer_js, &runtime_dir, &baseline_dir)
             .map_err(|e| format!("修复失败：{e}"))?;
         let line = install_out.lines().last().unwrap_or("").to_string();
@@ -666,6 +786,7 @@ pub(crate) async fn repair_service(app: AppHandle, state: State<'_, AppState>) -
                 wait_service_url(&state, Duration::from_secs(2));
                 state.set_phase(BootPhase::Ready);
                 state.clear_error();
+                drop(guard);
                 plugins::record_restart(&state);
                 update_tray_tooltip(&app2);
                 refresh_main_after_restart(&app2, &state);
@@ -673,9 +794,12 @@ pub(crate) async fn repair_service(app: AppHandle, state: State<'_, AppState>) -
             }
             Err(issue) => {
                 if issue.spawn_error {
+                    state.set_error(issue.detail.clone());
+                    update_tray_tooltip(&app2);
                     return Err(issue.detail);
                 }
                 state.set_error("修复后服务没有正常启动，请稍后再试。");
+                update_tray_tooltip(&app2);
                 log::warn!(
                     "repair_service start failed ({}): {}",
                     issue.kind.kind_str(),

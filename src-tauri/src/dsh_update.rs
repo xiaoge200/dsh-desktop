@@ -1,10 +1,87 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::node;
-use crate::service::restart_dsh_service;
-use crate::state::{AppState, DshUpdateStatus};
+use crate::plugins;
+use crate::service::{ops_guard, restart_dsh_service};
+use crate::state::{AppState, BootPhase, DshUpdateStatus};
+use crate::update_tray_tooltip;
 use tauri::{AppHandle, Manager, State};
+
+fn locked_file_hint() -> &'static str {
+    "。若提示文件被占用（其他 DSH 窗口、杀毒或残留进程），请稍后重试，持续失败请重启电脑。"
+}
+
+fn apply_swap(
+    app: &AppHandle,
+    state: &AppState,
+    node: &Path,
+    installer: &Path,
+    runtime: &Path,
+    workspace: &Path,
+    extra: &[String],
+    u: &node::InstallerResult,
+    previous_current: Option<String>,
+) -> DshUpdateStatus {
+    let guard = ops_guard();
+    state.set_phase(BootPhase::ServiceStart);
+    state.supervisor.lock().unwrap().ensure_stopped();
+    update_tray_tooltip(app);
+    let status = match &u.staging {
+        Some(s) => {
+            let staging = PathBuf::from(s);
+            match node::run_swap(node, installer, runtime, &staging) {
+                Ok(out) => {
+                    let sw = node::parse_installer_output(&out);
+                    let new_version = sw.version.clone();
+                    let message = if sw.ok && sw.action == "updated" {
+                        format!(
+                            "已更新到 {}，服务已自动重启",
+                            new_version.clone().unwrap_or_default()
+                        )
+                    } else if sw.ok {
+                        sw.message.unwrap_or_else(|| "更新结果未知，请查看日志".into())
+                    } else {
+                        format!(
+                            "{}{}",
+                            sw.message.unwrap_or_else(|| "新版本替换失败".into()),
+                            locked_file_hint()
+                        )
+                    };
+                    DshUpdateStatus {
+                        ok: sw.ok,
+                        update_available: false,
+                        current: sw.current.or(previous_current),
+                        latest: new_version,
+                        prerelease: sw.prerelease.clone(),
+                        pre_available: sw.pre_available,
+                        message,
+                    }
+                }
+                Err(e) => DshUpdateStatus {
+                    ok: false,
+                    update_available: false,
+                    current: previous_current,
+                    latest: u.version.clone(),
+                    message: format!("更新替换失败：{e}{}", locked_file_hint()),
+                    ..Default::default()
+                },
+            }
+        }
+        None => DshUpdateStatus {
+            ok: false,
+            update_available: false,
+            current: previous_current,
+            latest: u.version.clone(),
+            message: "更新缺少暂存目录，已保留当前版本。".into(),
+            ..Default::default()
+        },
+    };
+    restart_dsh_service(app, state, node, runtime, workspace, extra);
+    drop(guard);
+    plugins::record_restart(state);
+    status
+}
 
 pub(crate) fn spawn_bg_dsh_update(app: &AppHandle, installer_js: &Path) {
     let bg_app = app.clone();
@@ -115,59 +192,19 @@ pub(crate) fn spawn_bg_dsh_update(app: &AppHandle, installer_js: &Path) {
             return;
         }
         log::info!("bg update downloaded {} to staging, swapping", u.version.clone().unwrap_or_default());
-        state.supervisor.lock().unwrap().stop();
-        let staging = match &u.staging {
-            Some(s) => std::path::PathBuf::from(s),
-            None => {
-                state.set_dsh_update(DshUpdateStatus {
-                    ok: false,
-                    update_available: false,
-                    current,
-                    latest: u.version.clone(),
-                    message: "更新缺少暂存目录，已保留当前版本。".into(),
-                    ..Default::default()
-                });
-                restart_dsh_service(&bg_app, &state, &bg_node, &bg_runtime, &bg_workspace, &bg_extra);
-                return;
-            }
-        };
-        let swap_out = node::run_swap(&bg_node, &bg_installer, &bg_runtime, &staging);
-        let sw = match &swap_out {
-            Ok(o) => node::parse_installer_output(o),
-            Err(e) => {
-                state.set_dsh_update(DshUpdateStatus {
-                    ok: false,
-                    update_available: false,
-                    current,
-                    latest: u.version.clone(),
-                    message: format!("后台替换失败：{e}"),
-                    ..Default::default()
-                });
-                log::warn!("bg update swap failed: {e}");
-                restart_dsh_service(&bg_app, &state, &bg_node, &bg_runtime, &bg_workspace, &bg_extra);
-                return;
-            }
-        };
-        let new_version = sw.version.clone();
-        let message = if sw.ok && sw.action == "updated" {
-            format!(
-                "已更新到 {}（重启服务后生效）",
-                new_version.clone().unwrap_or_default()
-            )
-        } else {
-            sw.message.unwrap_or_else(|| "更新结果未知，请查看日志".into())
-        };
-        state.set_dsh_update(DshUpdateStatus {
-            ok: sw.ok,
-            update_available: false,
-            current: sw.current.or(current.clone()),
-            latest: new_version,
-            prerelease: sw.prerelease.clone(),
-            pre_available: sw.pre_available,
-            message,
-        });
-        log::info!("bg update result: {}", swap_out.as_deref().unwrap_or("?").lines().last().unwrap_or("?"));
-        restart_dsh_service(&bg_app, &state, &bg_node, &bg_runtime, &bg_workspace, &bg_extra);
+        let status = apply_swap(
+            &bg_app,
+            &state,
+            &bg_node,
+            &bg_installer,
+            &bg_runtime,
+            &bg_workspace,
+            &bg_extra,
+            &u,
+            current,
+        );
+        state.set_dsh_update(status.clone());
+        log::info!("bg update result: {}", status.message);
     });
 }
 
@@ -306,57 +343,18 @@ pub(crate) async fn update_dsh(
             return status;
         }
         log::info!("update_dsh: downloaded {} to staging, swapping", u.version.clone().unwrap_or_default());
-        state.supervisor.lock().unwrap().stop();
-        let staging = match &u.staging {
-            Some(s) => std::path::PathBuf::from(s),
-            None => {
-                let status = DshUpdateStatus {
-                    ok: false,
-                    update_available: false,
-                    current: current.clone(),
-                    latest: u.version.clone(),
-                    message: "更新缺少暂存目录，已保留当前版本。".into(),
-                    ..Default::default()
-                };
-                state.set_dsh_update(status.clone());
-                restart_dsh_service(&app2, &state, &node, &runtime, &workspace, &extra);
-                return status;
-            }
-        };
-        let swap_out = node::run_swap(&node, &installer, &runtime, &staging);
-        let status = match swap_out {
-            Ok(out) => {
-                let sw = node::parse_installer_output(&out);
-                let new_version = sw.version.clone();
-                let message = if sw.ok && sw.action == "updated" {
-                    format!(
-                        "已更新到 {}（重启服务后生效）",
-                        new_version.clone().unwrap_or_default()
-                    )
-                } else {
-                    sw.message.unwrap_or_else(|| "更新失败，已保留当前版本。".into())
-                };
-                DshUpdateStatus {
-                    ok: sw.ok,
-                    update_available: false,
-                    current: sw.current.or(current.clone()),
-                    latest: new_version,
-                    prerelease: sw.prerelease.clone(),
-                    pre_available: sw.pre_available,
-                    message,
-                }
-            }
-            Err(e) => DshUpdateStatus {
-                ok: false,
-                update_available: false,
-                current: current.clone(),
-                latest: u.version.clone(),
-                message: format!("更新替换失败：{e}"),
-                ..Default::default()
-            },
-        };
+        let status = apply_swap(
+            &app2,
+            &state,
+            &node,
+            &installer,
+            &runtime,
+            &workspace,
+            &extra,
+            &u,
+            current,
+        );
         state.set_dsh_update(status.clone());
-        restart_dsh_service(&app2, &state, &node, &runtime, &workspace, &extra);
         status
     })
     .await

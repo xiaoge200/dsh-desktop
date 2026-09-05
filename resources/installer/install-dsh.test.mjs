@@ -20,7 +20,22 @@ import { dirname } from "node:path";
 const INSTALLER = fileURLToPath(new URL("./install-dsh.mjs", import.meta.url));
 
 // 顶层 import：install-dsh.mjs 检测到测试进程时不执行 main，仅导出内部函数
-const { restoreBackup, copyTreeFallback, compareVersions, splitVersions } = await import("./install-dsh.mjs");
+const {
+  restoreBackup, copyTreeFallback, compareVersions, splitVersions,
+  replaceDir, retriable, cleanRuntimeLeftovers,
+} = await import("./install-dsh.mjs");
+
+function scratch(name) {
+  const root = join(tmpdir(), `dsh-test-${name}-${process.pid}`);
+  rmSync(root, { recursive: true, force: true });
+  mkdirSync(root, { recursive: true });
+  return root;
+}
+
+function dirMark(dir, text) {
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dir, "mark.txt"), text);
+}
 
 function runInstaller(args, timeout = 300_000) {
   return spawnSync(process.execPath, [INSTALLER, ...args], {
@@ -214,4 +229,59 @@ test("splitVersions 只有预发布时 stable 为 null", () => {
   const { stable, prerelease } = splitVersions(["1.0.0-rc.1", "1.0.0-rc.2"]);
   assert.equal(stable, null);
   assert.equal(prerelease, "1.0.0-rc.2");
+});
+
+test("replaceDir 快乐路径：新内容就位，旧版与 stage 均消失", async () => {
+  const root = scratch("replace-ok");
+  const target = join(root, "runtime");
+  const stage = join(root, "stage");
+  dirMark(target, "old");
+  dirMark(stage, "new");
+
+  await replaceDir(target, stage);
+
+  assert.equal(readFileSync(join(target, "mark.txt"), "utf8"), "new");
+  assert.ok(!existsSync(join(root, "runtime.old")));
+  assert.ok(!existsSync(stage));
+  rmSync(root, { recursive: true, force: true });
+});
+
+test("replaceDir 崩溃残留自愈：target 缺失且 .old 存在时先恢复再替换", async () => {
+  const root = scratch("replace-heal");
+  const target = join(root, "runtime");
+  const stage = join(root, "stage");
+  dirMark(target + ".old", "old-leftover");
+  dirMark(stage, "new");
+
+  await replaceDir(target, stage);
+
+  assert.equal(readFileSync(join(target, "mark.txt"), "utf8"), "new");
+  assert.ok(!existsSync(target + ".old"));
+  rmSync(root, { recursive: true, force: true });
+});
+
+test("cleanRuntimeLeftovers 清理 .dsh-runtime-bak 与 target.old", () => {
+  const root = scratch("clean-leftovers");
+  const target = join(root, "runtime");
+  dirMark(target, "live");
+  dirMark(join(root, ".dsh-runtime-bak"), "bak");
+  dirMark(target + ".old", "old");
+
+  cleanRuntimeLeftovers(target);
+
+  assert.ok(existsSync(target));
+  assert.ok(!existsSync(join(root, ".dsh-runtime-bak")));
+  assert.ok(!existsSync(target + ".old"));
+  rmSync(root, { recursive: true, force: true });
+});
+
+test("retriable 仅认 EPERM/EBUSY/ENOTEMPTY/EACCES", () => {
+  for (const code of ["EPERM", "EBUSY", "ENOTEMPTY", "EACCES"]) {
+    assert.ok(retriable({ code }), code);
+  }
+  for (const code of ["EXDEV", "ENOENT", "EEXIST", "EIO"]) {
+    assert.ok(!retriable({ code }), code);
+  }
+  assert.ok(!retriable(null));
+  assert.ok(!retriable(new Error("plain")));
 });

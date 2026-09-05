@@ -104,6 +104,53 @@ fn loopback(port: u16) -> SocketAddr {
     SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port)
 }
 
+pub fn probe_port(port: u16) -> bool {
+    if port == 0 {
+        return false;
+    }
+    match TcpStream::connect_timeout(&loopback(port), HEALTH_TIMEOUT) {
+        Ok(mut stream) => {
+            let req = format!(
+                "GET / HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\nUser-Agent: dsh-desktop/0.1\r\n\r\n"
+            );
+            let _ = stream.set_read_timeout(Some(HEALTH_TIMEOUT));
+            if stream.write_all(req.as_bytes()).is_err() {
+                return false;
+            }
+            let mut buf = [0u8; 128];
+            match stream.read(&mut buf) {
+                Ok(_) => {
+                    let head = String::from_utf8_lossy(&buf);
+                    head.starts_with("HTTP/1") || head.contains("HTTP/1")
+                }
+                Err(_) => false,
+            }
+        }
+        Err(_) => false,
+    }
+}
+
+const STALE_CMD_MARKER: &str = "dsh-market-restart";
+
+fn runtime_dir_from_bin(bin: &Path) -> Option<PathBuf> {
+    let mut prev: Option<&std::ffi::OsStr> = None;
+    for anc in bin.ancestors().skip(1) {
+        let name = anc.file_name()?;
+        if prev == Some(std::ffi::OsStr::new("@deepseek-ai"))
+            && name == std::ffi::OsStr::new("node_modules")
+        {
+            return Some(anc.parent()?.to_path_buf());
+        }
+        prev = Some(name);
+    }
+    None
+}
+
+fn cmd_matches_markers(cmd: &[String], markers: &[String]) -> bool {
+    let hay: String = cmd.iter().map(|a| a.to_lowercase()).collect::<Vec<_>>().join(" ");
+    markers.iter().any(|m| hay.contains(&m.to_lowercase()))
+}
+
 fn normalize_for_node(p: &Path) -> PathBuf {
     #[cfg(windows)]
     {
@@ -135,7 +182,7 @@ pub struct Supervisor {
 
 const MAX_RESTARTS: usize = 3;
 const RESTART_WINDOW: Duration = Duration::from_secs(300);
-const HEALTH_TIMEOUT: Duration = Duration::from_millis(800);
+const HEALTH_TIMEOUT: Duration = Duration::from_millis(300);
 
 impl Supervisor {
     pub fn new() -> Self {
@@ -336,32 +383,6 @@ impl Supervisor {
         Ok(port)
     }
 
-    pub fn health_check(&self) -> bool {
-        let port = self.port();
-        if port == 0 {
-            return false;
-        }
-        match TcpStream::connect_timeout(&loopback(port), HEALTH_TIMEOUT) {
-            Ok(mut stream) => {
-                let req = format!(
-                    "GET / HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\nUser-Agent: dsh-desktop/0.1\r\n\r\n"
-                );
-                let _ = stream.set_read_timeout(Some(HEALTH_TIMEOUT));
-                if stream.write_all(req.as_bytes()).is_err() {
-                    return false;
-                }
-                let mut buf = [0u8; 128];
-                match stream.read(&mut buf) {
-                    Ok(_) => {
-                        let head = String::from_utf8_lossy(&buf);
-                        head.starts_with("HTTP/1") || head.contains("HTTP/1")
-                    }
-                    Err(_) => false,
-                }
-            }
-            Err(_) => false,
-        }
-    }
 
     pub fn is_exited(&self) -> bool {
         let mut guard = self.child.lock().unwrap();
@@ -441,8 +462,8 @@ impl Supervisor {
         let now = Instant::now();
         let mut window = self.restarts.lock().unwrap();
         window.retain(|t| now.duration_since(*t) < RESTART_WINDOW);
+        *self.degraded.lock().unwrap() = window.len() >= MAX_RESTARTS;
         if window.len() >= MAX_RESTARTS {
-            *self.degraded.lock().unwrap() = true;
             false
         } else {
             window.push(now);
@@ -515,11 +536,28 @@ impl Supervisor {
         }
     }
 
-    fn kill_stale_dsh(&self) {
-        let marker = match self.dsh_bin.lock().unwrap().clone() {
-            Some(p) => normalize_for_node(&p).to_string_lossy().to_lowercase(),
-            None => return,
+    pub fn ensure_stopped(&mut self) {
+        self.stop();
+        for _ in 0..4 {
+            if !self.kill_stale_dsh() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(500));
+        }
+    }
+
+    fn kill_stale_dsh(&self) -> bool {
+        let bin = match self.dsh_bin.lock().unwrap().clone() {
+            Some(p) => normalize_for_node(&p),
+            None => return false,
         };
+        let mut markers = vec![
+            bin.to_string_lossy().to_lowercase(),
+            STALE_CMD_MARKER.to_string(),
+        ];
+        if let Some(runtime) = runtime_dir_from_bin(&bin) {
+            markers.push(runtime.to_string_lossy().to_lowercase());
+        }
         let mut sys = sysinfo::System::new();
         sys.refresh_processes_specifics(
             sysinfo::ProcessesToUpdate::All,
@@ -527,17 +565,16 @@ impl Supervisor {
             sysinfo::ProcessRefreshKind::nothing().with_cmd(sysinfo::UpdateKind::Always),
         );
         let current = sysinfo::get_current_pid().ok();
+        let mut killed_any = false;
         for (pid, proc_) in sys.processes() {
             if Some(*pid) == current {
                 continue;
             }
-            let matches = proc_
-                .cmd()
-                .iter()
-                .any(|a| a.to_string_lossy().to_lowercase().contains(&marker));
-            if !matches {
+            let cmd: Vec<String> = proc_.cmd().iter().map(|a| a.to_string_lossy().to_string()).collect();
+            if !cmd_matches_markers(&cmd, &markers) {
                 continue;
             }
+            killed_any = true;
             log::info!("killing stale dsh process pid={pid}");
             #[cfg(windows)]
             {
@@ -554,6 +591,7 @@ impl Supervisor {
                 let _ = proc_.kill();
             }
         }
+        killed_any
     }
 }
 
@@ -615,6 +653,41 @@ mod tests {
     }
 
     #[test]
+    fn runtime_dir_from_bin_finds_runtime_above_scoped_modules() {
+        let bin = PathBuf::from(r"C:\Users\me\AppData\Roaming\com.dsh.desktop\dsh-runtime\node_modules\@deepseek-ai\dsh\lib\bin.js");
+        assert_eq!(
+            runtime_dir_from_bin(&bin),
+            Some(PathBuf::from(r"C:\Users\me\AppData\Roaming\com.dsh.desktop\dsh-runtime"))
+        );
+    }
+
+    #[test]
+    fn runtime_dir_from_bin_returns_none_for_unrelated_paths() {
+        assert_eq!(runtime_dir_from_bin(Path::new(r"C:\x\node_modules\plain\bin.js")), None);
+        assert_eq!(runtime_dir_from_bin(Path::new(r"C:\x\@deepseek-ai\dsh\bin.js")), None);
+    }
+
+    #[test]
+    fn cmd_matches_markers_case_insensitive_contains() {
+        let markers = vec![
+            r"c:\dsh-runtime".to_string(),
+            "dsh-market-restart".to_string(),
+        ];
+        assert!(cmd_matches_markers(
+            &["node.exe".into(), r"C:\DSH-RUNTIME\node_modules\@deepseek-ai\dsh\lib\bin.js".into()],
+            &markers
+        ));
+        assert!(cmd_matches_markers(
+            &["node.exe".into(), "-e".into(), "const dsh-market-restart = 1".into()],
+            &markers
+        ));
+        assert!(!cmd_matches_markers(
+            &["powershell.exe".into(), "-Command".into(), "echo hi".into()],
+            &markers
+        ));
+    }
+
+    #[test]
     fn pick_free_port_returns_preferred_when_free() {
         let port = Supervisor::pick_free_port(3080);
         assert!(port > 0);
@@ -636,7 +709,7 @@ mod tests {
         drop(listener);
         let sup = Supervisor::new();
         sup.port.store(port as u32, Ordering::SeqCst);
-        assert!(!sup.health_check());
+        assert!(!probe_port(sup.port()));
     }
 
     #[test]
@@ -654,7 +727,7 @@ mod tests {
         sup.port.store(port as u32, Ordering::SeqCst);
         let deadline = Instant::now() + Duration::from_secs(3);
         while Instant::now() < deadline {
-            if sup.health_check() {
+            if probe_port(sup.port()) {
                 return;
             }
             std::thread::sleep(Duration::from_millis(50));

@@ -7,7 +7,7 @@ import {
   renameSync, rmSync, symlinkSync, writeFileSync,
 } from "node:fs";
 import { createHash } from "node:crypto";
-import { join, dirname } from "node:path";
+import { join, dirname, basename } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const PKG = "@deepseek-ai/dsh";
@@ -179,22 +179,125 @@ function fetchTo(target, registry, versionSpec) {
 }
 
 
-function swapStaging(target, stage) {
-  try {
-    rmSync(target, { recursive: true, force: true });
-    renameSync(stage, target);
-  } catch (e) {
-    
-    log("swap rename failed, copying from staging: " + (e.message ?? e));
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+function retriable(e) {
+  const code = (e && e.code) || "";
+  return /EPERM|EBUSY|ENOTEMPTY|EACCES/.test(code);
+}
+
+async function retryRename(from, to, what) {
+  let last;
+  for (let i = 1; i <= 4; i++) {
     try {
-      rmSync(target, { recursive: true, force: true });
-      mkdirSync(target, { recursive: true });
-      copyTree(stage, target);
-      rmSync(stage, { recursive: true, force: true });
-    } catch (e2) {
-      throw Object.assign(new Error(`swap failed: ${e2.message ?? e2}`), { kind: "install" });
+      renameSync(from, to);
+      return;
+    } catch (e) {
+      last = e;
+      if (!retriable(e)) throw e;
+      log(`${what}: rename retry ${i}/4 (${e.code ?? e})`);
+      await sleep(500 * i);
     }
   }
+  throw last;
+}
+
+function lockedHint() {
+  return "文件可能被占用（其他 DSH 窗口、杀毒或残留进程），请稍后重试，持续失败请重启电脑。";
+}
+
+// 安全替换：旧版先改名让位（完整保留），新版就位后删除旧版；失败回滚，绝不先删旧版。
+async function replaceDir(target, stage) {
+  const oldDir = target + ".old";
+  if (existsSync(oldDir)) {
+    if (!existsSync(target)) {
+      log("stale .old without target; restoring then replacing");
+      try {
+        await retryRename(oldDir, target, "restore .old");
+      } catch (e) {
+        throw Object.assign(
+          new Error(`上次替换中断，恢复旧版本失败：${lockedHint()}。旧版本保留在 ${oldDir}。`),
+          { kind: "install", userMessage: `上次替换未完成：${lockedHint()}旧版本保留在 ${oldDir}。` }
+        );
+      }
+    } else {
+      try {
+        rmSync(oldDir, { recursive: true, force: true });
+        log("removed stale .old leftover");
+      } catch (e) {
+        log("stale .old removal failed (ignored): " + (e.message ?? e));
+      }
+    }
+  }
+  if (!existsSync(target)) {
+    await retryRename(stage, target, "fresh install");
+    return;
+  }
+  try {
+    await retryRename(target, oldDir, "move current aside");
+  } catch (e) {
+    throw Object.assign(
+      new Error(`当前版本无法让位：${lockedHint()}`),
+      { kind: "install", userMessage: `新版本替换失败，已保留当前版本：${lockedHint()}` }
+    );
+  }
+  try {
+    await retryRename(stage, target, "move new into place");
+  } catch (e) {
+    if (e && e.code === "EXDEV") {
+      try {
+        mkdirSync(target, { recursive: true });
+        copyTree(stage, target);
+        rmSync(stage, { recursive: true, force: true });
+        rmSync(oldDir, { recursive: true, force: true });
+        return;
+      } catch (e2) {
+        throw Object.assign(
+          new Error(`swap copy fallback failed: ${e2.message ?? e2}`),
+          { kind: "install" }
+        );
+      }
+    }
+    try {
+      await retryRename(oldDir, target, "rollback");
+    } catch (e2) {
+      throw Object.assign(
+        new Error(`替换失败且回滚失败：${target} 缺失，旧版本完整保留在 ${oldDir}。请关闭其他 DSH 窗口后重试，或重新安装。`),
+        { kind: "install", userMessage: `新版本替换失败：${lockedHint()}旧版本完整保留在 ${oldDir}。` }
+      );
+    }
+    throw Object.assign(
+      new Error(`replace failed (${e.code ?? e}); old version restored`),
+      { kind: "install", userMessage: `新版本替换失败，已恢复原版本：${lockedHint()}` }
+    );
+  }
+  try {
+    rmSync(oldDir, { recursive: true, force: true });
+  } catch (e) {
+    log("old runtime kept at " + oldDir + ": " + (e.message ?? e));
+  }
+}
+
+function cleanRuntimeLeftovers(target) {
+  const parent = dirname(target);
+  for (const name of [".dsh-runtime-bak", basename(target) + ".old"]) {
+    const p = join(parent, name);
+    try {
+      if (existsSync(p)) {
+        rmSync(p, { recursive: true, force: true });
+        log("removed leftover " + name);
+      }
+    } catch (e) {
+      log("leftover removal failed: " + name + " (" + (e.message ?? e) + ")");
+    }
+  }
+}
+
+async function swapStaging(target, stage) {
+  await cleanRuntimeLeftovers(target);
+  await replaceDir(target, stage);
 }
 
 
@@ -252,7 +355,7 @@ function cleanStaleStaging(target) {
 }
 
 
-function copyBaseline(target, baselineRoot) {
+async function copyBaseline(target, baselineRoot) {
   let src = baselineRoot;
   if (existsSync(join(src, "node_modules")) && existsSync(join(src, "node_modules", "@deepseek-ai", "dsh", "lib", "bin.js"))) {
     src = join(src, "node_modules");
@@ -261,13 +364,12 @@ function copyBaseline(target, baselineRoot) {
     throw Object.assign(new Error(`baseline missing: ${baselineRoot}`), { kind: "unknown" });
   }
   cleanStaleStaging(target);
+  cleanRuntimeLeftovers(target);
   const stage = join(dirname(target), ".dsh-runtime-staging-" + process.pid);
   rmSync(stage, { recursive: true, force: true });
   mkdirSync(stage, { recursive: true });
   copyTree(src, join(stage, "node_modules"));
-  
-  rmSync(target, { recursive: true, force: true });
-  renameSync(stage, target);
+  await replaceDir(target, stage);
 }
 
 
@@ -338,7 +440,7 @@ async function main() {
       }
       if (opts.baseline) {
         try {
-          copyBaseline(target, opts.baseline);
+          await copyBaseline(target, opts.baseline);
           const v = readVersion(target);
           if (!v || !smokeOk(target)) {
             out({ ok: false, error: { kind: "integrity", message: "程序文件不完整，请重新安装。", detail: "baseline copy smoke failed" } });
@@ -475,16 +577,23 @@ async function main() {
     }
 
     case "swap": {
-      
-      
+
+
       if (!opts.staging || !existsSync(opts.staging)) {
         out({ ok: false, error: { kind: "install", message: "缺少已下载的暂存版本。", detail: "staging missing" } });
         process.exit(1);
       }
       try {
-        swapStaging(opts.target, opts.staging);
+        await swapStaging(opts.target, opts.staging);
       } catch (e) {
-        out({ ok: false, error: { kind: "install", message: "新版本没有装好，已保留旧版本。", detail: String(e.message ?? e) } });
+        out({
+          ok: false,
+          error: {
+            kind: "install",
+            message: e?.userMessage || "新版本没有装好，已保留旧版本。",
+            detail: String(e.message ?? e),
+          },
+        });
         process.exit(1);
       }
       
@@ -522,4 +631,8 @@ if (!invokedByTest) {
 }
 
 
-export { restoreBackup, copyTree, copyTreeFallback, smokeTest, readInstalled, writeInstalled, compareVersions, splitVersions };
+export {
+  restoreBackup, copyTree, copyTreeFallback, smokeTest, readInstalled, writeInstalled,
+  compareVersions, splitVersions,
+  replaceDir, swapStaging, retryRename, retriable, cleanRuntimeLeftovers, copyBaseline,
+};

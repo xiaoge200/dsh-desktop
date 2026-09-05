@@ -155,7 +155,7 @@ function renderPlugin(p: PluginInfo): HTMLElement {
       try {
         await invoke("plugins_remove", { name: p.name });
         await renderList();
-        setStatus(T("已移除，重启服务后生效"));
+        setStatus(T("已移除，服务已自动重启"));
       } catch (e) {
         alert(String(e));
       } finally {
@@ -232,7 +232,7 @@ async function doAdd(spec: string) {
     await renderList();
     const parts: string[] = [];
     if (res.warning) parts.push(res.warning);
-    parts.push(T("已安装，重启服务后生效"));
+    parts.push(T("已安装，服务已自动重启"));
     setStatus(parts.join(" "));
     els.specInput.value = "";
   } catch (e) {

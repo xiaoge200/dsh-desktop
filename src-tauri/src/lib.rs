@@ -29,7 +29,7 @@ use settings::{
 };
 use state::{AppState, BootPhase, StatusSnapshot};
 use supervisor::Supervisor;
-use tauri::{AppHandle, Emitter, Manager, State};
+use tauri::{AppHandle, Emitter, Manager};
 
 const RUNTIME_DIR: &str = "dsh-runtime";
 const WORKSPACE_DIR: &str = "workspace";
@@ -62,8 +62,12 @@ pub(crate) fn update_tray_tooltip(app: &AppHandle) {
     } else {
         if zh { "DSH 工作台：正在启动…".into() } else { "DSH Workspace: starting…".into() }
     };
+    let allowed = crate::service::restart_action_allowed(&state);
     if let Some(tray) = app.tray_by_id("main-tray") {
         let _ = tray.set_tooltip(Some(&tooltip));
+        if let Ok(menu) = build_tray_menu(app, allowed) {
+            let _ = tray.set_menu(Some(menu));
+        }
     }
 }
 
@@ -128,10 +132,15 @@ fn open_context_menu(app: AppHandle) -> Result<(), String> {
     } else {
         ("Settings", "Restart service", "Quit")
     };
+    let restart_allowed = {
+        let state = app.state::<AppState>();
+        crate::service::restart_action_allowed(&state)
+    };
     let settings_i = CtxMenuItem::with_id(&app, "ctx-settings", s_settings, true, None::<&str>)
         .map_err(|e| e.to_string())?;
-    let restart_i = CtxMenuItem::with_id(&app, "ctx-restart", s_restart, true, None::<&str>)
-        .map_err(|e| e.to_string())?;
+    let restart_i =
+        CtxMenuItem::with_id(&app, "ctx-restart", s_restart, restart_allowed, None::<&str>)
+            .map_err(|e| e.to_string())?;
     let quit_i = CtxMenuItem::with_id(&app, "ctx-quit", s_quit, true, None::<&str>)
         .map_err(|e| e.to_string())?;
     let menu = CtxMenu::with_items(&app, &[&settings_i, &restart_i, &quit_i])
@@ -210,12 +219,18 @@ fn boot(app: AppHandle) {
         }
     };
     match node::smoke(&node_path) {
-        Ok(v) => log::info!("node ok: {v}"),
+        Ok(v) => {
+            log::info!("node ok: {v}");
+            state.set_cached_node_version(Some(v));
+        }
         Err(e) => {
             log::warn!("node smoke failed (retrying once): {e}");
             std::thread::sleep(Duration::from_millis(800));
             match node::smoke(&node_path) {
-                Ok(v) => log::info!("node ok (after retry): {v}"),
+                Ok(v) => {
+                    log::info!("node ok (after retry): {v}");
+                    state.set_cached_node_version(Some(v));
+                }
                 Err(e2) => {
                     fail(
                         &app,
@@ -330,6 +345,14 @@ fn boot(app: AppHandle) {
             ) {
                 Ok(()) => {}
                 Err(issue2) => {
+                    let exited = state.supervisor.lock().unwrap().is_exited();
+                    let has_url = service_url(&state).contains("?token=");
+                    log::error!(
+                        "boot retry failed: kind={} exited={exited} health={} url={has_url} detail_len={}",
+                        issue2.kind.kind_str(),
+                        crate::supervisor::probe_port(state.port()),
+                        issue2.detail.len()
+                    );
                     let msg = if issue2.spawn_error {
                         if issue2.detail.contains("多次启动失败") {
                             "程序多次启动失败，请稍后再试。"
@@ -339,7 +362,17 @@ fn boot(app: AppHandle) {
                     } else {
                         "程序没有正常启动，点这里修复。"
                     };
-                    fail(&app, &state, msg, &issue2.detail);
+                    let detail: String = if issue2.detail.trim().is_empty() {
+                        if exited {
+                            "服务进程已退出且没有输出，请查看日志目录下的 service.log。".into()
+                        } else {
+                            "服务进程仍在运行但没有响应，请稍后重试或查看日志目录下的 service.log。"
+                                .into()
+                        }
+                    } else {
+                        issue2.detail.clone()
+                    };
+                    fail(&app, &state, msg, &detail);
                     if !issue2.spawn_error {
                         emit_error_options(&app, &state, &issue2);
                     }
@@ -368,6 +401,7 @@ fn boot(app: AppHandle) {
 fn spawn_ensure_default_plugin(app: &AppHandle) {
     let app = app.clone();
     std::thread::spawn(move || {
+        let _guard = crate::service::ops_guard();
         let state = app.state::<AppState>();
         let node = state.node_path();
         let runtime = state.runtime_dir();
@@ -378,28 +412,46 @@ fn spawn_ensure_default_plugin(app: &AppHandle) {
 }
 
 #[tauri::command]
-fn get_status(state: State<'_, AppState>) -> StatusSnapshot {
-    let phase = state.phase();
-    let dsh_version = node::read_installed_version(&state.runtime_dir());
-    let node_version = node::smoke(&state.node_path()).ok();
-    StatusSnapshot {
-        phase,
-        message: phase_text(phase).to_string(),
-        error: state.error(),
-        port: state.port(),
-        service_url: if phase == BootPhase::Ready {
-            let u = service_url(&state);
-            if u.contains("?token=") {
-                state.set_pending_auth_url(Some(u.clone()));
-            }
-            Some(u)
-        } else {
-            None
-        },
-        recovery: state.last_recovery(),
-        dsh_version,
-        node_version,
-    }
+async fn get_status(app: AppHandle) -> StatusSnapshot {
+    let app2 = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app2.state::<AppState>();
+        let phase = state.phase();
+        let dsh_version = node::read_installed_version(&state.runtime_dir());
+        let node_version = state.cached_node_version();
+        StatusSnapshot {
+            phase,
+            message: phase_text(phase).to_string(),
+            error: state.error(),
+            port: state.port(),
+            service_url: if phase == BootPhase::Ready {
+                let u = service_url(&state);
+                if u.contains("?token=") {
+                    state.set_pending_auth_url(Some(u.clone()));
+                }
+                Some(u)
+            } else {
+                None
+            },
+            recovery: state.last_recovery(),
+            dsh_version,
+            node_version,
+        }
+    })
+    .await
+    .unwrap_or_else(|e| {
+        log::warn!("get_status task failed: {e}");
+        StatusSnapshot {
+            phase: BootPhase::Error,
+            message: phase_text(BootPhase::Error).to_string(),
+            error: Some("状态读取失败".into()),
+            port: 0,
+            service_url: None,
+            recovery: None,
+            dsh_version: None,
+            node_version: None,
+        }
+    })
 }
 
 fn parse_dsh_extra_args() -> Vec<String> {
@@ -431,9 +483,8 @@ fn quit_app(app: &AppHandle) {
     });
 }
 
-fn build_tray(app: &AppHandle) -> tauri::Result<()> {
+fn build_tray_menu(app: &AppHandle, restart_allowed: bool) -> tauri::Result<tauri::menu::Menu<tauri::Wry>> {
     use tauri::menu::{Menu, MenuItem};
-    use tauri::tray::TrayIconBuilder;
     let zh = is_zh_locale();
     let (s_show, s_settings, s_restart, s_quit) = if zh {
         ("打开界面", "设置", "重启服务", "退出")
@@ -442,9 +493,14 @@ fn build_tray(app: &AppHandle) -> tauri::Result<()> {
     };
     let show_i = MenuItem::with_id(app, "show", s_show, true, None::<&str>)?;
     let settings_i = MenuItem::with_id(app, "settings", s_settings, true, None::<&str>)?;
-    let restart_i = MenuItem::with_id(app, "restart", s_restart, true, None::<&str>)?;
+    let restart_i = MenuItem::with_id(app, "restart", s_restart, restart_allowed, None::<&str>)?;
     let quit_i = MenuItem::with_id(app, "quit", s_quit, true, None::<&str>)?;
-    let menu = Menu::with_items(app, &[&show_i, &settings_i, &restart_i, &quit_i])?;
+    Menu::with_items(app, &[&show_i, &settings_i, &restart_i, &quit_i])
+}
+
+fn build_tray(app: &AppHandle) -> tauri::Result<()> {
+    use tauri::tray::TrayIconBuilder;
+    let menu = build_tray_menu(app, true)?;
     let _tray = TrayIconBuilder::with_id("main-tray")
         .icon(app.default_window_icon().unwrap().clone())
         .menu(&menu)
@@ -581,6 +637,7 @@ pub fn run() {
             service_watch_active: std::sync::atomic::AtomicBool::new(false),
             last_recovery: std::sync::Mutex::new(None),
             pending_auth_url: std::sync::Mutex::new(None),
+            node_version_cache: std::sync::Mutex::new(None),
         })
         .setup(move |app| {
             {

@@ -35,6 +35,7 @@ pub struct AppState {
     pub service_watch_active: AtomicBool,
     pub last_recovery: Mutex<Option<RecoveryInfo>>,
     pub pending_auth_url: Mutex<Option<String>>,
+    pub node_version_cache: Mutex<Option<String>>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -175,6 +176,18 @@ impl AppState {
     pub fn pending_auth_url(&self) -> Option<String> {
         self.pending_auth_url.lock().unwrap().clone()
     }
+
+    pub fn service_health(&self) -> bool {
+        crate::supervisor::probe_port(self.port())
+    }
+
+    pub fn set_cached_node_version(&self, v: Option<String>) {
+        *self.node_version_cache.lock().unwrap() = v;
+    }
+
+    pub fn cached_node_version(&self) -> Option<String> {
+        self.node_version_cache.lock().unwrap().clone()
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -192,6 +205,7 @@ pub struct StatusSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Read, Write};
 
     fn new_state() -> AppState {
         AppState {
@@ -212,7 +226,45 @@ mod tests {
             service_watch_active: AtomicBool::new(false),
             last_recovery: Mutex::new(None),
             pending_auth_url: Mutex::new(None),
+            node_version_cache: Mutex::new(None),
         }
+    }
+
+    #[test]
+    fn service_health_false_when_port_zero_or_closed() {
+        let s = new_state();
+        assert!(!s.service_health());
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        s.set_port(port);
+        drop(listener);
+        assert!(!s.service_health());
+    }
+
+    #[test]
+    fn service_health_true_on_live_http_server() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 512];
+                let _ = stream.read(&mut buf);
+                let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+            }
+        });
+        let s = new_state();
+        s.set_port(port);
+        assert!(s.service_health());
+    }
+
+    #[test]
+    fn node_version_cache_roundtrip() {
+        let s = new_state();
+        assert_eq!(s.cached_node_version(), None);
+        s.set_cached_node_version(Some("v24.9.0".into()));
+        assert_eq!(s.cached_node_version().as_deref(), Some("v24.9.0"));
+        s.set_cached_node_version(None);
+        assert_eq!(s.cached_node_version(), None);
     }
 
     #[test]

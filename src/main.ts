@@ -209,7 +209,6 @@ function bindActions() {
         return;
       }
       els.errorMessage.textContent = T("移除完成，正在重启服务…");
-      await invoke("restart_service");
     } catch (e) {
       console.error("remove incompatible plugins failed", e);
       els.errorMessage.textContent = T("移除失败：") + String(e);

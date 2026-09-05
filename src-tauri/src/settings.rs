@@ -1,7 +1,6 @@
 use crate::config;
-use crate::node;
 use crate::state::{AppState, BootPhase};
-use tauri::{AppHandle, State};
+use tauri::{AppHandle, Manager, State};
 
 #[derive(serde::Serialize)]
 pub(crate) struct SettingsData {
@@ -18,30 +17,35 @@ pub(crate) struct SettingsData {
 }
 
 #[tauri::command]
-pub(crate) fn get_settings(app: AppHandle, state: State<'_, AppState>) -> Result<SettingsData, String> {
-    use tauri_plugin_autostart::ManagerExt;
+pub(crate) async fn get_settings(app: AppHandle) -> Result<SettingsData, String> {
+    let app2 = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        use tauri_plugin_autostart::ManagerExt;
 
-    let pkg = app.package_info();
-    let autostart = app
-        .autolaunch()
-        .is_enabled()
-        .map_err(|e| format!("读取开机启动设置失败: {e}"))?;
+        let pkg = app2.package_info();
+        let autostart = app2
+            .autolaunch()
+            .is_enabled()
+            .map_err(|e| format!("读取开机启动设置失败: {e}"))?;
+        let state = app2.state::<AppState>();
+        let port = state.port();
+        let service_running = port > 0 && state.service_health();
 
-    let port = state.port();
-    let service_running = port > 0 && state.supervisor.lock().unwrap().health_check();
-
-    Ok(SettingsData {
-        app_version: pkg.version.to_string(),
-        node_version: node::smoke(&state.node_path()).ok(),
-        dsh_version: node::read_installed_version(&state.runtime_dir()),
-        port,
-        service_running,
-        phase: state.phase(),
-        error: state.error(),
-        workspace_dir: state.workspace_dir().display().to_string(),
-        log_file: state.log_file().display().to_string(),
-        autostart_enabled: autostart,
+        Ok(SettingsData {
+            app_version: pkg.version.to_string(),
+            node_version: state.cached_node_version(),
+            dsh_version: crate::node::read_installed_version(&state.runtime_dir()),
+            port,
+            service_running,
+            phase: state.phase(),
+            error: state.error(),
+            workspace_dir: state.workspace_dir().display().to_string(),
+            log_file: state.log_file().display().to_string(),
+            autostart_enabled: autostart,
+        })
     })
+    .await
+    .map_err(|e| format!("读取设置任务异常: {e}"))?
 }
 
 #[derive(serde::Serialize)]
@@ -53,14 +57,28 @@ pub(crate) struct ServiceState {
 }
 
 #[tauri::command]
-pub(crate) fn get_service_state(state: State<'_, AppState>) -> ServiceState {
-    let port = state.port();
-    ServiceState {
-        port,
-        service_running: port > 0 && state.supervisor.lock().unwrap().health_check(),
-        phase: state.phase(),
-        error: state.error(),
-    }
+pub(crate) async fn get_service_state(app: AppHandle) -> ServiceState {
+    let app2 = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app2.state::<AppState>();
+        let port = state.port();
+        ServiceState {
+            port,
+            service_running: port > 0 && state.service_health(),
+            phase: state.phase(),
+            error: state.error(),
+        }
+    })
+    .await
+    .unwrap_or_else(|e| {
+        log::warn!("get_service_state task failed: {e}");
+        ServiceState {
+            port: 0,
+            service_running: false,
+            phase: BootPhase::Error,
+            error: Some("状态读取失败".into()),
+        }
+    })
 }
 
 #[tauri::command]

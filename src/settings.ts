@@ -74,6 +74,8 @@ const els = {
 };
 
 let configCache: AppConfig | null = null;
+let lastService: ServiceState | null = null;
+let restartBusy = false;
 
 function setRowText(el: HTMLElement, text: string) {
   el.textContent = text;
@@ -100,6 +102,9 @@ function renderUpdateStatus() {
     msg = lang === "zh"
       ? `${st.message}（预发布 ${st.prerelease}）`
       : `${st.message} (prerelease ${st.prerelease})`;
+  }
+  if (!st.ok && !/占用/.test(msg)) {
+    msg = `${msg} ${T("文件占用提示")}`;
   }
   setRowText(els.updateState, msg);
 
@@ -266,9 +271,28 @@ function serviceStateText(s: ServiceState): string {
   return s.port > 0 ? T("正在重启…") : T("未启动");
 }
 
+function renderRestartButton(s: ServiceState) {
+  if (restartBusy) return;
+  const booting = s.phase === "node-check" || s.phase === "dsh-install";
+  const starting = s.phase === "service-start";
+  const transitioning = !s.service_running && s.phase !== "error" && s.port > 0;
+  if (booting) {
+    els.restartBtn.disabled = true;
+    els.restartBtn.textContent = T("正在启动…");
+  } else if (starting || transitioning) {
+    els.restartBtn.disabled = true;
+    els.restartBtn.textContent = T("正在重启…");
+  } else {
+    els.restartBtn.disabled = false;
+    els.restartBtn.textContent = T("重启服务");
+  }
+}
+
 async function loadSettings() {
   try {
     const s = await invoke<SettingsData>("get_settings");
+    lastService = s;
+    renderRestartButton(s);
     els.autostart.checked = s.autostart_enabled;
     setRowText(els.serviceState, serviceStateText(s));
     setRowText(els.appVersion, s.app_version);
@@ -306,7 +330,9 @@ async function refreshSettings() {
 async function refreshServiceState() {
   try {
     const s = await invoke<ServiceState>("get_service_state");
+    lastService = s;
     setRowText(els.serviceState, serviceStateText(s));
+    renderRestartButton(s);
   } catch (e) {
     console.error("service state poll failed", e);
   }
@@ -377,6 +403,8 @@ function bind() {
   });
 
   els.restartBtn.addEventListener("click", async () => {
+    if (restartBusy) return;
+    restartBusy = true;
     els.restartBtn.disabled = true;
     els.restartBtn.textContent = lang === "zh" ? "正在重启…" : "Restarting…";
     try {
@@ -387,8 +415,13 @@ function bind() {
       console.error("restart failed", e);
       await refreshSettings();
     } finally {
-      els.restartBtn.disabled = false;
-      els.restartBtn.textContent = T("重启服务");
+      restartBusy = false;
+      if (lastService) {
+        renderRestartButton(lastService);
+      } else {
+        els.restartBtn.disabled = false;
+        els.restartBtn.textContent = T("重启服务");
+      }
     }
   });
 

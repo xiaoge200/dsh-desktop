@@ -4,11 +4,10 @@ mod plugin_profile;
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
-use tauri::State;
+use tauri::{AppHandle, Manager, State};
 
 use plugin_npm::{registry_flag, run_npm, GIT_TIMEOUT, NPM_TIMEOUT};
 pub(crate) use plugin_profile::dsh_home;
@@ -17,13 +16,12 @@ use plugin_profile::{
     parse_patch_file_opt, profile_dir, read_manifest, read_version, reconcile, resolve_bundle_dir,
     row_patches, RowPatch, PROFILE_NAME, PROFILE_PATCH_FILENAME, TEMPLATE_BUNDLES,
 };
+use crate::service::{ops_guard, run_exclusive_mutation};
 use crate::state::AppState;
 
 const SNAPSHOT_FILE: &str = "plugins-state.json";
 const DEFAULT_PLUGIN: &str = "dshmarket";
 const DEFAULT_PLUGIN_MARKER: &str = "default-plugin.json";
-
-static PLUGIN_OPS: Mutex<()> = Mutex::new(());
 
 #[derive(Serialize)]
 pub struct PluginRow {
@@ -93,7 +91,7 @@ fn snapshot_differs(snap: &Option<Snapshot>, name: &str, version: &str) -> bool 
 }
 
 pub fn record_restart(state: &AppState) {
-    let Ok(_guard) = PLUGIN_OPS.try_lock() else {
+    let Ok(_guard) = crate::service::OPS_LOCK.try_lock() else {
         log::warn!("plugins: snapshot skipped (plugin op in progress)");
         return;
     };
@@ -273,12 +271,18 @@ fn list_impl(runtime: &Path, home: &Path, app_data: &Path) -> Result<PluginsList
 }
 
 #[tauri::command]
-pub fn plugins_list(state: State<'_, AppState>) -> Result<PluginsListData, String> {
-    let runtime = state.runtime_dir();
-    if runtime.as_os_str().is_empty() {
-        return Err("服务尚未初始化".into());
-    }
-    list_impl(&runtime, &dsh_home(), &state.app_data_dir())
+pub async fn plugins_list(app: AppHandle) -> Result<PluginsListData, String> {
+    let app2 = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app2.state::<AppState>();
+        let runtime = state.runtime_dir();
+        if runtime.as_os_str().is_empty() {
+            return Err("服务尚未初始化".into());
+        }
+        list_impl(&runtime, &dsh_home(), &state.app_data_dir())
+    })
+    .await
+    .map_err(|e| format!("列表任务异常: {e}"))?
 }
 
 fn normalize_spec(spec: &str) -> Result<String, String> {
@@ -341,7 +345,6 @@ fn add_impl(
     spec: &str,
     registry_source: &str,
 ) -> Result<PluginAddResult, String> {
-    let _guard = PLUGIN_OPS.lock().unwrap();
     let home = dsh_home();
     let profile = profile_dir(&home);
     ensure_profile(&profile)?;
@@ -418,6 +421,7 @@ fn add_impl(
 
 #[tauri::command]
 pub async fn plugins_add(
+    app: AppHandle,
     state: State<'_, AppState>,
     spec: String,
 ) -> Result<PluginAddResult, String> {
@@ -427,9 +431,15 @@ pub async fn plugins_add(
         return Err("服务尚未初始化".into());
     }
     let registry_source = state.config.lock().unwrap().get().registry_source;
-    tauri::async_runtime::spawn_blocking(move || add_impl(&node, &runtime, &spec, &registry_source))
-        .await
-        .map_err(|e| format!("安装任务异常: {e}"))?
+    let app2 = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app2.state::<AppState>();
+        run_exclusive_mutation(&app2, &state, "plugin add", move || {
+            add_impl(&node, &runtime, &spec, &registry_source)
+        })
+    })
+    .await
+    .map_err(|e| format!("安装任务异常: {e}"))?
 }
 
 pub fn removable_plugin_names(names: &[String]) -> Vec<String> {
@@ -448,7 +458,6 @@ fn removable_from_manifest(profile: &Path, names: &[String]) -> Vec<String> {
 }
 
 fn remove_impl(node: &Path, runtime: &Path, name: &str, registry_source: &str) -> Result<(), String> {
-    let _guard = PLUGIN_OPS.lock().unwrap();
     let profile = profile_dir(&dsh_home());
     let before = read_manifest(&profile)?;
     let before_deps: HashSet<String> = dep_keys(&before).into_iter().collect();
@@ -470,20 +479,31 @@ fn remove_impl(node: &Path, runtime: &Path, name: &str, registry_source: &str) -
 }
 
 #[tauri::command]
-pub async fn plugins_remove(state: State<'_, AppState>, name: String) -> Result<(), String> {
+pub async fn plugins_remove(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    name: String,
+) -> Result<(), String> {
     let node = state.node_path();
     let runtime = state.runtime_dir();
     if runtime.as_os_str().is_empty() {
         return Err("服务尚未初始化".into());
     }
     let registry_source = state.config.lock().unwrap().get().registry_source;
-    tauri::async_runtime::spawn_blocking(move || remove_impl(&node, &runtime, &name, &registry_source))
-        .await
-        .map_err(|e| format!("卸载任务异常: {e}"))?
+    let app2 = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app2.state::<AppState>();
+        run_exclusive_mutation(&app2, &state, "plugin remove", move || {
+            remove_impl(&node, &runtime, &name, &registry_source)
+        })
+    })
+    .await
+    .map_err(|e| format!("卸载任务异常: {e}"))?
 }
 
 #[tauri::command]
 pub async fn plugins_remove_incompatible(
+    app: AppHandle,
     state: State<'_, AppState>,
     names: Vec<String>,
 ) -> Result<Vec<String>, String> {
@@ -493,21 +513,25 @@ pub async fn plugins_remove_incompatible(
         return Err("服务尚未初始化".into());
     }
     let registry_source = state.config.lock().unwrap().get().registry_source;
+    let app2 = app.clone();
     tauri::async_runtime::spawn_blocking(move || {
-        let targets = removable_plugin_names(&names);
-        let mut removed: Vec<String> = Vec::new();
-        for name in &targets {
-            match remove_impl(&node, &runtime, name, &registry_source) {
-                Ok(()) => {
-                    log::info!("plugins: removed incompatible plugin {name}");
-                    removed.push(name.clone());
-                }
-                Err(e) => {
-                    log::warn!("plugins: remove incompatible plugin {name} failed: {e}");
+        let state = app2.state::<AppState>();
+        run_exclusive_mutation(&app2, &state, "plugin remove-incompatible", move || {
+            let targets = removable_plugin_names(&names);
+            let mut removed: Vec<String> = Vec::new();
+            for name in &targets {
+                match remove_impl(&node, &runtime, name, &registry_source) {
+                    Ok(()) => {
+                        log::info!("plugins: removed incompatible plugin {name}");
+                        removed.push(name.clone());
+                    }
+                    Err(e) => {
+                        log::warn!("plugins: remove incompatible plugin {name} failed: {e}");
+                    }
                 }
             }
-        }
-        Ok(removed)
+            Ok(removed)
+        })
     })
     .await
     .map_err(|e| format!("移除任务异常: {e}"))?
@@ -553,7 +577,6 @@ pub fn ensure_default_plugin(node: &Path, runtime: &Path, app_data: &Path, regis
 }
 
 fn set_enabled_impl(id: &str, enabled: bool) -> Result<(), String> {
-    let _guard = PLUGIN_OPS.lock().unwrap();
     if id.trim().is_empty() {
         return Err("行 id 不能为空".into());
     }
@@ -564,9 +587,12 @@ fn set_enabled_impl(id: &str, enabled: bool) -> Result<(), String> {
 
 #[tauri::command]
 pub async fn plugins_set_enabled(id: String, enabled: bool) -> Result<(), String> {
-    tauri::async_runtime::spawn_blocking(move || set_enabled_impl(&id, enabled))
-        .await
-        .map_err(|e| format!("切换任务异常: {e}"))?
+    tauri::async_runtime::spawn_blocking(move || {
+        let _guard = ops_guard();
+        set_enabled_impl(&id, enabled)
+    })
+    .await
+    .map_err(|e| format!("切换任务异常: {e}"))?
 }
 
 #[cfg(test)]
