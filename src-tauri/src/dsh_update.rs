@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use crate::node;
@@ -7,6 +8,23 @@ use crate::service::{ops_guard, restart_dsh_service};
 use crate::state::{AppState, BootPhase, DshUpdateStatus};
 use crate::update_tray_tooltip;
 use tauri::{AppHandle, Manager, State};
+
+static DSH_UPDATE_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+struct UpdateActiveGuard;
+
+impl Drop for UpdateActiveGuard {
+    fn drop(&mut self) {
+        DSH_UPDATE_ACTIVE.store(false, Ordering::SeqCst);
+    }
+}
+
+fn try_begin_update() -> Option<UpdateActiveGuard> {
+    DSH_UPDATE_ACTIVE
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .ok()
+        .map(|_| UpdateActiveGuard)
+}
 
 fn locked_file_hint() -> &'static str {
     "。若提示文件被占用（其他 DSH 窗口、杀毒或残留进程），请稍后重试，持续失败请重启电脑。"
@@ -27,7 +45,7 @@ fn apply_swap(
     state.set_phase(BootPhase::ServiceStart);
     state.supervisor.lock().unwrap().ensure_stopped();
     update_tray_tooltip(app);
-    let status = match &u.staging {
+    let mut status = match &u.staging {
         Some(s) => {
             let staging = PathBuf::from(s);
             match node::run_swap(node, installer, runtime, &staging) {
@@ -35,10 +53,7 @@ fn apply_swap(
                     let sw = node::parse_installer_output(&out);
                     let new_version = sw.version.clone();
                     let message = if sw.ok && sw.action == "updated" {
-                        format!(
-                            "已更新到 {}，服务已自动重启",
-                            new_version.clone().unwrap_or_default()
-                        )
+                        format!("已更新到 {}", new_version.clone().unwrap_or_default())
                     } else if sw.ok {
                         sw.message.unwrap_or_else(|| "更新结果未知，请查看日志".into())
                     } else {
@@ -77,9 +92,28 @@ fn apply_swap(
             ..Default::default()
         },
     };
-    restart_dsh_service(app, state, node, runtime, workspace, extra);
+    match restart_dsh_service(app, state, node, runtime, workspace, extra) {
+        Ok(()) => {
+            if status.ok && status.message.starts_with("已更新到") {
+                status.message = format!(
+                    "已更新到 {}，服务已自动重启",
+                    status.latest.clone().unwrap_or_default()
+                );
+            }
+        }
+        Err(_) => {
+            if status.ok {
+                status.ok = false;
+                status.message = format!(
+                    "已更新到 {}，但服务未能自动重启，请稍后在设置页重启服务。",
+                    status.latest.clone().unwrap_or_default()
+                );
+            }
+        }
+    }
     drop(guard);
     plugins::record_restart(state);
+    update_tray_tooltip(app);
     status
 }
 
@@ -92,6 +126,7 @@ pub(crate) fn spawn_bg_dsh_update(app: &AppHandle, installer_js: &Path) {
         let bg_runtime = state.runtime_dir();
         let bg_workspace = state.workspace_dir();
         let bg_extra = state.dsh_extra_args.lock().unwrap().clone();
+        std::thread::sleep(Duration::from_secs(30));
         let cfg = state.config.lock().unwrap().get();
         let auto_update = cfg.auto_update_dsh;
         let registry_source = cfg.registry_source;
@@ -107,7 +142,10 @@ pub(crate) fn spawn_bg_dsh_update(app: &AppHandle, installer_js: &Path) {
             log::info!("bg update: auto-update disabled by user");
             return;
         }
-        std::thread::sleep(Duration::from_secs(30));
+        let Some(_update_guard) = try_begin_update() else {
+            log::info!("bg update: skipped, another update is already running");
+            return;
+        };
         let check = match node::run_check(&bg_node, &bg_installer, &bg_runtime, &registry_source, false) {
             Ok(o) => o,
             Err(e) => {
@@ -314,6 +352,18 @@ pub(crate) async fn update_dsh(
     let app2 = app.clone();
     Ok(tauri::async_runtime::spawn_blocking(move || {
         let state = app2.state::<AppState>();
+        let Some(_update_guard) = try_begin_update() else {
+            let status = DshUpdateStatus {
+                ok: true,
+                update_available: false,
+                current,
+                latest: None,
+                message: "更新正在进行中，请稍候。".into(),
+                ..Default::default()
+            };
+            state.set_dsh_update(status.clone());
+            return status;
+        };
         let u = match node::run_update(&node, &installer, &runtime, &registry_source, false) {
             Ok(out) => node::parse_installer_output(&out),
             Err(e) => {

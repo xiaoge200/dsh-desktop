@@ -91,10 +91,19 @@ fn snapshot_differs(snap: &Option<Snapshot>, name: &str, version: &str) -> bool 
 }
 
 pub fn record_restart(state: &AppState) {
-    let Ok(_guard) = crate::service::OPS_LOCK.try_lock() else {
+    if crate::service::OPS_LOCK.try_lock().is_err() {
         log::warn!("plugins: snapshot skipped (plugin op in progress)");
         return;
-    };
+    }
+    write_snapshot(state);
+}
+
+// 调用方必须已持 OPS_LOCK（run_exclusive_mutation 成功路径在锁内调用）。
+pub fn record_restart_force(state: &AppState) {
+    write_snapshot(state);
+}
+
+fn write_snapshot(state: &AppState) {
     let runtime = state.runtime_dir();
     if runtime.as_os_str().is_empty() {
         return;
@@ -434,6 +443,15 @@ pub async fn plugins_add(
     let app2 = app.clone();
     tauri::async_runtime::spawn_blocking(move || {
         let state = app2.state::<AppState>();
+        let deps = read_manifest(&profile_dir(&dsh_home()))
+            .map(|m| dep_keys(&m))
+            .unwrap_or_default();
+        if deps
+            .iter()
+            .any(|n| n == &spec || spec_matches_name(&spec, n))
+        {
+            return Err("该插件已安装。".into());
+        }
         run_exclusive_mutation(&app2, &state, "plugin add", move || {
             add_impl(&node, &runtime, &spec, &registry_source)
         })
@@ -493,6 +511,12 @@ pub async fn plugins_remove(
     let app2 = app.clone();
     tauri::async_runtime::spawn_blocking(move || {
         let state = app2.state::<AppState>();
+        let deps = read_manifest(&profile_dir(&dsh_home()))
+            .map(|m| dep_keys(&m))
+            .unwrap_or_default();
+        if !deps.contains(&name) {
+            return Err("未安装该插件。".into());
+        }
         run_exclusive_mutation(&app2, &state, "plugin remove", move || {
             remove_impl(&node, &runtime, &name, &registry_source)
         })
@@ -516,8 +540,11 @@ pub async fn plugins_remove_incompatible(
     let app2 = app.clone();
     tauri::async_runtime::spawn_blocking(move || {
         let state = app2.state::<AppState>();
+        let targets = removable_plugin_names(&names);
+        if targets.is_empty() {
+            return Ok(Vec::new());
+        }
         run_exclusive_mutation(&app2, &state, "plugin remove-incompatible", move || {
-            let targets = removable_plugin_names(&names);
             let mut removed: Vec<String> = Vec::new();
             for name in &targets {
                 match remove_impl(&node, &runtime, name, &registry_source) {

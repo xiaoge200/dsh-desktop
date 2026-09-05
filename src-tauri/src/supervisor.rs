@@ -379,6 +379,7 @@ impl Supervisor {
 
         *self.child.lock().unwrap() = Some(child);
         self.port.store(port as u32, Ordering::SeqCst);
+        *self.degraded.lock().unwrap() = false;
         log::info!("service spawning on 127.0.0.1:{port}");
         Ok(port)
     }
@@ -571,6 +572,12 @@ impl Supervisor {
                 continue;
             }
             let cmd: Vec<String> = proc_.cmd().iter().map(|a| a.to_string_lossy().to_string()).collect();
+            if cmd
+                .iter()
+                .any(|a| a.to_lowercase().contains("install-dsh.mjs"))
+            {
+                continue;
+            }
             if !cmd_matches_markers(&cmd, &markers) {
                 continue;
             }

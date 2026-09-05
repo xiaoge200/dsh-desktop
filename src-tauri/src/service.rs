@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{mpsc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use crate::state::{AppState, BootPhase, RecoveryInfo};
@@ -16,6 +16,44 @@ const HEALTH_REAP_EVERY: u32 = 15;
 pub(crate) static OPS_LOCK: Mutex<()> = Mutex::new(());
 pub(crate) static OPS_ACTIVE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
+static UI_SYNC_PENDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static UI_SYNC_TX: Mutex<Option<mpsc::Sender<()>>> = Mutex::new(None);
+
+// 启动一个持有 AppHandle 的 UI 协调线程：所有状态变更（phase/port/error/
+// 互斥操作）只发信号，由它统一刷新托盘 tooltip 与重启菜单项——单一出口，
+// 避免各调用点手工同步不一致（tauri 句柄不可放入 static/托管状态，见记忆）。
+pub(crate) fn start_ui_sync(app: AppHandle) {
+    let (tx, rx) = mpsc::channel::<()>();
+    *UI_SYNC_TX.lock().unwrap_or_else(|e| e.into_inner()) = Some(tx);
+    std::thread::spawn(move || loop {
+        if rx.recv().is_err() {
+            return;
+        }
+        loop {
+            match rx.try_recv() {
+                Ok(()) => continue,
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => return,
+            }
+        }
+        UI_SYNC_PENDING.store(false, Ordering::SeqCst);
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            update_tray_tooltip(&app);
+        }));
+    });
+}
+
+pub(crate) fn request_ui_sync() {
+    UI_SYNC_PENDING.store(true, Ordering::SeqCst);
+    if let Some(tx) = UI_SYNC_TX.lock().unwrap_or_else(|e| e.into_inner()).clone() {
+        let _ = tx.send(());
+    }
+}
+
+pub(crate) fn notify_service_ui() {
+    request_ui_sync();
+}
+
 pub(crate) struct OpGuard {
     _lock: MutexGuard<'static, ()>,
 }
@@ -23,12 +61,14 @@ pub(crate) struct OpGuard {
 impl Drop for OpGuard {
     fn drop(&mut self) {
         OPS_ACTIVE.fetch_sub(1, Ordering::SeqCst);
+        request_ui_sync();
     }
 }
 
 pub(crate) fn ops_guard() -> OpGuard {
     let lock = OPS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     OPS_ACTIVE.fetch_add(1, Ordering::SeqCst);
+    request_ui_sync();
     OpGuard { _lock: lock }
 }
 
@@ -142,6 +182,27 @@ pub(crate) fn run_exclusive_mutation<T>(
     op_label: &str,
     op: impl FnOnce() -> Result<T, String>,
 ) -> Result<T, String> {
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        mutation_inner(app, state, op_label, op)
+    }));
+    match outcome {
+        Ok(r) => r,
+        Err(_) => {
+            log::error!("{op_label}: panicked during exclusive mutation");
+            state.supervisor.lock().unwrap().ensure_stopped();
+            state.set_error("服务操作异常中断，请重试。");
+            update_tray_tooltip(app);
+            Err("服务操作异常中断，请重试。".into())
+        }
+    }
+}
+
+fn mutation_inner<T>(
+    app: &AppHandle,
+    state: &AppState,
+    op_label: &str,
+    op: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
     let guard = ops_guard();
     log::info!("{op_label}: exclusive mutation starts (service will be stopped)");
     state.set_phase(BootPhase::ServiceStart);
@@ -169,8 +230,8 @@ pub(crate) fn run_exclusive_mutation<T>(
             wait_service_url(state, Duration::from_secs(2));
             state.set_phase(BootPhase::Ready);
             state.clear_error();
+            plugins::record_restart_force(state);
             drop(guard);
-            plugins::record_restart(state);
             update_tray_tooltip(app);
             refresh_main_after_restart(app, state);
         }
@@ -198,22 +259,29 @@ pub(crate) fn menu_restart(app: &AppHandle, tag: &'static str) {
         if state.runtime_dir().as_os_str().is_empty() {
             return;
         }
-        let _guard = ops_guard();
-        update_tray_tooltip(&app);
-        match restart_with_heal(&app, &state, tag, true) {
-            Ok(()) => refresh_main_after_restart(&app, &state),
-            Err(issue) => {
-                log::warn!(
-                    "{tag} restart failed ({}): {}",
-                    issue.kind.kind_str(),
-                    issue.detail
-                );
-                if !issue.spawn_error {
-                    fail_to_boot_page(&app, &state, &issue, crash_message(&issue.kind));
+        let outcome = {
+            let _guard = ops_guard();
+            update_tray_tooltip(&app);
+            match restart_with_heal(&app, &state, tag, true) {
+                Ok(()) => {
+                    refresh_main_after_restart(&app, &state);
+                    Ok(())
+                }
+                Err(issue) => {
+                    log::warn!(
+                        "{tag} restart failed ({}): {}",
+                        issue.kind.kind_str(),
+                        issue.detail
+                    );
+                    if !issue.spawn_error {
+                        fail_to_boot_page(&app, &state, &issue, crash_message(&issue.kind));
+                    }
+                    Err(())
                 }
             }
-        }
+        };
         update_tray_tooltip(&app);
+        let _ = outcome;
     });
 }
 
@@ -476,16 +544,20 @@ pub(crate) fn spawn_service_watch(app: &AppHandle) {
                 continue;
             }
             log::info!("external takeover on port {}; re-claiming", state.port());
-            let _guard = ops_guard();
+            let outcome = {
+                let _guard = ops_guard();
+                update_tray_tooltip(&app);
+                restart_with_heal(&app, &state, "auto-recover", false)
+            };
             update_tray_tooltip(&app);
-            match restart_with_heal(&app, &state, "auto-recover", false) {
+            match outcome {
                 Ok(()) => {
                     state.service_watch_active.store(false, Ordering::SeqCst);
                     refresh_main_after_restart(&app, &state);
-                    update_tray_tooltip(&app);
                     return;
                 }
                 Err(issue2) => {
+                    state.supervisor.lock().unwrap().ensure_stopped();
                     fail_watch(&app, &state, &issue2, crash_message(&issue2.kind));
                     return;
                 }
@@ -671,16 +743,17 @@ pub(crate) fn restart_dsh_service(
     runtime: &Path,
     workspace: &Path,
     extra: &[String],
-) {
+) -> Result<(), BootIssue> {
     let dsh_bin = node::dsh_bin(runtime);
     let preferred = preferred_port(state);
-    match start_service_with_heal(app, state, node, &dsh_bin, workspace, preferred, extra, true) {
+    let result = match start_service_with_heal(app, state, node, &dsh_bin, workspace, preferred, extra, true) {
         Ok(()) => {
             wait_service_url(state, Duration::from_secs(2));
             state.set_phase(BootPhase::Ready);
             state.clear_error();
             log::info!("service restarted after dsh update");
             refresh_main_after_restart(app, state);
+            Ok(())
         }
         Err(issue) => {
             state.set_error("更新后服务没有正常启动，请稍后再试。");
@@ -689,9 +762,11 @@ pub(crate) fn restart_dsh_service(
                 issue.kind.kind_str(),
                 issue.detail
             );
+            Err(issue)
         }
-    }
+    };
     update_tray_tooltip(app);
+    result
 }
 
 #[tauri::command]
@@ -794,12 +869,11 @@ pub(crate) async fn repair_service(app: AppHandle, state: State<'_, AppState>) -
             }
             Err(issue) => {
                 if issue.spawn_error {
-                    state.set_error(issue.detail.clone());
-                    update_tray_tooltip(&app2);
+                    fail_to_boot_page(&app2, &state, &issue, &issue.detail);
                     return Err(issue.detail);
                 }
-                state.set_error("修复后服务没有正常启动，请稍后再试。");
-                update_tray_tooltip(&app2);
+                let text = "修复后服务没有正常启动，请稍后再试。";
+                fail_to_boot_page(&app2, &state, &issue, text);
                 log::warn!(
                     "repair_service start failed ({}): {}",
                     issue.kind.kind_str(),

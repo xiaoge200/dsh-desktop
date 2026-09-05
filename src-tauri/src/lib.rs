@@ -203,6 +203,7 @@ fn boot(app: AppHandle) {
     state.clear_recovery();
     state.set_pending_auth_url(None);
     state.set_phase(BootPhase::NodeCheck);
+    update_tray_tooltip(&app);
     emit_progress(&app, BootPhase::NodeCheck, phase_text(BootPhase::NodeCheck));
     let resource_dir = match app.path().resource_dir() {
         Ok(d) => d,
@@ -402,12 +403,15 @@ fn spawn_ensure_default_plugin(app: &AppHandle) {
     let app = app.clone();
     std::thread::spawn(move || {
         let _guard = crate::service::ops_guard();
+        update_tray_tooltip(&app);
         let state = app.state::<AppState>();
         let node = state.node_path();
         let runtime = state.runtime_dir();
         let app_data = state.app_data_dir();
         let registry = state.config.lock().unwrap().get().registry_source;
         plugins::ensure_default_plugin(&node, &runtime, &app_data, &registry);
+        drop(_guard);
+        update_tray_tooltip(&app);
     });
 }
 
@@ -500,7 +504,11 @@ fn build_tray_menu(app: &AppHandle, restart_allowed: bool) -> tauri::Result<taur
 
 fn build_tray(app: &AppHandle) -> tauri::Result<()> {
     use tauri::tray::TrayIconBuilder;
-    let menu = build_tray_menu(app, true)?;
+    let initial_allowed = {
+        let state = app.state::<AppState>();
+        crate::service::restart_action_allowed(&state)
+    };
+    let menu = build_tray_menu(app, initial_allowed)?;
     let _tray = TrayIconBuilder::with_id("main-tray")
         .icon(app.default_window_icon().unwrap().clone())
         .menu(&menu)
@@ -673,6 +681,7 @@ pub fn run() {
             }
 
             build_tray(app.handle())?;
+            crate::service::start_ui_sync(app.handle().clone());
 
             let app_handle = app.handle().clone();
             std::thread::spawn(move || {

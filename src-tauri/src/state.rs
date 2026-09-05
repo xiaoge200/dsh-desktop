@@ -59,7 +59,11 @@ pub struct DshUpdateStatus {
 
 impl AppState {
     pub fn set_phase(&self, phase: BootPhase) {
+        if self.phase() == phase {
+            return;
+        }
         self.phase.store(phase as u8, Ordering::SeqCst);
+        crate::service::notify_service_ui();
     }
 
     pub fn phase(&self) -> BootPhase {
@@ -82,11 +86,16 @@ impl AppState {
     }
 
     pub fn clear_error(&self) {
-        *self.error_message.lock().unwrap() = None;
+        let changed = self.error_message.lock().unwrap().take().is_some();
+        if changed {
+            crate::service::notify_service_ui();
+        }
     }
 
     pub fn set_port(&self, port: u16) {
-        self.port.store(port, Ordering::SeqCst);
+        if self.port.swap(port, Ordering::SeqCst) != port {
+            crate::service::notify_service_ui();
+        }
     }
 
     pub fn port(&self) -> u16 {

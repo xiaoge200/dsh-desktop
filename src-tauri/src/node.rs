@@ -138,6 +138,8 @@ fn registry_args(source: &str) -> Vec<String> {
     }
 }
 
+const INSTALLER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(45 * 60);
+
 fn run_installer(node: &Path, installer_js: &Path, args: &[String]) -> Result<String, String> {
     let mut full_args: Vec<String> = vec![normalize_for_node(installer_js).to_string_lossy().to_string()];
     full_args.extend(args.iter().cloned());
@@ -171,7 +173,26 @@ fn run_installer(node: &Path, installer_js: &Path, args: &[String]) -> Result<St
             let _ = (&mut &err_r).read_to_string(&mut buf);
             buf
         });
-        let status = child.wait().map_err(|e| format!("installer wait failed: {e}"))?;
+        let deadline = std::time::Instant::now() + INSTALLER_TIMEOUT;
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(st)) => break st,
+                Ok(None) if std::time::Instant::now() >= deadline => {
+                    log::warn!("installer timed out; killing pid={}", child.id());
+                    use std::os::windows::process::CommandExt;
+                    let _ = std::process::Command::new("taskkill")
+                        .args(["/PID", &child.id().to_string(), "/T", "/F"])
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null())
+                        .creation_flags(0x0800_0000)
+                        .status();
+                    let _ = child.wait();
+                    return Err("安装器超时（可能被占用或卡住），已终止。请稍后重试。".into());
+                }
+                Err(e) => return Err(format!("installer wait failed: {e}")),
+                _ => std::thread::sleep(std::time::Duration::from_millis(500)),
+            }
+        };
         (
             status.success(),
             t_out.join().unwrap_or_default(),

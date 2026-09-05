@@ -285,3 +285,18 @@ test("retriable 仅认 EPERM/EBUSY/ENOTEMPTY/EACCES", () => {
   assert.ok(!retriable(null));
   assert.ok(!retriable(new Error("plain")));
 });
+
+test("replaceDir keepOld 保留 .old 供 smoke 后回滚", async () => {
+  const root = scratch("replace-keepold");
+  const target = join(root, "runtime");
+  const stage = join(root, "stage");
+  dirMark(target, "old");
+  dirMark(stage, "new");
+
+  await replaceDir(target, stage, true);
+
+  assert.equal(readFileSync(join(target, "mark.txt"), "utf8"), "new");
+  assert.ok(existsSync(target + ".old"), ".old 应保留");
+  assert.equal(readFileSync(join(target + ".old", "mark.txt"), "utf8"), "old");
+  rmSync(root, { recursive: true, force: true });
+});

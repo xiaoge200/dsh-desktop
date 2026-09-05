@@ -54,6 +54,7 @@ pub(crate) struct ServiceState {
     service_running: bool,
     phase: BootPhase,
     error: Option<String>,
+    op_busy: bool,
 }
 
 #[tauri::command]
@@ -67,6 +68,7 @@ pub(crate) async fn get_service_state(app: AppHandle) -> ServiceState {
             service_running: port > 0 && state.service_health(),
             phase: state.phase(),
             error: state.error(),
+            op_busy: crate::service::ops_active() > 0,
         }
     })
     .await
@@ -77,6 +79,7 @@ pub(crate) async fn get_service_state(app: AppHandle) -> ServiceState {
             service_running: false,
             phase: BootPhase::Error,
             error: Some("状态读取失败".into()),
+            op_busy: false,
         }
     })
 }

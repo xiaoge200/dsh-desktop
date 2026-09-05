@@ -19,6 +19,7 @@ interface ServiceState {
   service_running: boolean;
   phase: string;
   error: string | null;
+  op_busy?: boolean;
 }
 
 interface SettingsData extends ServiceState {
@@ -76,6 +77,7 @@ const els = {
 let configCache: AppConfig | null = null;
 let lastService: ServiceState | null = null;
 let restartBusy = false;
+let transitionSince: number | null = null;
 
 function setRowText(el: HTMLElement, text: string) {
   el.textContent = text;
@@ -276,13 +278,31 @@ function renderRestartButton(s: ServiceState) {
   const booting = s.phase === "node-check" || s.phase === "dsh-install";
   const starting = s.phase === "service-start";
   const transitioning = !s.service_running && s.phase !== "error" && s.port > 0;
+  const queued = s.op_busy && s.service_running;
   if (booting) {
+    transitionSince = null;
     els.restartBtn.disabled = true;
     els.restartBtn.textContent = T("正在启动…");
-  } else if (starting || transitioning) {
+  } else if (starting) {
+    transitionSince = null;
+    els.restartBtn.disabled = true;
+    els.restartBtn.textContent = T("正在重启…");
+  } else if (transitioning) {
+    if (transitionSince === null) transitionSince = Date.now();
+    const stuck = s.phase === "ready" && Date.now() - transitionSince > 12000;
+    if (stuck) {
+      els.restartBtn.disabled = false;
+      els.restartBtn.textContent = T("已停止");
+    } else {
+      els.restartBtn.disabled = true;
+      els.restartBtn.textContent = T("正在重启…");
+    }
+  } else if (queued) {
+    transitionSince = null;
     els.restartBtn.disabled = true;
     els.restartBtn.textContent = T("正在重启…");
   } else {
+    transitionSince = null;
     els.restartBtn.disabled = false;
     els.restartBtn.textContent = T("重启服务");
   }

@@ -209,7 +209,8 @@ function lockedHint() {
 }
 
 // 安全替换：旧版先改名让位（完整保留），新版就位后删除旧版；失败回滚，绝不先删旧版。
-async function replaceDir(target, stage) {
+// keepOld=true 时新版就位后保留 .old（调用方 smoke 通过后再删或回滚）。
+async function replaceDir(target, stage, keepOld = false) {
   const oldDir = target + ".old";
   if (existsSync(oldDir)) {
     if (!existsSync(target)) {
@@ -273,10 +274,12 @@ async function replaceDir(target, stage) {
       { kind: "install", userMessage: `新版本替换失败，已恢复原版本：${lockedHint()}` }
     );
   }
-  try {
-    rmSync(oldDir, { recursive: true, force: true });
-  } catch (e) {
-    log("old runtime kept at " + oldDir + ": " + (e.message ?? e));
+  if (!keepOld) {
+    try {
+      rmSync(oldDir, { recursive: true, force: true });
+    } catch (e) {
+      log("old runtime kept at " + oldDir + ": " + (e.message ?? e));
+    }
   }
 }
 
@@ -295,9 +298,9 @@ function cleanRuntimeLeftovers(target) {
   }
 }
 
-async function swapStaging(target, stage) {
+async function swapStaging(target, stage, keepOld = false) {
   await cleanRuntimeLeftovers(target);
-  await replaceDir(target, stage);
+  await replaceDir(target, stage, keepOld);
 }
 
 
@@ -584,7 +587,7 @@ async function main() {
         process.exit(1);
       }
       try {
-        await swapStaging(opts.target, opts.staging);
+        await swapStaging(opts.target, opts.staging, true);
       } catch (e) {
         out({
           ok: false,
@@ -596,13 +599,36 @@ async function main() {
         });
         process.exit(1);
       }
-      
+
       let smoke;
       try {
         smoke = smokeTest(opts.target);
       } catch (e) {
-        out({ ok: false, error: { kind: "integrity", message: "替换后文件不完整，请重新安装。", detail: String(e.message ?? e) } });
+        const oldDir = opts.target + ".old";
+        let restored = false;
+        try {
+          rmSync(opts.target, { recursive: true, force: true });
+          renameSync(oldDir, opts.target);
+          restored = true;
+        } catch (e2) {
+          log("rollback after smoke failure failed: " + (e2.message ?? e2));
+        }
+        out({
+          ok: false,
+          error: {
+            kind: "integrity",
+            message: restored
+              ? "新版本文件不完整，已恢复原版本，请稍后重试。"
+              : `新版本文件不完整且回滚失败，旧版本保留在 ${oldDir}。`,
+            detail: String(e.message ?? e),
+          },
+        });
         process.exit(1);
+      }
+      try {
+        rmSync(opts.target + ".old", { recursive: true, force: true });
+      } catch (e) {
+        log("old runtime kept at " + (opts.target + ".old") + ": " + (e.message ?? e));
       }
       const version = readVersion(opts.target);
       writeInstalled(opts.target, {
