@@ -1,9 +1,9 @@
 [[permission]]
 identifier = "allow-restart-service"
 description = "Allows the restart_service command (used by the in-page restart shim on the DSH origin)"
-commands = ["restart_service"]
+commands = { allow = ["restart_service"] }
 
 [[permission]]
 identifier = "allow-open-context-menu"
 description = "Allows the open_context_menu command (injected context menu on the DSH origin)"
-commands = ["open_context_menu"]
+commands = { allow = ["open_context_menu"] }
