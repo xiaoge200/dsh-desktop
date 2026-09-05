@@ -117,7 +117,7 @@
 - [ ] **FR-08 壳更新完整实测**：端点就绪后走一遍完整更新
 - [x] **O2 鉴权确认**：dsh web 自 0.1.2-alpha.5 起启用 URL token 鉴权（需先访问
   打印的 `/?token=` URL 兑换会话 Cookie）；桌面端已适配——管道捕获服务输出的
-  鉴权 URL 并以其导航（见 CHANGELOG 0.1.4-alpha.1）
+  鉴权 URL 并以其导航（见 CHANGELOG 0.1.4）
 
 ## C. 需真实用户/时间
 
