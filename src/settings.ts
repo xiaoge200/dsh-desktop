@@ -14,14 +14,17 @@ function applyStaticI18n() {
 }
 applyStaticI18n();
 
-interface SettingsData {
-  app_version: string;
-  node_version: string | null;
-  dsh_version: string | null;
+interface ServiceState {
   port: number;
   service_running: boolean;
   phase: string;
   error: string | null;
+}
+
+interface SettingsData extends ServiceState {
+  app_version: string;
+  node_version: string | null;
+  dsh_version: string | null;
   workspace_dir: string;
   log_file: string;
   autostart_enabled: boolean;
@@ -250,7 +253,7 @@ async function doApplyAppUpdate() {
   }
 }
 
-function serviceStateText(s: SettingsData): string {
+function serviceStateText(s: ServiceState): string {
   if (s.service_running) {
     return lang === "zh" ? `运行中（端口 ${s.port}）` : `Running (port ${s.port})`;
   }
@@ -260,7 +263,7 @@ function serviceStateText(s: SettingsData): string {
   if (s.phase === "error") {
     return s.error ?? T("启动失败");
   }
-  return s.port > 0 ? T("已停止") : T("未启动");
+  return s.port > 0 ? T("正在重启…") : T("未启动");
 }
 
 async function loadSettings() {
@@ -300,11 +303,28 @@ async function refreshSettings() {
   }
 }
 
+async function refreshServiceState() {
+  try {
+    const s = await invoke<ServiceState>("get_service_state");
+    setRowText(els.serviceState, serviceStateText(s));
+  } catch (e) {
+    console.error("service state poll failed", e);
+  }
+}
+
+function startServiceStatePoll() {
+  setInterval(() => {
+    if (document.visibilityState === "hidden") return;
+    refreshServiceState();
+  }, 1000);
+}
+
 async function bindRefreshEvents() {
 
   await listen("settings://refresh", refreshSettings);
   await listen("boot://progress", refreshSettings);
   await listen("boot://ready", refreshSettings);
+  await listen("boot://error-options", refreshSettings);
 }
 
 function bind() {
@@ -365,6 +385,7 @@ function bind() {
     } catch (e) {
       alert(lang === "zh" ? "重启服务失败，请查看日志。" : "Failed to restart the service. Check the logs.");
       console.error("restart failed", e);
+      await refreshSettings();
     } finally {
       els.restartBtn.disabled = false;
       els.restartBtn.textContent = T("重启服务");
@@ -397,3 +418,4 @@ function bind() {
 bind();
 loadSettings();
 bindRefreshEvents();
+startServiceStatePoll();

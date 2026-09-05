@@ -1,10 +1,15 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::state::{AppState, BootPhase, RecoveryInfo};
 use crate::{emit_progress, is_zh_locale, node, plugins, serviceout, update_tray_tooltip};
 use tauri::{AppHandle, Emitter, Manager, State};
+
+const EXIT_TAIL_DRAIN: Duration = Duration::from_millis(500);
+const PROBE_TICK: Duration = Duration::from_millis(500);
+const PROBE_WINDOW: Duration = Duration::from_secs(20);
+const HEALTH_REAP_EVERY: u32 = 15;
 
 fn refresh_main_after_restart(app: &AppHandle, state: &AppState) {
     let url = service_url(state);
@@ -40,40 +45,54 @@ fn bare_service_url(url: &str) -> String {
     }
 }
 
+fn restart_with_heal(
+    app: &AppHandle,
+    state: &AppState,
+    tag: &'static str,
+) -> Result<(), BootIssue> {
+    let runtime_dir = state.runtime_dir();
+    let dsh_bin = node::dsh_bin(&runtime_dir);
+    let extra = state.dsh_extra_args.lock().unwrap().clone();
+    let preferred = preferred_port(state);
+    match start_service_with_heal(
+        app,
+        state,
+        &state.node_path(),
+        &dsh_bin,
+        &state.workspace_dir(),
+        preferred,
+        &extra,
+        false,
+    ) {
+        Ok(()) => {
+            wait_service_url(state, Duration::from_secs(2));
+            state.set_phase(BootPhase::Ready);
+            state.clear_error();
+            log::info!("{tag} restart ready: {}", service_url(state));
+            Ok(())
+        }
+        Err(issue) => Err(issue),
+    }
+}
+
 pub(crate) fn menu_restart(app: &AppHandle, tag: &'static str) {
     let app = app.clone();
     std::thread::spawn(move || {
         let state = app.state::<AppState>();
-        let runtime_dir = state.runtime_dir();
-        if runtime_dir.as_os_str().is_empty() {
+        if state.runtime_dir().as_os_str().is_empty() {
             return;
         }
-        let dsh_bin = node::dsh_bin(&runtime_dir);
-        let extra = state.dsh_extra_args.lock().unwrap().clone();
-        let preferred = preferred_port(&state);
-        match start_service_with_heal(
-            &app,
-            &state,
-            &state.node_path(),
-            &dsh_bin,
-            &state.workspace_dir(),
-            preferred,
-            &extra,
-            false,
-        ) {
-            Ok(()) => {
-                wait_service_url(&state, Duration::from_secs(2));
-                state.set_phase(BootPhase::Ready);
-                state.clear_error();
-                log::info!("{tag} restart ready: {}", service_url(&state));
-                refresh_main_after_restart(&app, &state);
-            }
+        match restart_with_heal(&app, &state, tag) {
+            Ok(()) => refresh_main_after_restart(&app, &state),
             Err(issue) => {
                 log::warn!(
                     "{tag} restart failed ({}): {}",
                     issue.kind.kind_str(),
                     issue.detail
                 );
+                if !issue.spawn_error {
+                    fail_to_boot_page(&app, &state, &issue, crash_message(&issue.kind));
+                }
             }
         }
     });
@@ -183,6 +202,78 @@ pub(crate) fn emit_error_options(app: &AppHandle, state: &AppState, issue: &Boot
     );
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProbeDecision {
+    BackToWatch,
+    Takeover,
+    TimedOut,
+    KeepProbing,
+}
+
+fn probe_decision(child_alive: bool, port_healthy: bool, elapsed: Duration, window: Duration) -> ProbeDecision {
+    if child_alive {
+        return ProbeDecision::BackToWatch;
+    }
+    if port_healthy {
+        return ProbeDecision::Takeover;
+    }
+    if elapsed >= window {
+        return ProbeDecision::TimedOut;
+    }
+    ProbeDecision::KeepProbing
+}
+
+fn crash_message(kind: &serviceout::FailureKind) -> &'static str {
+    match kind {
+        serviceout::FailureKind::PluginTree => {
+            "服务因插件不兼容意外停止，请移除不兼容插件后重试。"
+        }
+        serviceout::FailureKind::StaleLock { .. } => {
+            "服务意外停止（残留锁文件可能仍在阻止启动），请重试。"
+        }
+        serviceout::FailureKind::Unknown => "服务意外停止，请点击重试。",
+    }
+}
+
+fn navigate_main_to_boot(app: &AppHandle, state: &AppState) {
+    if let Some(w) = app.get_webview_window("main") {
+        let on_service = w
+            .url()
+            .ok()
+            .map(|u| u.host_str() == Some("127.0.0.1"))
+            .unwrap_or(false);
+        if on_service {
+            if let Some(bp) = state.boot_page_url() {
+                if let Ok(u) = bp.parse::<tauri::Url>() {
+                    log::info!("service down; main window -> boot page");
+                    let _ = w.navigate(u);
+                }
+            }
+        }
+    }
+}
+
+fn fail_to_boot_page(app: &AppHandle, state: &AppState, issue: &BootIssue, msg: &str) {
+    let _ = app.emit(
+        "boot://progress",
+        serde_json::json!({ "phase": BootPhase::Error, "message": msg }),
+    );
+    state.set_error(msg);
+    emit_error_options(app, state, issue);
+    log::warn!(
+        "service crashed after ready ({}): {}",
+        issue.kind.kind_str(),
+        issue.detail
+    );
+    navigate_main_to_boot(app, state);
+    update_tray_tooltip(app);
+}
+
+fn fail_watch(app: &AppHandle, state: &AppState, issue: &BootIssue, msg: &str) {
+    state.service_watch_active.store(false, Ordering::SeqCst);
+    fail_to_boot_page(app, state, issue, msg);
+}
+
 pub(crate) fn spawn_service_watch(app: &AppHandle) {
     let app = app.clone();
     std::thread::spawn(move || {
@@ -195,63 +286,155 @@ pub(crate) fn spawn_service_watch(app: &AppHandle) {
         }
         drop(guard_state);
         std::thread::sleep(Duration::from_secs(3));
+        let mut reap_tick: u32 = 0;
         loop {
+            reap_tick = reap_tick.wrapping_add(1);
             let state = app.state::<AppState>();
             if state.phase() != BootPhase::Ready {
                 state.service_watch_active.store(false, Ordering::SeqCst);
                 return;
             }
             let healthy = state.supervisor.lock().unwrap().health_check();
-            if healthy {
-                std::thread::sleep(Duration::from_secs(2));
-                continue;
-            }
-            let exited = state.supervisor.lock().unwrap().is_exited();
+            let exited = if healthy && reap_tick.is_multiple_of(HEALTH_REAP_EVERY) {
+                state.supervisor.lock().unwrap().is_exited()
+            } else if healthy {
+                false
+            } else {
+                state.supervisor.lock().unwrap().is_exited()
+            };
             if !exited {
                 std::thread::sleep(Duration::from_secs(2));
                 continue;
             }
+            std::thread::sleep(EXIT_TAIL_DRAIN);
             let issue = boot_issue(&state);
-            let msg = match &issue.kind {
-                serviceout::FailureKind::PluginTree => {
-                    "服务因插件不兼容意外停止，请移除不兼容插件后重试。"
-                }
-                serviceout::FailureKind::StaleLock { .. } => {
-                    "服务意外停止（残留锁文件可能仍在阻止启动），请重试。"
-                }
-                serviceout::FailureKind::Unknown => "服务意外停止，请点击重试。",
+            if issue.kind != serviceout::FailureKind::Unknown {
+                fail_watch(&app, &state, &issue, crash_message(&issue.kind));
+                return;
+            }
+            let zh = is_zh_locale();
+            let msg = if zh {
+                "服务正在自动恢复，请稍候…"
+            } else {
+                "Service stopped; recovering automatically…"
             };
-            state.service_watch_active.store(false, Ordering::SeqCst);
             let _ = app.emit(
                 "boot://progress",
-                serde_json::json!({ "phase": BootPhase::Error, "message": msg }),
+                serde_json::json!({ "phase": BootPhase::ServiceStart, "message": msg }),
             );
-            state.set_error(msg);
-            emit_error_options(&app, &state, &issue);
-            log::warn!(
-                "service crashed after ready ({}): {}",
-                issue.kind.kind_str(),
-                issue.detail
+            log::info!(
+                "service exited; probing for external takeover on 127.0.0.1:{}",
+                state.port()
             );
-            if let Some(w) = app.get_webview_window("main") {
-                let on_service = w
-                    .url()
-                    .ok()
-                    .map(|u| u.host_str() == Some("127.0.0.1"))
-                    .unwrap_or(false);
-                if on_service {
-                    if let Some(bp) = state.boot_page_url() {
-                        if let Ok(u) = bp.parse::<tauri::Url>() {
-                            log::info!("service crashed; main window -> boot page");
-                            let _ = w.navigate(u);
-                        }
+            let probe_start = Instant::now();
+            let mut taken_over = false;
+            loop {
+                let state = app.state::<AppState>();
+                if state.phase() != BootPhase::Ready {
+                    state.service_watch_active.store(false, Ordering::SeqCst);
+                    return;
+                }
+                let child_alive = !state.supervisor.lock().unwrap().is_exited();
+                let healthy = state.supervisor.lock().unwrap().health_check();
+                match probe_decision(child_alive, healthy, probe_start.elapsed(), PROBE_WINDOW) {
+                    ProbeDecision::KeepProbing => std::thread::sleep(PROBE_TICK),
+                    ProbeDecision::BackToWatch => break,
+                    ProbeDecision::Takeover => {
+                        taken_over = true;
+                        break;
+                    }
+                    ProbeDecision::TimedOut => {
+                        fail_watch(&app, &state, &issue, crash_message(&issue.kind));
+                        return;
                     }
                 }
             }
-            update_tray_tooltip(&app);
-            return;
+            if !taken_over {
+                continue;
+            }
+            let state = app.state::<AppState>();
+            if !state.supervisor.lock().unwrap().is_exited() {
+                continue;
+            }
+            log::info!("external takeover on port {}; re-claiming", state.port());
+            match restart_with_heal(&app, &state, "auto-recover") {
+                Ok(()) => {
+                    state.service_watch_active.store(false, Ordering::SeqCst);
+                    refresh_main_after_restart(&app, &state);
+                    return;
+                }
+                Err(issue2) => {
+                    fail_watch(&app, &state, &issue2, crash_message(&issue2.kind));
+                    return;
+                }
+            }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn probe_decision_child_alive_returns_to_watch() {
+        assert_eq!(
+            probe_decision(true, true, Duration::from_secs(1), PROBE_WINDOW),
+            ProbeDecision::BackToWatch
+        );
+        assert_eq!(
+            probe_decision(true, false, Duration::from_secs(30), PROBE_WINDOW),
+            ProbeDecision::BackToWatch
+        );
+    }
+
+    #[test]
+    fn probe_decision_child_dead_healthy_port_is_takeover() {
+        assert_eq!(
+            probe_decision(false, true, Duration::from_secs(1), PROBE_WINDOW),
+            ProbeDecision::Takeover
+        );
+        assert_eq!(
+            probe_decision(false, true, Duration::from_secs(30), PROBE_WINDOW),
+            ProbeDecision::Takeover
+        );
+    }
+
+    #[test]
+    fn probe_decision_keeps_probing_inside_window() {
+        assert_eq!(
+            probe_decision(false, false, Duration::from_secs(5), PROBE_WINDOW),
+            ProbeDecision::KeepProbing
+        );
+    }
+
+    #[test]
+    fn probe_decision_times_out_at_and_after_window() {
+        assert_eq!(
+            probe_decision(false, false, PROBE_WINDOW, PROBE_WINDOW),
+            ProbeDecision::TimedOut
+        );
+        assert_eq!(
+            probe_decision(false, false, Duration::from_secs(25), PROBE_WINDOW),
+            ProbeDecision::TimedOut
+        );
+    }
+
+    #[test]
+    fn crash_message_has_text_for_every_kind() {
+        let kinds = [
+            serviceout::FailureKind::PluginTree,
+            serviceout::FailureKind::StaleLock {
+                lock_path: Some("~/.dsh/x.lock".into()),
+            },
+            serviceout::FailureKind::Unknown,
+        ];
+        for kind in kinds {
+            let msg = crash_message(&kind);
+            assert!(!msg.is_empty());
+            assert_eq!(msg, crash_message(&kind));
+        }
+    }
 }
 
 fn is_safe_lock_path(path: &Path) -> bool {
@@ -388,7 +571,7 @@ pub(crate) async fn restart_service(app: AppHandle, state: State<'_, AppState>) 
     let app2 = app.clone();
     tauri::async_runtime::spawn_blocking(move || {
         let state = app2.state::<AppState>();
-        match start_service_with_heal(&app2, &state, &node, &dsh_bin, &workspace, preferred, &extra, false) {
+        match start_service_with_heal(&app2, &state, &node, &dsh_bin, &workspace, preferred, &extra, true) {
             Ok(()) => {
                 wait_service_url(&state, Duration::from_secs(2));
                 state.set_phase(BootPhase::Ready);
@@ -399,6 +582,10 @@ pub(crate) async fn restart_service(app: AppHandle, state: State<'_, AppState>) 
             }
             Err(issue) => {
                 if issue.spawn_error {
+                    state.set_error(issue.detail.clone());
+                    emit_error_options(&app2, &state, &issue);
+                    navigate_main_to_boot(&app2, &state);
+                    update_tray_tooltip(&app2);
                     return Err(issue.detail);
                 }
                 let zh = is_zh_locale();
@@ -426,6 +613,9 @@ pub(crate) async fn restart_service(app: AppHandle, state: State<'_, AppState>) 
                     }
                 };
                 state.set_error(text);
+                emit_error_options(&app2, &state, &issue);
+                navigate_main_to_boot(&app2, &state);
+                update_tray_tooltip(&app2);
                 log::warn!(
                     "restart_service failed ({}): {}",
                     issue.kind.kind_str(),

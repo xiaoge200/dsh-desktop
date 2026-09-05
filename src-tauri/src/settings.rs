@@ -44,6 +44,25 @@ pub(crate) fn get_settings(app: AppHandle, state: State<'_, AppState>) -> Result
     })
 }
 
+#[derive(serde::Serialize)]
+pub(crate) struct ServiceState {
+    port: u16,
+    service_running: bool,
+    phase: BootPhase,
+    error: Option<String>,
+}
+
+#[tauri::command]
+pub(crate) fn get_service_state(state: State<'_, AppState>) -> ServiceState {
+    let port = state.port();
+    ServiceState {
+        port,
+        service_running: port > 0 && state.supervisor.lock().unwrap().health_check(),
+        phase: state.phase(),
+        error: state.error(),
+    }
+}
+
 #[tauri::command]
 pub(crate) fn set_autostart(app: AppHandle, enabled: bool) -> Result<(), String> {
     use tauri_plugin_autostart::ManagerExt;

@@ -24,7 +24,8 @@ use service::{
     service_url, spawn_service_watch, start_service_with_heal, wait_service_url,
 };
 use settings::{
-    get_config, get_settings, open_log_dir, open_workspace_dir, set_autostart, set_config,
+    get_config, get_service_state, get_settings, open_log_dir, open_workspace_dir, set_autostart,
+    set_config,
 };
 use state::{AppState, BootPhase, StatusSnapshot};
 use supervisor::Supervisor;
@@ -507,6 +508,9 @@ fn handle_page_load(
                 if let Err(e) = webview.eval(include_str!("../assets/notify-shim.js")) {
                     log::warn!("notify shim eval failed: {e}");
                 }
+                if let Err(e) = webview.eval(include_str!("../assets/restart-shim.js")) {
+                    log::warn!("restart shim eval failed: {e}");
+                }
             }
             if payload.url().query().is_none() {
                 let app = webview.app_handle();
@@ -627,6 +631,7 @@ pub fn run() {
             restart_service,
             repair_service,
             get_settings,
+            get_service_state,
             set_autostart,
             open_log_dir,
             open_workspace_dir,
