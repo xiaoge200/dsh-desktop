@@ -15,12 +15,22 @@ if (!next || !/^\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?$/.test(next)) {
 }
 const semverOk = (s) => /^\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?$/.test(s);
 
+// 版本需要同时写入 Cargo.toml 与 tauri.conf.json（tauri CLI/bundler/updater 从
+// conf 读取，运行时 pkg.version 缺省回退 Cargo），package.json 侧无消费仅同步。
 const cargoPath = join(root, "src-tauri", "Cargo.toml");
 let cargo = readFileSync(cargoPath, "utf8");
 const cur = cargo.match(/^version = "([^"]+)"/m)?.[1];
 if (!cur) throw new Error("Cargo.toml 缺少 version");
 cargo = cargo.replace(/^version = "([^"]+)"/m, `version = "${next}"`);
 writeFileSync(cargoPath, cargo);
+
+const confPath = join(root, "src-tauri", "tauri.conf.json");
+let conf = readFileSync(confPath, "utf8");
+if (!/^\s*"version": "([^"]+)",/m.test(conf)) {
+  throw new Error("tauri.conf.json 缺少 version 字段（bundler/updater 需要它）");
+}
+conf = conf.replace(/^(\s*)"version": "[^"]+",/m, `$1"version": "${next}",`);
+writeFileSync(confPath, conf);
 
 for (const rel of ["package.json", "package-lock.json"]) {
   const p = join(root, rel);

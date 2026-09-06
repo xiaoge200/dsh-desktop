@@ -12,7 +12,8 @@
     "opener:default",
     "autostart:allow-enable",
     "autostart:allow-disable",
-    "autostart:allow-is-enabled"
+    "autostart:allow-is-enabled",
+    "main-local-commands"
   ],
   "remote": {
     "urls": ["http://127.0.0.1:*"],

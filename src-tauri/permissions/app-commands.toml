@@ -1,9 +1,159 @@
+# dsh-desktop 应用命令权限。App ACL 一旦存在即严格模式：
+# 每个窗口（本地与 remote）都必须显式授权其调用的命令。
+
 [[permission]]
 identifier = "allow-restart-service"
-description = "Allows the restart_service command (used by the in-page restart shim on the DSH origin)"
+description = "Allows the restart_service command"
 commands = { allow = ["restart_service"] }
 
 [[permission]]
 identifier = "allow-open-context-menu"
-description = "Allows the open_context_menu command (injected context menu on the DSH origin)"
+description = "Allows the open_context_menu command"
 commands = { allow = ["open_context_menu"] }
+
+[[permission]]
+identifier = "allow-get-status"
+description = "Allows the get_status command"
+commands = { allow = ["get_status"] }
+
+[[permission]]
+identifier = "allow-repair-service"
+description = "Allows the repair_service command"
+commands = { allow = ["repair_service"] }
+
+[[permission]]
+identifier = "allow-open-settings"
+description = "Allows the open_settings command"
+commands = { allow = ["open_settings"] }
+
+[[permission]]
+identifier = "allow-plugins-remove-incompatible"
+description = "Allows the plugins_remove_incompatible command"
+commands = { allow = ["plugins_remove_incompatible"] }
+
+[[permission]]
+identifier = "allow-get-settings"
+description = "Allows the get_settings command"
+commands = { allow = ["get_settings"] }
+
+[[permission]]
+identifier = "allow-get-service-state"
+description = "Allows the get_service_state command"
+commands = { allow = ["get_service_state"] }
+
+[[permission]]
+identifier = "allow-set-autostart"
+description = "Allows the set_autostart command"
+commands = { allow = ["set_autostart"] }
+
+[[permission]]
+identifier = "allow-open-log-dir"
+description = "Allows the open_log_dir command"
+commands = { allow = ["open_log_dir"] }
+
+[[permission]]
+identifier = "allow-open-workspace-dir"
+description = "Allows the open_workspace_dir command"
+commands = { allow = ["open_workspace_dir"] }
+
+[[permission]]
+identifier = "allow-get-config"
+description = "Allows the get_config command"
+commands = { allow = ["get_config"] }
+
+[[permission]]
+identifier = "allow-set-config"
+description = "Allows the set_config command"
+commands = { allow = ["set_config"] }
+
+[[permission]]
+identifier = "allow-get-dsh-update-status"
+description = "Allows the get_dsh_update_status command"
+commands = { allow = ["get_dsh_update_status"] }
+
+[[permission]]
+identifier = "allow-check-dsh-update"
+description = "Allows the check_dsh_update command"
+commands = { allow = ["check_dsh_update"] }
+
+[[permission]]
+identifier = "allow-update-dsh"
+description = "Allows the update_dsh command"
+commands = { allow = ["update_dsh"] }
+
+[[permission]]
+identifier = "allow-get-app-update-status"
+description = "Allows the get_app_update_status command"
+commands = { allow = ["get_app_update_status"] }
+
+[[permission]]
+identifier = "allow-check-app-update"
+description = "Allows the check_app_update command"
+commands = { allow = ["check_app_update"] }
+
+[[permission]]
+identifier = "allow-update-app"
+description = "Allows the update_app command"
+commands = { allow = ["update_app"] }
+
+[[permission]]
+identifier = "allow-plugins-list"
+description = "Allows the plugins_list command"
+commands = { allow = ["plugins_list"] }
+
+[[permission]]
+identifier = "allow-plugins-add"
+description = "Allows the plugins_add command"
+commands = { allow = ["plugins_add"] }
+
+[[permission]]
+identifier = "allow-plugins-remove"
+description = "Allows the plugins_remove command"
+commands = { allow = ["plugins_remove"] }
+
+[[permission]]
+identifier = "allow-plugins-set-enabled"
+description = "Allows the plugins_set_enabled command"
+commands = { allow = ["plugins_set_enabled"] }
+
+[[permission]]
+identifier = "allow-plugins-marketplace"
+description = "Allows the plugins_marketplace command"
+commands = { allow = ["plugins_marketplace"] }
+
+[[set]]
+identifier = "main-local-commands"
+description = "Commands invoked by the boot page (local context of the main window)"
+permissions = [
+  "allow-get-status",
+  "allow-restart-service",
+  "allow-repair-service",
+  "allow-open-context-menu",
+  "allow-open-settings",
+  "allow-plugins-remove-incompatible",
+]
+
+[[set]]
+identifier = "settings-commands"
+description = "Commands invoked by the settings window"
+permissions = [
+  "allow-get-settings",
+  "allow-get-service-state",
+  "allow-set-autostart",
+  "allow-open-log-dir",
+  "allow-open-workspace-dir",
+  "allow-get-config",
+  "allow-set-config",
+  "allow-get-dsh-update-status",
+  "allow-check-dsh-update",
+  "allow-update-dsh",
+  "allow-get-app-update-status",
+  "allow-check-app-update",
+  "allow-update-app",
+  "allow-restart-service",
+  "allow-plugins-list",
+  "allow-plugins-add",
+  "allow-plugins-remove",
+  "allow-plugins-set-enabled",
+  "allow-plugins-marketplace",
+]

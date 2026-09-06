@@ -19,7 +19,7 @@ pub(crate) struct SettingsData {
 #[tauri::command]
 pub(crate) async fn get_settings(app: AppHandle) -> Result<SettingsData, String> {
     let app2 = app.clone();
-    tauri::async_runtime::spawn_blocking(move || {
+    let result = tauri::async_runtime::spawn_blocking(move || {
         use tauri_plugin_autostart::ManagerExt;
 
         let pkg = app2.package_info();
@@ -44,8 +44,18 @@ pub(crate) async fn get_settings(app: AppHandle) -> Result<SettingsData, String>
             autostart_enabled: autostart,
         })
     })
-    .await
-    .map_err(|e| format!("读取设置任务异常: {e}"))?
+    .await;
+    match result {
+        Ok(Ok(data)) => Ok(data),
+        Ok(Err(e)) => {
+            log::error!("get_settings failed: {e}");
+            Err(e)
+        }
+        Err(e) => {
+            log::error!("get_settings task panicked: {e}");
+            Err(format!("读取设置任务异常: {e}"))
+        }
+    }
 }
 
 #[derive(serde::Serialize)]
