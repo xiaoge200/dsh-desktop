@@ -48,6 +48,22 @@ interface DshUpdateStatus {
   message: string;
 }
 
+type RowKind = "dsh" | "app";
+
+interface UpdateStageState {
+  stage: string;
+  can_cancel: boolean;
+  received: number | null;
+  total: number | null;
+}
+
+interface UpdateProgressSnapshot {
+  dsh: UpdateStageState;
+  app: UpdateStageState;
+}
+
+const idleStage = (): UpdateStageState => ({ stage: "idle", can_cancel: false, received: null, total: null });
+
 const $ = <T extends HTMLElement = HTMLElement>(id: string) => document.querySelector(id) as T;
 
 const els = {
@@ -67,11 +83,9 @@ const els = {
   advancedSaveBtn: $("#advanced-save-btn") as HTMLButtonElement,
   advancedSaveState: $("#advanced-save-state"),
   updateState: $("#dsh-update-state"),
-  checkUpdateBtn: $("#check-update-btn") as HTMLButtonElement,
-  applyUpdateBtn: $("#apply-update-btn") as HTMLButtonElement,
+  dshUpdateBtn: $("#dsh-update-btn") as HTMLButtonElement,
   appUpdateState: $("#app-update-state"),
-  appCheckUpdateBtn: $("#app-check-update-btn") as HTMLButtonElement,
-  appApplyUpdateBtn: $("#app-apply-update-btn") as HTMLButtonElement,
+  appUpdateBtn: $("#app-update-btn") as HTMLButtonElement,
 };
 
 let configCache: AppConfig | null = null;
@@ -84,180 +98,189 @@ function setRowText(el: HTMLElement, text: string) {
 }
 
 let lastUpdateStatus: DshUpdateStatus | null = null;
-let updateBusy = false;
-
-function renderUpdateStatus() {
-  const st = lastUpdateStatus;
-  if (!st) {
-    setRowText(els.updateState, T("尚未检查更新"));
-    els.applyUpdateBtn.hidden = true;
-    return;
-  }
-
-  let msg = st.message;
-  if (st.pre_available && st.prerelease && !st.update_available) {
-
-    msg = lang === "zh"
-      ? `已是最新正式版；发现预发布版本 ${st.prerelease}（已开启预发布更新）`
-      : `Latest stable installed; prerelease ${st.prerelease} available (prerelease updates on)`;
-  } else if (st.prerelease && st.pre_available) {
-    msg = lang === "zh"
-      ? `${st.message}（预发布 ${st.prerelease}）`
-      : `${st.message} (prerelease ${st.prerelease})`;
-  }
-  if (!st.ok && !/占用/.test(msg)) {
-    msg = `${msg} ${T("文件占用提示")}`;
-  }
-  setRowText(els.updateState, msg);
-
-  els.applyUpdateBtn.hidden = !st.update_available || updateBusy;
-
-  const ver = st.current ?? st.latest ?? st.prerelease;
-  if (ver) setRowText(els.dshVersion, ver);
-}
-
-async function loadUpdateStatus() {
-  try {
-    lastUpdateStatus = await invoke<DshUpdateStatus | null>("get_dsh_update_status");
-  } catch (e) {
-    console.error("load update status failed", e);
-    lastUpdateStatus = null;
-  }
-  renderUpdateStatus();
-}
-
-async function doCheckUpdate() {
-  if (updateBusy) return;
-  updateBusy = true;
-  els.checkUpdateBtn.disabled = true;
-  els.checkUpdateBtn.textContent = T("检查中…");
-  setRowText(els.updateState, T("检查中…"));
-  try {
-    lastUpdateStatus = await invoke<DshUpdateStatus>("check_dsh_update");
-  } catch (e) {
-    console.error("check update failed", e);
-    lastUpdateStatus = {
-      ok: false,
-      update_available: false,
-      current: null,
-      latest: null,
-      prerelease: null,
-      pre_available: false,
-      message: lang === "zh" ? "检查更新失败，请查看日志。" : "Failed to check updates. See the logs.",
-    };
-  } finally {
-    updateBusy = false;
-    els.checkUpdateBtn.disabled = false;
-    els.checkUpdateBtn.textContent = T("检查更新");
-    renderUpdateStatus();
-  }
-}
-
-async function doApplyUpdate() {
-  if (updateBusy) return;
-  updateBusy = true;
-  els.applyUpdateBtn.disabled = true;
-  els.applyUpdateBtn.textContent = T("更新中…");
-  setRowText(els.updateState, T("正在更新，请稍候…"));
-  try {
-    lastUpdateStatus = await invoke<DshUpdateStatus>("update_dsh");
-  } catch (e) {
-    console.error("update failed", e);
-    lastUpdateStatus = {
-      ok: false,
-      update_available: false,
-      current: null,
-      latest: null,
-      prerelease: null,
-      pre_available: false,
-      message: lang === "zh" ? "更新失败，请查看日志。" : "Update failed. See the logs.",
-    };
-  } finally {
-    updateBusy = false;
-    els.applyUpdateBtn.disabled = false;
-    els.applyUpdateBtn.textContent = T("立即更新");
-    renderUpdateStatus();
-  }
-}
-
 let lastAppUpdateStatus: DshUpdateStatus | null = null;
-let appUpdateBusy = false;
+let lastProgress: UpdateProgressSnapshot = { dsh: idleStage(), app: idleStage() };
+const actionBusy: Record<RowKind, boolean> = { dsh: false, app: false };
 
-function renderAppUpdateStatus() {
-  const st = lastAppUpdateStatus;
-  if (!st) {
-    setRowText(els.appUpdateState, T("尚未检查更新"));
-    els.appApplyUpdateBtn.hidden = true;
+function rowStatus(kind: RowKind): DshUpdateStatus | null {
+  return kind === "dsh" ? lastUpdateStatus : lastAppUpdateStatus;
+}
+
+function rowEls(kind: RowKind): { btn: HTMLButtonElement; state: HTMLElement; version: HTMLElement } {
+  return kind === "dsh"
+    ? { btn: els.dshUpdateBtn, state: els.updateState, version: els.dshVersion }
+    : { btn: els.appUpdateBtn, state: els.appUpdateState, version: els.appVersion };
+}
+
+function percentText(p: UpdateStageState): string | null {
+  if (p.total && p.total > 0 && p.received !== null) {
+    return `(${Math.round((p.received / p.total) * 100)}%)`;
+  }
+  return null;
+}
+
+function busyText(p: UpdateStageState): string {
+  switch (p.stage) {
+    case "checking":
+      return T("检查中…");
+    case "downloading": {
+      const base = T("正在下载更新…");
+      const pct = percentText(p);
+      return pct ? `${base} ${pct}` : base;
+    }
+    case "swapping":
+      return T("正在应用更新…");
+    case "installing":
+      return T("正在安装更新…");
+    case "restarting":
+      return T("正在重启服务…");
+    default:
+      return "";
+  }
+}
+
+function idleMessage(kind: RowKind, st: DshUpdateStatus): string {
+  let msg = st.message;
+  if (kind === "dsh") {
+    if (st.pre_available && st.prerelease && !st.update_available) {
+      msg = lang === "zh"
+        ? `已是最新正式版；发现预发布版本 ${st.prerelease}（已开启预发布更新）`
+        : `Latest stable installed; prerelease ${st.prerelease} available (prerelease updates on)`;
+    } else if (st.prerelease && st.pre_available) {
+      msg = lang === "zh"
+        ? `${st.message}（预发布 ${st.prerelease}）`
+        : `${st.message} (prerelease ${st.prerelease})`;
+    }
+  }
+  return msg;
+}
+
+function renderRow(kind: RowKind) {
+  const { btn, state, version } = rowEls(kind);
+  const p = lastProgress[kind];
+  const st = rowStatus(kind);
+
+  if (p.stage !== "idle") {
+    btn.disabled = !(p.stage === "downloading" && p.can_cancel);
+    if (p.stage === "downloading") {
+      btn.textContent = p.can_cancel ? T("停止") : T("自动更新中…");
+    } else {
+      btn.textContent = busyText(p);
+    }
+    setRowText(state, busyText(p));
     return;
   }
-  setRowText(els.appUpdateState, st.message);
-  els.appApplyUpdateBtn.hidden = !st.update_available || appUpdateBusy;
-  const ver = st.current ?? st.latest;
-  if (ver) setRowText(els.appVersion, ver);
-}
 
-async function loadAppUpdateStatus() {
-  try {
-    lastAppUpdateStatus = await invoke<DshUpdateStatus | null>("get_app_update_status");
-  } catch (e) {
-    console.error("load app update status failed", e);
-    lastAppUpdateStatus = null;
+  btn.disabled = actionBusy[kind];
+  if (!st) {
+    btn.textContent = T("检查更新");
+    setRowText(state, T("尚未检查更新"));
+    return;
   }
-  renderAppUpdateStatus();
+  if (st.update_available) {
+    btn.textContent = T("立即更新");
+    const target = st.latest ?? st.prerelease;
+    if (target) setRowText(version, target);
+  } else {
+    btn.textContent = T("检查更新");
+  }
+  setRowText(state, idleMessage(kind, st));
 }
 
-async function doCheckAppUpdate() {
-  if (appUpdateBusy) return;
-  appUpdateBusy = true;
-  els.appCheckUpdateBtn.disabled = true;
-  els.appCheckUpdateBtn.textContent = T("检查中…");
-  setRowText(els.appUpdateState, T("检查中…"));
+async function loadUpdateStatus(kind: RowKind) {
   try {
-    lastAppUpdateStatus = await invoke<DshUpdateStatus>("check_app_update");
+    const cmd = kind === "dsh" ? "get_dsh_update_status" : "get_app_update_status";
+    const status = await invoke<DshUpdateStatus | null>(cmd);
+    if (kind === "dsh") lastUpdateStatus = status;
+    else lastAppUpdateStatus = status;
   } catch (e) {
-    console.error("check app update failed", e);
-    lastAppUpdateStatus = {
+    console.error(`load ${kind} update status failed`, e);
+    if (kind === "dsh") lastUpdateStatus = null;
+    else lastAppUpdateStatus = null;
+  }
+  renderRow(kind);
+}
+
+async function loadProgress() {
+  const wasBusy = lastProgress.dsh.stage !== "idle" || lastProgress.app.stage !== "idle";
+  try {
+    lastProgress = await invoke<UpdateProgressSnapshot>("get_update_progress");
+  } catch (e) {
+    console.error("load update progress failed", e);
+  }
+  renderRow("dsh");
+  renderRow("app");
+  const nowBusy = lastProgress.dsh.stage !== "idle" || lastProgress.app.stage !== "idle";
+  if (wasBusy && !nowBusy) {
+    void refreshSettings();
+  }
+}
+
+async function refreshUpdateUI() {
+  await Promise.all([loadProgress(), loadUpdateStatus("dsh"), loadUpdateStatus("app")]);
+}
+
+async function runRowAction(kind: RowKind) {
+  if (actionBusy[kind] || lastProgress[kind].stage !== "idle") return;
+  const st = rowStatus(kind);
+  const doUpdate = !!st && st.update_available;
+  const cmd = kind === "dsh"
+    ? doUpdate ? "update_dsh" : "check_dsh_update"
+    : doUpdate ? "update_app" : "check_app_update";
+  actionBusy[kind] = true;
+  renderRow(kind);
+  try {
+    await invoke<DshUpdateStatus>(cmd);
+  } catch (e) {
+    console.error(`${kind} ${doUpdate ? "update" : "check"} failed`, e);
+    const msg = typeof e === "string" && e
+      ? e
+      : lang === "zh"
+        ? doUpdate ? "更新失败，请查看日志。" : "检查更新失败，请查看日志。"
+        : doUpdate ? "Update failed. See the logs." : "Failed to check updates. See the logs.";
+    const prev = rowStatus(kind);
+    const failed: DshUpdateStatus = {
       ok: false,
-      update_available: false,
-      current: null,
-      latest: null,
-      prerelease: null,
-      pre_available: false,
-      message: lang === "zh" ? "检查更新失败，请查看日志。" : "Failed to check updates. See the logs.",
+      update_available: prev?.update_available ?? false,
+      current: prev?.current ?? null,
+      latest: prev?.latest ?? null,
+      prerelease: prev?.prerelease ?? null,
+      pre_available: prev?.pre_available ?? false,
+      message: msg,
     };
+    if (kind === "dsh") lastUpdateStatus = failed;
+    else lastAppUpdateStatus = failed;
+    renderRow(kind);
   } finally {
-    appUpdateBusy = false;
-    els.appCheckUpdateBtn.disabled = false;
-    els.appCheckUpdateBtn.textContent = T("检查更新");
-    renderAppUpdateStatus();
+    actionBusy[kind] = false;
+    await refreshUpdateUI();
   }
 }
 
-async function doApplyAppUpdate() {
-  if (appUpdateBusy) return;
-  appUpdateBusy = true;
-  els.appApplyUpdateBtn.disabled = true;
-  els.appApplyUpdateBtn.textContent = T("更新中…");
-  setRowText(els.appUpdateState, T("正在更新，请稍候…"));
+async function stopRowAction(kind: RowKind) {
+  const cmd = kind === "dsh" ? "cancel_dsh_update" : "cancel_app_update";
   try {
-    lastAppUpdateStatus = await invoke<DshUpdateStatus>("update_app");
+    await invoke(cmd);
   } catch (e) {
-    console.error("app update failed", e);
-    lastAppUpdateStatus = {
-      ok: false,
-      update_available: false,
-      current: null,
-      latest: null,
-      prerelease: null,
-      pre_available: false,
-      message: lang === "zh" ? "更新失败，请查看日志。" : "Update failed. See the logs.",
-    };
-  } finally {
-    appUpdateBusy = false;
-    els.appApplyUpdateBtn.disabled = false;
-    els.appApplyUpdateBtn.textContent = T("立即更新");
-    renderAppUpdateStatus();
+    console.error(`${kind} cancel failed`, e);
   }
+  await refreshUpdateUI();
+}
+
+function onRowClick(kind: RowKind) {
+  const p = lastProgress[kind];
+  if (p.stage === "downloading" && p.can_cancel) {
+    stopRowAction(kind);
+    return;
+  }
+  runRowAction(kind);
+}
+
+function startUpdateProgressPoll() {
+  setInterval(() => {
+    if (document.visibilityState === "hidden") return;
+    loadProgress();
+  }, 500);
 }
 
 function serviceStateText(s: ServiceState): string {
@@ -326,9 +349,7 @@ async function loadSettings() {
     els.portInput.value = configCache.port > 0 ? String(configCache.port) : "0";
     els.registrySelect.value = configCache.registry_source || "auto";
 
-    await loadUpdateStatus();
-
-    await loadAppUpdateStatus();
+    await refreshUpdateUI();
   } catch (e) {
     setRowText(els.serviceState, T("读取失败"));
     console.error("load settings failed", e);
@@ -445,11 +466,8 @@ function bind() {
     }
   });
 
-  els.checkUpdateBtn.addEventListener("click", doCheckUpdate);
-  els.applyUpdateBtn.addEventListener("click", doApplyUpdate);
-
-  els.appCheckUpdateBtn.addEventListener("click", doCheckAppUpdate);
-  els.appApplyUpdateBtn.addEventListener("click", doApplyAppUpdate);
+  els.dshUpdateBtn.addEventListener("click", () => onRowClick("dsh"));
+  els.appUpdateBtn.addEventListener("click", () => onRowClick("app"));
 
   els.openWorkspaceBtn.addEventListener("click", async () => {
     try {
@@ -472,3 +490,4 @@ bind();
 loadSettings();
 bindRefreshEvents();
 startServiceStatePoll();
+startUpdateProgressPoll();

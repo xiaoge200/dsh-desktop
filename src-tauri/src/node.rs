@@ -1,5 +1,20 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+pub const CANCELLED_MARKER: &str = "\u{1F}CANCELLED";
+
+pub fn cancelled_err() -> String {
+    format!("{CANCELLED_MARKER} 操作已取消")
+}
+
+pub fn is_cancelled(e: &str) -> bool {
+    e.starts_with(CANCELLED_MARKER)
+}
+
+fn cancel_requested(cancel: Option<&AtomicBool>) -> bool {
+    cancel.map(|c| c.load(Ordering::SeqCst)).unwrap_or(false)
+}
 
 pub(crate) fn normalize_for_node(p: &Path) -> PathBuf {
     #[cfg(windows)]
@@ -82,7 +97,14 @@ pub fn run_prepare(
     ])
 }
 
-pub fn run_check(node: &Path, installer_js: &Path, target: &Path, source: &str, pre: bool) -> Result<String, String> {
+pub fn run_check(
+    node: &Path,
+    installer_js: &Path,
+    target: &Path,
+    source: &str,
+    pre: bool,
+    cancel: Option<&AtomicBool>,
+) -> Result<String, String> {
     let mut args = vec![
         "check".to_string(),
         "--target".to_string(),
@@ -92,10 +114,17 @@ pub fn run_check(node: &Path, installer_js: &Path, target: &Path, source: &str, 
     if pre {
         args.push("--pre".to_string());
     }
-    run_installer(node, installer_js, &args)
+    run_installer_timeout(node, installer_js, &args, INSTALLER_CHECK_TIMEOUT, cancel)
 }
 
-pub fn run_update(node: &Path, installer_js: &Path, target: &Path, source: &str, pre: bool) -> Result<String, String> {
+pub fn run_update(
+    node: &Path,
+    installer_js: &Path,
+    target: &Path,
+    source: &str,
+    pre: bool,
+    cancel: Option<&AtomicBool>,
+) -> Result<String, String> {
     let mut args = vec![
         "update".to_string(),
         "--target".to_string(),
@@ -105,7 +134,7 @@ pub fn run_update(node: &Path, installer_js: &Path, target: &Path, source: &str,
     if pre {
         args.push("--pre".to_string());
     }
-    run_installer(node, installer_js, &args)
+    run_installer_timeout(node, installer_js, &args, INSTALLER_UPDATE_TIMEOUT, cancel)
 }
 
 pub fn run_swap(node: &Path, installer_js: &Path, target: &Path, staging: &Path) -> Result<String, String> {
@@ -139,8 +168,27 @@ fn registry_args(source: &str) -> Vec<String> {
 }
 
 const INSTALLER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(45 * 60);
+const INSTALLER_CHECK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3 * 60);
+const INSTALLER_UPDATE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
+fn timeout_message(timeout: std::time::Duration) -> String {
+    format!(
+        "操作超时（已等待 {} 秒），已终止。请检查网络或稍后重试。",
+        timeout.as_secs()
+    )
+}
 
 fn run_installer(node: &Path, installer_js: &Path, args: &[String]) -> Result<String, String> {
+    run_installer_timeout(node, installer_js, args, INSTALLER_TIMEOUT, None)
+}
+
+fn run_installer_timeout(
+    node: &Path,
+    installer_js: &Path,
+    args: &[String],
+    timeout: std::time::Duration,
+    cancel: Option<&AtomicBool>,
+) -> Result<String, String> {
     let mut full_args: Vec<String> = vec![normalize_for_node(installer_js).to_string_lossy().to_string()];
     full_args.extend(args.iter().cloned());
     log::info!("installer: {:?} {:?}", normalize_for_node(node), full_args);
@@ -173,21 +221,28 @@ fn run_installer(node: &Path, installer_js: &Path, args: &[String]) -> Result<St
             let _ = (&mut &err_r).read_to_string(&mut buf);
             buf
         });
-        let deadline = std::time::Instant::now() + INSTALLER_TIMEOUT;
+        let kill = |child: &mut crate::winproc::ChildHandle| {
+            log::warn!("installer killed; pid={}", child.id());
+            use std::os::windows::process::CommandExt;
+            let _ = std::process::Command::new("taskkill")
+                .args(["/PID", &child.id().to_string(), "/T", "/F"])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .creation_flags(0x0800_0000)
+                .status();
+            let _ = child.wait();
+        };
+        let deadline = std::time::Instant::now() + timeout;
         let status = loop {
             match child.try_wait() {
                 Ok(Some(st)) => break st,
+                Ok(None) if cancel_requested(cancel) => {
+                    kill(&mut child);
+                    return Err(cancelled_err());
+                }
                 Ok(None) if std::time::Instant::now() >= deadline => {
-                    log::warn!("installer timed out; killing pid={}", child.id());
-                    use std::os::windows::process::CommandExt;
-                    let _ = std::process::Command::new("taskkill")
-                        .args(["/PID", &child.id().to_string(), "/T", "/F"])
-                        .stdout(std::process::Stdio::null())
-                        .stderr(std::process::Stdio::null())
-                        .creation_flags(0x0800_0000)
-                        .status();
-                    let _ = child.wait();
-                    return Err("安装器超时（可能被占用或卡住），已终止。请稍后重试。".into());
+                    kill(&mut child);
+                    return Err(timeout_message(timeout));
                 }
                 Err(e) => return Err(format!("installer wait failed: {e}")),
                 _ => std::thread::sleep(std::time::Duration::from_millis(500)),
@@ -203,14 +258,50 @@ fn run_installer(node: &Path, installer_js: &Path, args: &[String]) -> Result<St
     let (success, stdout, stderr) = {
         let mut cmd = Command::new(normalize_for_node(node));
         cmd.args(&full_args);
-        log::info!("installer: {:?}", cmd);
-        let out = cmd
-            .output()
+        cmd.stdout(std::process::Stdio::piped());
+        cmd.stderr(std::process::Stdio::piped());
+        let mut child = cmd
+            .spawn()
             .map_err(|e| format!("cannot start installer: {e}"))?;
+        let out = child.stdout.take().unwrap();
+        let err = child.stderr.take().unwrap();
+        let t_out = std::thread::spawn(move || {
+            use std::io::Read;
+            let mut buf = String::new();
+            let _ = (&mut &out).read_to_string(&mut buf);
+            buf
+        });
+        let t_err = std::thread::spawn(move || {
+            use std::io::Read;
+            let mut buf = String::new();
+            let _ = (&mut &err).read_to_string(&mut buf);
+            buf
+        });
+        let kill = |child: &mut std::process::Child| {
+            log::warn!("installer killed; pid={}", child.id());
+            let _ = child.kill();
+            let _ = child.wait();
+        };
+        let deadline = std::time::Instant::now() + timeout;
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(st)) => break st,
+                Ok(None) if cancel_requested(cancel) => {
+                    kill(&mut child);
+                    return Err(cancelled_err());
+                }
+                Ok(None) if std::time::Instant::now() >= deadline => {
+                    kill(&mut child);
+                    return Err(timeout_message(timeout));
+                }
+                Err(e) => return Err(format!("installer wait failed: {e}")),
+                _ => std::thread::sleep(std::time::Duration::from_millis(500)),
+            }
+        };
         (
-            out.status.success(),
-            String::from_utf8_lossy(&out.stdout).to_string(),
-            String::from_utf8_lossy(&out.stderr).to_string(),
+            status.success(),
+            t_out.join().unwrap_or_default(),
+            t_err.join().unwrap_or_default(),
         )
     };
 

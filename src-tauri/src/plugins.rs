@@ -217,7 +217,7 @@ fn list_impl(runtime: &Path, home: &Path, app_data: &Path) -> Result<PluginsList
     layers.push(row_patches(&home_patches));
 
     for name in TEMPLATE_BUNDLES {
-        let version = resolve_bundle_dir(runtime, &profile, &name.to_string())
+        let version = resolve_bundle_dir(runtime, &profile, name)
             .and_then(|d| read_version(&d))
             .unwrap_or_else(|| "-".into());
         let restart_required = snapshot_differs(&snapshot, name, &version);

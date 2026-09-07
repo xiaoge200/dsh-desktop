@@ -86,10 +86,7 @@ pub fn extract_url(text: &str, port: u16) -> Option<String> {
     let mut window = text.len();
     while window >= needle.len() {
         let found = text[..window].rfind(&needle);
-        let p = match found {
-            None => return None,
-            Some(p) => p,
-        };
+        let p = found?;
         let after = &text[p + needle.len()..];
         let raw: String = after
             .chars()
@@ -148,7 +145,7 @@ pub fn extract_lock_path(text: &str) -> Option<String> {
         }
     }
     for token in text.split_whitespace() {
-        let t = token.trim_end_matches(&[';', ',', ')', ']', '}', '"', '\'']);
+        let t = token.trim_end_matches([';', ',', ')', ']', '}', '"', '\'']);
         if t.ends_with(".lock") && looks_like_path(t) {
             return Some(t.to_string());
         }

@@ -97,6 +97,21 @@ description = "Allows the update_app command"
 commands = { allow = ["update_app"] }
 
 [[permission]]
+identifier = "allow-get-update-progress"
+description = "Allows the get_update_progress command"
+commands = { allow = ["get_update_progress"] }
+
+[[permission]]
+identifier = "allow-cancel-dsh-update"
+description = "Allows the cancel_dsh_update command"
+commands = { allow = ["cancel_dsh_update"] }
+
+[[permission]]
+identifier = "allow-cancel-app-update"
+description = "Allows the cancel_app_update command"
+commands = { allow = ["cancel_app_update"] }
+
+[[permission]]
 identifier = "allow-plugins-list"
 description = "Allows the plugins_list command"
 commands = { allow = ["plugins_list"] }
@@ -150,6 +165,9 @@ permissions = [
   "allow-get-app-update-status",
   "allow-check-app-update",
   "allow-update-app",
+  "allow-get-update-progress",
+  "allow-cancel-dsh-update",
+  "allow-cancel-app-update",
   "allow-restart-service",
   "allow-plugins-list",
   "allow-plugins-add",

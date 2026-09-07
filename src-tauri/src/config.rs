@@ -85,7 +85,7 @@ mod tests {
         store.set(c.clone()).unwrap();
 
         let reloaded = ConfigStore::new(&dir);
-        assert_eq!(reloaded.get().auto_update_dsh, false);
+        assert!(!reloaded.get().auto_update_dsh);
         assert_eq!(reloaded.get().port, 4000);
         std::fs::remove_dir_all(&dir).ok();
     }

@@ -471,7 +471,6 @@ pub(crate) fn spawn_service_watch(app: &AppHandle) {
         {
             return;
         }
-        drop(guard_state);
         std::thread::sleep(Duration::from_secs(3));
         let mut reap_tick: u32 = 0;
         loop {
@@ -669,6 +668,7 @@ fn is_safe_lock_path(path: &Path) -> bool {
             .unwrap_or(false)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn start_service_with_heal(
     app: &AppHandle,
     state: &AppState,
@@ -706,9 +706,8 @@ pub(crate) fn start_service_with_heal(
         state.set_port(port);
         log::info!("service on 127.0.0.1:{port}");
 
-        match wait_service_outcome(state, Duration::from_secs(60)) {
-            WaitOutcome::Ready => return Ok(()),
-            _ => {}
+        if wait_service_outcome(state, Duration::from_secs(60)) == WaitOutcome::Ready {
+            return Ok(());
         }
         let issue = boot_issue(state);
         if !healed {

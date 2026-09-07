@@ -4,7 +4,7 @@
 import { spawnSync } from "node:child_process";
 import {
   copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, readlinkSync,
-  renameSync, rmSync, symlinkSync, writeFileSync,
+  renameSync, rmSync, statSync, symlinkSync, writeFileSync,
 } from "node:fs";
 import { createHash } from "node:crypto";
 import { join, dirname, basename } from "node:path";
@@ -136,6 +136,21 @@ function splitVersions(versions) {
 }
 
 
+function registryCandidates(opts) {
+  const primary = opts.registry || opts.mirror || DEFAULT_REGISTRY;
+  const others = [];
+  for (const url of [DEFAULT_REGISTRY, DEFAULT_MIRROR]) {
+    if (url !== primary && !others.includes(url)) others.push(url);
+  }
+  for (const url of [opts.registry, opts.mirror]) {
+    if (url && url !== primary && !others.includes(url)) others.push(url);
+  }
+  return [primary, ...others].map((url) => ({
+    label: url === DEFAULT_REGISTRY ? "npmjs" : url === DEFAULT_MIRROR ? "npmmirror" : "custom",
+    url,
+  }));
+}
+
 async function queryDistTags(registry) {
   
   const reachable = await registryReachable(registry);
@@ -155,10 +170,28 @@ async function queryDistTags(registry) {
 }
 
 
+function sweepStaleStaging(parent, keepPid) {
+  const cutoff = Date.now() - 6 * 3600 * 1000;
+  let names;
+  try {
+    names = readdirSync(parent);
+  } catch {
+    return;
+  }
+  for (const n of names) {
+    if (!n.startsWith(".dsh-runtime-staging-") || n.endsWith("-" + keepPid)) continue;
+    const p = join(parent, n);
+    try {
+      if (statSync(p).mtimeMs < cutoff) rmSync(p, { recursive: true, force: true });
+    } catch {}
+  }
+}
+
 function fetchTo(target, registry, versionSpec) {
   const parent = dirname(target);
   const stage = join(parent, ".dsh-runtime-staging-" + process.pid);
   rmSync(stage, { recursive: true, force: true });
+  sweepStaleStaging(parent, process.pid);
   mkdirSync(stage, { recursive: true });
   const spec = versionSpec ? `${PKG}@${versionSpec}` : PKG;
   const res = runNpm(
@@ -470,10 +503,7 @@ async function main() {
       
       
       
-      const registries = [
-        { label: opts.registry ? "custom" : "npmjs", url: opts.registry || DEFAULT_REGISTRY },
-        { label: opts.mirror ? "custom" : "npmmirror", url: opts.mirror || DEFAULT_MIRROR },
-      ];
+      const registries = registryCandidates(opts);
       let info = null, latestSource = null;
       for (const r of registries) {
         const d = await queryDistTags(r.url);
@@ -488,14 +518,14 @@ async function main() {
       const stable = info.stable;
       const prerelease = info.prerelease;
       const cur = current ?? "0.0.0";
-      
+
       let follow = null;
       if (opts.pre && prerelease && stable && compareVersions(prerelease, stable) > 0) {
-        follow = prerelease; 
+        follow = prerelease;
       } else if (stable) {
         follow = stable;
       } else {
-        follow = prerelease; 
+        follow = prerelease;
       }
       const target_available = !!follow && follow !== cur && compareVersions(follow, cur) > 0;
       const pre_available = !!prerelease && prerelease !== cur && compareVersions(prerelease, cur) > 0;
@@ -512,12 +542,9 @@ async function main() {
     }
 
     case "update": {
-      
-      
-      const registries = [
-        { label: opts.registry ? "custom" : "npmjs", url: opts.registry || DEFAULT_REGISTRY },
-        { label: opts.mirror ? "custom" : "npmmirror", url: opts.mirror || DEFAULT_MIRROR },
-      ];
+
+
+      const registries = registryCandidates(opts);
       let info = null, latestSource = null;
       for (const r of registries) {
         const d = await queryDistTags(r.url);
@@ -548,17 +575,24 @@ async function main() {
       }
 
       
-      let fetched = null, usedSource = null;
-      const order = latestSource === "npmmirror" ? [registries[1], registries[0]] : [registries[0], registries[1]];
-      for (const r of order) {
+      let fetched = null, usedSource = null, rawDetail = "";
+      for (const r of registries) {
         try {
           fetched = fetchTo(target, r.url, targetVersion);
           usedSource = r.label;
           break;
-        } catch {  }
+        } catch (e) {
+          const raw = String((e && e.message) || "");
+          if (raw) rawDetail = raw;
+          if (/Python|node-gyp|gyp ERR|Visual Studio|MSBUILD/i.test(raw)) break;
+        }
       }
       if (!fetched) {
-        out({ ok: false, error: { kind: "install", message: "新版本下载失败，已保留当前版本。", detail: "download failed on both registries" } });
+        const needToolchain = /Python|node-gyp|gyp ERR|Visual Studio|MSBUILD/i.test(rawDetail);
+        const message = needToolchain
+          ? "新版本包含需要编译的原生依赖，本机缺少 Python/VS 构建工具链，无法安装该版本。"
+          : "新版本下载失败，已保留当前版本。";
+        out({ ok: false, error: { kind: "install", message, detail: rawDetail.slice(0, 600) } });
         process.exit(1);
       }
 

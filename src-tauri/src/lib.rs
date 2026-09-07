@@ -16,8 +16,11 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use app_update::{check_app_update, get_app_update_status, update_app};
-use dsh_update::{check_dsh_update, get_dsh_update_status, spawn_bg_dsh_update, update_dsh};
+use app_update::{cancel_app_update, check_app_update, get_app_update_status, update_app};
+use dsh_update::{
+    cancel_dsh_update, check_dsh_update, get_dsh_update_status, get_update_progress,
+    spawn_bg_dsh_update, update_dsh,
+};
 use plugins::plugin_market::plugins_marketplace;
 use service::{
     emit_error_options, menu_restart, preferred_port, repair_service, restart_service,
@@ -120,6 +123,15 @@ fn show_notify(app: &AppHandle, req: NotifyReq) {
         Ok(_) => log::info!("notify ok"),
         Err(e) => log::warn!("notify failed: {e}"),
     }
+}
+
+pub(crate) fn notify_update(app: &AppHandle, title: &str, body: &str) {
+    let main_app = app.clone();
+    let title = title.to_string();
+    let body = body.to_string();
+    let _ = app.run_on_main_thread(move || {
+        show_notify(&main_app, NotifyReq { title, body });
+    });
 }
 
 #[tauri::command]
@@ -394,7 +406,7 @@ fn boot(app: AppHandle) {
     let _ = app.emit("boot://ready", serde_json::json!({ "url": url }));
     spawn_service_watch(&app);
 
-    spawn_bg_dsh_update(&app, &installer_js);
+    spawn_bg_dsh_update(&app);
 
     spawn_ensure_default_plugin(&app);
 }
@@ -641,6 +653,10 @@ pub fn run() {
             dsh_extra_args: std::sync::Mutex::new(Vec::new()),
             dsh_update: std::sync::Mutex::new(None),
             app_update: std::sync::Mutex::new(None),
+            dsh_progress: std::sync::Mutex::new(state::UpdateProgress::default()),
+            app_progress: std::sync::Mutex::new(state::UpdateProgress::default()),
+            dsh_cancel: std::sync::atomic::AtomicBool::new(false),
+            app_cancel: std::sync::atomic::AtomicBool::new(false),
             boot_page_url: std::sync::Mutex::new(None),
             service_watch_active: std::sync::atomic::AtomicBool::new(false),
             last_recovery: std::sync::Mutex::new(None),
@@ -709,6 +725,9 @@ pub fn run() {
             get_app_update_status,
             check_app_update,
             update_app,
+            get_update_progress,
+            cancel_dsh_update,
+            cancel_app_update,
             open_settings,
             open_context_menu,
             plugins::plugins_list,

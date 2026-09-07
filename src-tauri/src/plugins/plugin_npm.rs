@@ -56,10 +56,7 @@ pub(crate) fn run_npm(node: &Path, cwd: &Path, args: &[String], timeout: Duratio
     log::info!("npm: {:?} {:?}", node_n, full_args);
 
     #[cfg(windows)]
-    let (mut child, pipes): (
-        crate::winproc::ChildHandle,
-        Vec<(bool, Option<Box<dyn std::io::Read + Send>>)>,
-    ) = {
+    let (mut child, pipes) = {
         use crate::winproc::{create_pipe, spawn_hidden, SpawnOpts};
         let (out_r, out_w) = create_pipe().map_err(|e| format!("无法创建管道: {e}"))?;
         let (err_r, err_w) = create_pipe().map_err(|e| format!("无法创建管道: {e}"))?;
@@ -80,10 +77,7 @@ pub(crate) fn run_npm(node: &Path, cwd: &Path, args: &[String], timeout: Duratio
         (child, pipes)
     };
     #[cfg(unix)]
-    let (mut child, pipes): (
-        std::process::Child,
-        Vec<(bool, Option<Box<dyn std::io::Read + Send>>)>,
-    ) = {
+    let (mut child, pipes) = {
         let mut cmd = Command::new(&node_n);
         cmd.args(&full_args).current_dir(&cwd_n);
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());

@@ -31,6 +31,10 @@ pub struct AppState {
     pub dsh_extra_args: Mutex<Vec<String>>,
     pub dsh_update: Mutex<Option<DshUpdateStatus>>,
     pub app_update: Mutex<Option<DshUpdateStatus>>,
+    pub dsh_progress: Mutex<UpdateProgress>,
+    pub app_progress: Mutex<UpdateProgress>,
+    pub dsh_cancel: AtomicBool,
+    pub app_cancel: AtomicBool,
     pub boot_page_url: Mutex<Option<String>>,
     pub service_watch_active: AtomicBool,
     pub last_recovery: Mutex<Option<RecoveryInfo>>,
@@ -55,6 +59,32 @@ pub struct DshUpdateStatus {
     pub prerelease: Option<String>,
     pub pre_available: bool,
     pub message: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum UpdateStage {
+    #[default]
+    Idle,
+    Checking,
+    Downloading,
+    Swapping,
+    Installing,
+    Restarting,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Default)]
+pub struct UpdateProgress {
+    pub stage: UpdateStage,
+    pub can_cancel: bool,
+    pub received: Option<u64>,
+    pub total: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Default)]
+pub struct UpdateProgressSnapshot {
+    pub dsh: UpdateProgress,
+    pub app: UpdateProgress,
 }
 
 impl AppState {
@@ -158,6 +188,28 @@ impl AppState {
         self.app_update.lock().unwrap().clone()
     }
 
+    pub fn set_dsh_progress(&self, progress: UpdateProgress) {
+        *self.dsh_progress.lock().unwrap() = progress;
+    }
+
+    pub fn dsh_progress(&self) -> UpdateProgress {
+        *self.dsh_progress.lock().unwrap()
+    }
+
+    pub fn set_app_progress(&self, progress: UpdateProgress) {
+        *self.app_progress.lock().unwrap() = progress;
+    }
+
+    pub fn app_progress(&self) -> UpdateProgress {
+        *self.app_progress.lock().unwrap()
+    }
+
+    pub fn progress_snapshot(&self) -> UpdateProgressSnapshot {
+        let dsh = self.dsh_progress();
+        let app = self.app_progress();
+        UpdateProgressSnapshot { dsh, app }
+    }
+
     pub fn set_boot_page_url(&self, url: String) {
         *self.boot_page_url.lock().unwrap() = Some(url);
     }
@@ -231,6 +283,10 @@ mod tests {
             dsh_extra_args: Mutex::new(Vec::new()),
             dsh_update: Mutex::new(None),
             app_update: Mutex::new(None),
+            dsh_progress: Mutex::new(UpdateProgress::default()),
+            app_progress: Mutex::new(UpdateProgress::default()),
+            dsh_cancel: AtomicBool::new(false),
+            app_cancel: AtomicBool::new(false),
             boot_page_url: Mutex::new(None),
             service_watch_active: AtomicBool::new(false),
             last_recovery: Mutex::new(None),

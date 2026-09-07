@@ -118,13 +118,25 @@ pub fn probe_port(port: u16) -> bool {
                 return false;
             }
             let mut buf = [0u8; 128];
-            match stream.read(&mut buf) {
-                Ok(_) => {
-                    let head = String::from_utf8_lossy(&buf);
-                    head.starts_with("HTTP/1") || head.contains("HTTP/1")
+            let mut got = 0usize;
+            let deadline = std::time::Instant::now() + HEALTH_TIMEOUT;
+            loop {
+                if std::time::Instant::now() >= deadline {
+                    break;
                 }
-                Err(_) => false,
+                match stream.read(&mut buf[got..]) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        got += n;
+                        if got == buf.len() {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
             }
+            let head = String::from_utf8_lossy(&buf[..got]);
+            head.starts_with("HTTP/1") || head.contains("HTTP/1")
         }
         Err(_) => false,
     }
@@ -255,7 +267,6 @@ impl Supervisor {
             match std::fs::OpenOptions::new()
                 .create(true)
                 .append(true)
-                .write(true)
                 .open(&log_path)
             {
                 Ok(f) => match f.try_clone() {

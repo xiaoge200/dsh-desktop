@@ -5,7 +5,9 @@ use std::time::Duration;
 use crate::node;
 use crate::plugins;
 use crate::service::{ops_guard, restart_dsh_service};
-use crate::state::{AppState, BootPhase, DshUpdateStatus};
+use crate::state::{
+    AppState, BootPhase, DshUpdateStatus, UpdateProgress, UpdateProgressSnapshot, UpdateStage,
+};
 use crate::update_tray_tooltip;
 use tauri::{AppHandle, Manager, State};
 
@@ -26,10 +28,75 @@ fn try_begin_update() -> Option<UpdateActiveGuard> {
         .map(|_| UpdateActiveGuard)
 }
 
+pub(crate) fn dsh_update_active() -> bool {
+    DSH_UPDATE_ACTIVE.load(Ordering::SeqCst)
+}
+
+struct UpdateResetGuard {
+    app: AppHandle,
+}
+
+impl Drop for UpdateResetGuard {
+    fn drop(&mut self) {
+        let state = self.app.state::<AppState>();
+        state.dsh_cancel.store(false, Ordering::SeqCst);
+        state.set_dsh_progress(UpdateProgress::default());
+    }
+}
+
+fn set_stage(state: &AppState, stage: UpdateStage, can_cancel: bool) {
+    state.set_dsh_progress(UpdateProgress {
+        stage,
+        can_cancel,
+        ..Default::default()
+    });
+}
+
+fn cancelled_status(prev: Option<DshUpdateStatus>, current: Option<String>) -> DshUpdateStatus {
+    let p = prev.unwrap_or_default();
+    DshUpdateStatus {
+        ok: false,
+        update_available: p.update_available,
+        current: current.or(p.current),
+        latest: p.latest,
+        prerelease: p.prerelease,
+        pre_available: p.pre_available,
+        message: "已取消，可稍后重试。".into(),
+    }
+}
+
+fn busy_status(state: &AppState) -> DshUpdateStatus {
+    state
+        .dsh_update()
+        .unwrap_or_else(|| DshUpdateStatus {
+            message: "更新正在进行中，请稍候。".into(),
+            ..Default::default()
+        })
+}
+
 fn locked_file_hint() -> &'static str {
     "。若提示文件被占用（其他 DSH 窗口、杀毒或残留进程），请稍后重试，持续失败请重启电脑。"
 }
 
+fn notify_dsh_update(app: &AppHandle, ok: bool, body: &str) {
+    let body = body.replace(locked_file_hint(), "");
+    let zh = crate::is_zh_locale();
+    let title = match (ok, zh) {
+        (true, true) => "DSH 更新完成",
+        (true, false) => "DSH update finished",
+        (false, true) => "DSH 更新失败",
+        (false, false) => "DSH update failed",
+    };
+    crate::notify_update(app, title, &body);
+}
+
+fn notify_dsh_available(app: &AppHandle, body: &str) {
+    let zh = crate::is_zh_locale();
+    let title = if zh { "发现 DSH 新版本" } else { "New DSH version available" };
+    crate::notify_update(app, title, body);
+}
+
+#[allow(clippy::too_many_arguments)]
 fn apply_swap(
     app: &AppHandle,
     state: &AppState,
@@ -41,6 +108,7 @@ fn apply_swap(
     u: &node::InstallerResult,
     previous_current: Option<String>,
 ) -> DshUpdateStatus {
+    set_stage(state, UpdateStage::Swapping, false);
     let guard = ops_guard();
     state.set_phase(BootPhase::ServiceStart);
     state.supervisor.lock().unwrap().ensure_stopped();
@@ -92,6 +160,7 @@ fn apply_swap(
             ..Default::default()
         },
     };
+    set_stage(state, UpdateStage::Restarting, false);
     match restart_dsh_service(app, state, node, runtime, workspace, extra) {
         Ok(()) => {
             if status.ok && status.message.starts_with("已更新到") {
@@ -117,132 +186,40 @@ fn apply_swap(
     status
 }
 
-pub(crate) fn spawn_bg_dsh_update(app: &AppHandle, installer_js: &Path) {
-    let bg_app = app.clone();
-    let bg_installer = installer_js.to_path_buf();
-    std::thread::spawn(move || {
-        let state = bg_app.state::<AppState>();
-        let bg_node = state.node_path();
-        let bg_runtime = state.runtime_dir();
-        let bg_workspace = state.workspace_dir();
-        let bg_extra = state.dsh_extra_args.lock().unwrap().clone();
-        std::thread::sleep(Duration::from_secs(30));
-        let cfg = state.config.lock().unwrap().get();
-        let auto_update = cfg.auto_update_dsh;
-        let registry_source = cfg.registry_source;
-        let current = node::read_installed_version(&bg_runtime);
-        if !auto_update {
-            state.set_dsh_update(DshUpdateStatus {
-                ok: true,
-                update_available: false,
-                current,
-                latest: None,
-                ..Default::default()
-            });
-            log::info!("bg update: auto-update disabled by user");
-            return;
-        }
-        let Some(_update_guard) = try_begin_update() else {
-            log::info!("bg update: skipped, another update is already running");
-            return;
-        };
-        let check = match node::run_check(&bg_node, &bg_installer, &bg_runtime, &registry_source, false) {
-            Ok(o) => o,
-            Err(e) => {
-                state.set_dsh_update(DshUpdateStatus {
-                    ok: false,
-                    update_available: false,
-                    current,
-                    latest: None,
-                    message: format!("后台检查更新失败：{e}"),
-                    ..Default::default()
-                });
-                log::warn!("bg update check failed: {e}");
-                return;
-            }
-        };
-        let check_res = node::parse_installer_output(&check);
-        if !check_res.ok {
-            state.set_dsh_update(DshUpdateStatus {
-                ok: false,
-                update_available: false,
-                current,
-                latest: None,
-                message: check_res.message.unwrap_or_else(|| "后台检查更新失败".into()),
-                ..Default::default()
-            });
-            return;
-        }
-        let has_update =
-            check_res.action == "new-version-available" || check_res.action == "prerelease-available";
-        if !has_update {
-            state.set_dsh_update(DshUpdateStatus {
-                ok: true,
-                update_available: false,
-                current,
-                latest: check_res.version.clone(),
-                prerelease: check_res.prerelease.clone(),
-                pre_available: check_res.pre_available,
-                message: up_to_date_message(&check_res.version),
-            });
-            log::info!("bg update: up-to-date");
-            return;
-        }
-        log::info!("bg update: new version available, installing");
-        let latest = check_res.version.clone();
+async fn auto_update_once(app: AppHandle) {
+    let state = app.state::<AppState>();
+    let auto = state.config.lock().unwrap().get().auto_update_dsh;
+    if !auto {
+        let current = node::read_installed_version(&state.runtime_dir());
         state.set_dsh_update(DshUpdateStatus {
             ok: true,
-            update_available: true,
-            current: current.clone(),
-            latest: latest.clone(),
-            prerelease: check_res.prerelease.clone(),
-            pre_available: check_res.pre_available,
-            message: format!("发现新版本 {}，正在后台更新…", latest.unwrap_or_default()),
-        });
-        let update_out = match node::run_update(&bg_node, &bg_installer, &bg_runtime, &registry_source, false) {
-            Ok(o) => o,
-            Err(e) => {
-                state.set_dsh_update(DshUpdateStatus {
-                    ok: false,
-                    update_available: false,
-                    current,
-                    latest: None,
-                    message: format!("后台更新失败：{e}"),
-                    ..Default::default()
-                });
-                log::warn!("bg update failed: {e}");
-                return;
-            }
-        };
-        let u = node::parse_installer_output(&update_out);
-        if !u.ok || u.action != "downloaded" {
-            let message = u.message.unwrap_or_else(|| "更新结果未知，请查看日志".into());
-            state.set_dsh_update(DshUpdateStatus {
-                ok: u.ok,
-                update_available: false,
-                current: current.clone(),
-                latest: u.version.clone(),
-                prerelease: u.prerelease.clone(),
-                pre_available: u.pre_available,
-                message,
-            });
-            log::warn!("bg update download failed: {}", update_out.lines().last().unwrap_or("?"));
-            return;
-        }
-        log::info!("bg update downloaded {} to staging, swapping", u.version.clone().unwrap_or_default());
-        let status = apply_swap(
-            &bg_app,
-            &state,
-            &bg_node,
-            &bg_installer,
-            &bg_runtime,
-            &bg_workspace,
-            &bg_extra,
-            &u,
+            update_available: false,
             current,
-        );
-        state.set_dsh_update(status.clone());
-        log::info!("bg update result: {}", status.message);
+            latest: None,
+            ..Default::default()
+        });
+        log::info!("auto update: disabled by user");
+        return;
+    }
+    match check_update_flow(app.clone()).await {
+        Ok(st) if st.ok && st.update_available => {
+            log::info!("auto update: new version available, applying");
+            if let Err(e) = apply_update_flow(app).await {
+                log::warn!("auto update apply failed: {e}");
+            }
+        }
+        Ok(_) => log::info!("auto update: no new version"),
+        Err(e) => log::warn!("auto update check failed: {e}"),
+    }
+}
+
+pub(crate) fn spawn_bg_dsh_update(app: &AppHandle) {
+    let app = app.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_secs(30));
+        tauri::async_runtime::spawn(async move {
+            auto_update_once(app).await;
+        });
     });
 }
 
@@ -258,11 +235,8 @@ pub(crate) fn get_dsh_update_status(state: State<'_, AppState>) -> Option<DshUpd
     state.dsh_update()
 }
 
-#[tauri::command]
-pub(crate) async fn check_dsh_update(
-    app: AppHandle,
-    state: State<'_, AppState>,
-) -> Result<DshUpdateStatus, String> {
+async fn check_update_flow(app: AppHandle) -> Result<DshUpdateStatus, String> {
+    let state = app.state::<AppState>();
     let node = state.node_path();
     let runtime = state.runtime_dir();
     if runtime.as_os_str().is_empty() {
@@ -274,8 +248,24 @@ pub(crate) async fn check_dsh_update(
     let registry_source = cfg.registry_source;
     let current = node::read_installed_version(&runtime);
     let app2 = app.clone();
-    Ok(tauri::async_runtime::spawn_blocking(move || {
-        let status = match node::run_check(&node, &installer, &runtime, &registry_source, false) {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app2.state::<AppState>();
+        let Some(_update_guard) = try_begin_update() else {
+            log::info!("check update: skipped, another update is running");
+            return busy_status(&state);
+        };
+        let _reset = UpdateResetGuard { app: app2.clone() };
+        state.dsh_cancel.store(false, Ordering::SeqCst);
+        set_stage(&state, UpdateStage::Checking, true);
+        let prev = state.dsh_update();
+        let status = match node::run_check(
+            &node,
+            &installer,
+            &runtime,
+            &registry_source,
+            false,
+            Some(&state.dsh_cancel),
+        ) {
             Ok(out) => {
                 let r = node::parse_installer_output(&out);
                 if !r.ok {
@@ -316,6 +306,7 @@ pub(crate) async fn check_dsh_update(
                     }
                 }
             }
+            Err(e) if node::is_cancelled(&e) => cancelled_status(prev, current),
             Err(e) => DshUpdateStatus {
                 ok: false,
                 update_available: false,
@@ -325,18 +316,23 @@ pub(crate) async fn check_dsh_update(
                 ..Default::default()
             },
         };
-        app2.state::<AppState>().set_dsh_update(status.clone());
+        if status.ok && status.update_available {
+            notify_dsh_available(&app2, &status.message);
+        }
+        state.set_dsh_update(status.clone());
         status
     })
     .await
-    .map_err(|e| format!("检查更新任务异常: {e}"))?)
+    .map_err(|e| format!("检查更新任务异常: {e}"))
 }
 
 #[tauri::command]
-pub(crate) async fn update_dsh(
-    app: AppHandle,
-    state: State<'_, AppState>,
-) -> Result<DshUpdateStatus, String> {
+pub(crate) async fn check_dsh_update(app: AppHandle) -> Result<DshUpdateStatus, String> {
+    check_update_flow(app).await
+}
+
+async fn apply_update_flow(app: AppHandle) -> Result<DshUpdateStatus, String> {
+    let state = app.state::<AppState>();
     let runtime = state.runtime_dir();
     if runtime.as_os_str().is_empty() {
         return Err("服务尚未初始化".into());
@@ -350,22 +346,30 @@ pub(crate) async fn update_dsh(
     let extra = state.dsh_extra_args.lock().unwrap().clone();
     let current = node::read_installed_version(&runtime);
     let app2 = app.clone();
-    Ok(tauri::async_runtime::spawn_blocking(move || {
+    tauri::async_runtime::spawn_blocking(move || {
         let state = app2.state::<AppState>();
         let Some(_update_guard) = try_begin_update() else {
-            let status = DshUpdateStatus {
-                ok: true,
-                update_available: false,
-                current,
-                latest: None,
-                message: "更新正在进行中，请稍候。".into(),
-                ..Default::default()
-            };
-            state.set_dsh_update(status.clone());
-            return status;
+            log::info!("update dsh: skipped, another update is running");
+            return busy_status(&state);
         };
-        let u = match node::run_update(&node, &installer, &runtime, &registry_source, false) {
+        let _reset = UpdateResetGuard { app: app2.clone() };
+        state.dsh_cancel.store(false, Ordering::SeqCst);
+        set_stage(&state, UpdateStage::Downloading, true);
+        let prev = state.dsh_update();
+        let u = match node::run_update(
+            &node,
+            &installer,
+            &runtime,
+            &registry_source,
+            false,
+            Some(&state.dsh_cancel),
+        ) {
             Ok(out) => node::parse_installer_output(&out),
+            Err(e) if node::is_cancelled(&e) => {
+                let status = cancelled_status(prev, current);
+                state.set_dsh_update(status.clone());
+                return status;
+            }
             Err(e) => {
                 let status = DshUpdateStatus {
                     ok: false,
@@ -375,13 +379,14 @@ pub(crate) async fn update_dsh(
                     message: format!("更新失败：{e}"),
                     ..Default::default()
                 };
+                notify_dsh_update(&app2, false, &status.message);
                 state.set_dsh_update(status.clone());
                 return status;
             }
         };
-        if !u.ok || u.action != "downloaded" {
+        if !u.ok {
             let status = DshUpdateStatus {
-                ok: u.ok,
+                ok: false,
                 update_available: false,
                 current,
                 latest: u.version.clone(),
@@ -389,9 +394,26 @@ pub(crate) async fn update_dsh(
                 pre_available: u.pre_available,
                 message: u.message.unwrap_or_else(|| "更新失败，已保留当前版本。".into()),
             };
+            notify_dsh_update(&app2, false, &status.message);
             state.set_dsh_update(status.clone());
             return status;
         }
+        if u.action != "downloaded" {
+            let ver = u.version.clone().or_else(|| u.prerelease.clone());
+            let status = DshUpdateStatus {
+                ok: true,
+                update_available: false,
+                current,
+                latest: u.version.clone(),
+                prerelease: u.prerelease.clone(),
+                pre_available: u.pre_available,
+                message: up_to_date_message(&ver),
+            };
+            notify_dsh_update(&app2, true, &status.message);
+            state.set_dsh_update(status.clone());
+            return status;
+        }
+        state.dsh_cancel.store(false, Ordering::SeqCst);
         log::info!("update_dsh: downloaded {} to staging, swapping", u.version.clone().unwrap_or_default());
         let status = apply_swap(
             &app2,
@@ -404,9 +426,30 @@ pub(crate) async fn update_dsh(
             &u,
             current,
         );
+        notify_dsh_update(&app2, status.ok, &status.message);
         state.set_dsh_update(status.clone());
         status
     })
     .await
-    .map_err(|e| format!("更新任务异常: {e}"))?)
+    .map_err(|e| format!("更新任务异常: {e}"))
+}
+
+#[tauri::command]
+pub(crate) async fn update_dsh(app: AppHandle) -> Result<DshUpdateStatus, String> {
+    apply_update_flow(app).await
+}
+
+#[tauri::command]
+pub(crate) fn get_update_progress(state: State<'_, AppState>) -> UpdateProgressSnapshot {
+    state.progress_snapshot()
+}
+
+#[tauri::command]
+pub(crate) fn cancel_dsh_update(state: State<'_, AppState>) {
+    let p = state.dsh_progress();
+    if p.can_cancel
+        && (p.stage == UpdateStage::Checking || p.stage == UpdateStage::Downloading)
+    {
+        state.dsh_cancel.store(true, Ordering::SeqCst);
+    }
 }
