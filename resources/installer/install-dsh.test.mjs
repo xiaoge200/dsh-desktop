@@ -21,7 +21,7 @@ const INSTALLER = fileURLToPath(new URL("./install-dsh.mjs", import.meta.url));
 
 // 顶层 import：install-dsh.mjs 检测到测试进程时不执行 main，仅导出内部函数
 const {
-  restoreBackup, copyTreeFallback, compareVersions, splitVersions,
+  restoreBackup, copyTreeFallback, compareVersions, splitVersions, splitTags, pickTarget,
   replaceDir, retriable, cleanRuntimeLeftovers,
 } = await import("./install-dsh.mjs");
 
@@ -229,6 +229,37 @@ test("splitVersions 只有预发布时 stable 为 null", () => {
   const { stable, prerelease } = splitVersions(["1.0.0-rc.1", "1.0.0-rc.2"]);
   assert.equal(stable, null);
   assert.equal(prerelease, "1.0.0-rc.2");
+});
+
+// ---- 更新通道：默认跟随 dist-tag latest（与 npm i pkg / 基线 -DshVer latest 一致）----
+test("splitTags/pickTarget 默认跟随 latest tag，更高 alpha 不越位（实测注册表形态）", () => {
+  const info = splitTags({ alpha: "0.1.3-alpha.2", latest: "0.1.2-rc.1", next: "0.1.2-rc.1" });
+  assert.equal(info.channel, "0.1.2-rc.1");
+  const d = pickTarget(info, false);
+  assert.equal(d.target, "0.1.2-rc.1");
+  assert.equal(d.isPre, false);
+  const p = pickTarget(info, true);
+  assert.equal(p.target, "0.1.3-alpha.2", "--pre 时才跟随更高预发布");
+  assert.equal(p.isPre, true);
+});
+
+test("splitTags latest 指向正式版时默认即正式版，--pre 才越级", () => {
+  const info = splitTags({ latest: "0.2.0", beta: "0.3.0-beta.1" });
+  assert.equal(info.channel, "0.2.0");
+  assert.equal(pickTarget(info, false).target, "0.2.0");
+  assert.equal(pickTarget(info, true).target, "0.3.0-beta.1");
+});
+
+test("splitTags 无 latest tag 时回退最高正式版", () => {
+  const info = splitTags({ stable: "0.1.0", alpha: "0.1.1-alpha.2" });
+  assert.equal(info.channel, "0.1.0");
+  assert.equal(pickTarget(info, false).target, "0.1.0");
+});
+
+test("splitTags 仅预发布且无 latest 时回退最高预发布", () => {
+  const info = splitTags({ alpha: "1.0.0-rc.1", next: "1.0.0-rc.2" });
+  assert.equal(info.channel, "1.0.0-rc.2");
+  assert.equal(pickTarget(info, false).target, "1.0.0-rc.2");
 });
 
 test("replaceDir 快乐路径：新内容就位，旧版与 stage 均消失", async () => {

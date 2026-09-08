@@ -135,6 +135,23 @@ function splitVersions(versions) {
   return { stable, prerelease };
 }
 
+function splitTags(tags) {
+  const values = Object.values(tags).filter((v) => typeof v === "string" && v.trim());
+  if (!values.length) return null;
+  const { stable, prerelease } = splitVersions(values);
+  const latest = typeof tags.latest === "string" && tags.latest.trim() ? tags.latest : null;
+  return { channel: latest || stable || prerelease, stable, prerelease };
+}
+
+// 默认通道 = dist-tag latest（与 npm i pkg / 基线 -DshVer latest 一致）；--pre 时才跟随更高预发布
+function pickTarget(info, pre) {
+  const usePre = !!(
+    pre && info.prerelease && info.prerelease !== info.channel
+    && compareVersions(info.prerelease, info.channel) > 0
+  );
+  return { target: usePre ? info.prerelease : info.channel, isPre: usePre };
+}
+
 
 function registryCandidates(opts) {
   const primary = opts.registry || opts.mirror || DEFAULT_REGISTRY;
@@ -164,9 +181,7 @@ async function queryDistTags(registry) {
     return null;
   }
   if (!tags || typeof tags !== "object") return null;
-  const versions = Object.values(tags).filter((v) => typeof v === "string");
-  if (versions.length === 0) return null;
-  return splitVersions(versions);
+  return splitTags(tags);
 }
 
 
@@ -507,7 +522,7 @@ async function main() {
       let info = null, latestSource = null;
       for (const r of registries) {
         const d = await queryDistTags(r.url);
-        if (d && (d.stable || d.prerelease)) { info = d; latestSource = r.label; break; }
+        if (d) { info = d; latestSource = r.label; break; }
       }
       if (!info) {
         out({ ok: false, error: { kind: "network", message: "暂时无法检查更新", detail: "both registries unreachable" } });
@@ -515,28 +530,17 @@ async function main() {
       }
       const installed = readInstalled(target);
       const current = installed && installed.version ? installed.version : readVersion(target);
-      const stable = info.stable;
-      const prerelease = info.prerelease;
       const cur = current ?? "0.0.0";
-
-      let follow = null;
-      if (opts.pre && prerelease && stable && compareVersions(prerelease, stable) > 0) {
-        follow = prerelease;
-      } else if (stable) {
-        follow = stable;
-      } else {
-        follow = prerelease;
-      }
+      const { target: follow, isPre } = pickTarget(info, opts.pre);
       const target_available = !!follow && follow !== cur && compareVersions(follow, cur) > 0;
-      const pre_available = !!prerelease && prerelease !== cur && compareVersions(prerelease, cur) > 0;
-      
-      const is_pre_target = follow !== null && prerelease !== null && follow === prerelease && follow !== stable;
+
       const action = !target_available
         ? "up-to-date"
-        : (is_pre_target ? "prerelease-available" : "new-version-available");
+        : (isPre ? "prerelease-available" : "new-version-available");
       out({
-        ok: true, action, version: stable, prerelease, pre_available, current,
-        dir: target, source: latestSource,
+        ok: true, action, version: follow,
+        prerelease: isPre ? info.prerelease : null, pre_available: isPre,
+        current, dir: target, source: latestSource,
       });
       return;
     }
@@ -548,7 +552,7 @@ async function main() {
       let info = null, latestSource = null;
       for (const r of registries) {
         const d = await queryDistTags(r.url);
-        if (d && (d.stable || d.prerelease)) { info = d; latestSource = r.label; break; }
+        if (d) { info = d; latestSource = r.label; break; }
       }
       if (!info) {
         out({ ok: false, error: { kind: "network", message: "当前没有网络，更新等联网后自动进行。", detail: "both registries unreachable" } });
@@ -556,21 +560,10 @@ async function main() {
       }
       const installed = readInstalled(target);
       const current = installed && installed.version ? installed.version : readVersion(target);
-      const stable = info.stable;
-      const prerelease = info.prerelease;
       const cur = current ?? "0.0.0";
-      const pre_available = !!prerelease && prerelease !== cur && compareVersions(prerelease, cur) > 0;
-      
-      let targetVersion = null;
-      if (opts.pre && prerelease && stable && compareVersions(prerelease, stable) > 0) {
-        targetVersion = prerelease;
-      } else if (stable) {
-        targetVersion = stable;
-      } else {
-        targetVersion = prerelease;
-      }
-      if (!opts.force && current === targetVersion) {
-        out({ ok: true, action: "up-to-date", version: stable, prerelease, pre_available, current, dir: target, source: latestSource });
+      const { target: follow, isPre } = pickTarget(info, opts.pre);
+      if (!opts.force && follow && compareVersions(follow, cur) <= 0) {
+        out({ ok: true, action: "up-to-date", version: follow, prerelease: null, pre_available: false, current, dir: target, source: latestSource });
         return;
       }
 
@@ -578,7 +571,7 @@ async function main() {
       let fetched = null, usedSource = null, rawDetail = "";
       for (const r of registries) {
         try {
-          fetched = fetchTo(target, r.url, targetVersion);
+          fetched = fetchTo(target, r.url, follow);
           usedSource = r.label;
           break;
         } catch (e) {
@@ -607,7 +600,8 @@ async function main() {
 
       out({
         ok: true, action: "downloaded", version: fetched.version,
-        staging: fetched.stage, prerelease, pre_available, current,
+        staging: fetched.stage, prerelease: isPre ? info.prerelease : null,
+        pre_available: isPre, current,
         dir: target, source: usedSource,
       });
       return;
@@ -693,6 +687,6 @@ if (!invokedByTest) {
 
 export {
   restoreBackup, copyTree, copyTreeFallback, smokeTest, readInstalled, writeInstalled,
-  compareVersions, splitVersions,
+  compareVersions, splitVersions, splitTags, pickTarget,
   replaceDir, swapStaging, retryRename, retriable, cleanRuntimeLeftovers, copyBaseline,
 };
