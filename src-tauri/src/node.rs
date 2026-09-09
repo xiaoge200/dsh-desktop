@@ -196,8 +196,8 @@ fn run_installer_timeout(
     #[cfg(windows)]
     let (success, stdout, stderr) = {
         use crate::winproc::{create_pipe, spawn_hidden, SpawnOpts};
-        let (out_r, out_w) = create_pipe().map_err(|e| format!("cannot start installer: {e}"))?;
-        let (err_r, err_w) = create_pipe().map_err(|e| format!("cannot start installer: {e}"))?;
+        let (mut out_r, out_w) = create_pipe().map_err(|e| format!("cannot start installer: {e}"))?;
+        let (mut err_r, err_w) = create_pipe().map_err(|e| format!("cannot start installer: {e}"))?;
         let mut child = spawn_hidden(SpawnOpts {
             program: normalize_for_node(node),
             args: full_args,
@@ -212,13 +212,13 @@ fn run_installer_timeout(
         let t_out = std::thread::spawn(move || {
             use std::io::Read;
             let mut buf = String::new();
-            let _ = (&mut &out_r).read_to_string(&mut buf);
+            let _ = out_r.read_to_string(&mut buf);
             buf
         });
         let t_err = std::thread::spawn(move || {
             use std::io::Read;
             let mut buf = String::new();
-            let _ = (&mut &err_r).read_to_string(&mut buf);
+            let _ = err_r.read_to_string(&mut buf);
             buf
         });
         let kill = |child: &mut crate::winproc::ChildHandle| {
@@ -263,18 +263,18 @@ fn run_installer_timeout(
         let mut child = cmd
             .spawn()
             .map_err(|e| format!("cannot start installer: {e}"))?;
-        let out = child.stdout.take().unwrap();
-        let err = child.stderr.take().unwrap();
+        let mut out = child.stdout.take().unwrap();
+        let mut err = child.stderr.take().unwrap();
         let t_out = std::thread::spawn(move || {
             use std::io::Read;
             let mut buf = String::new();
-            let _ = (&mut &out).read_to_string(&mut buf);
+            let _ = out.read_to_string(&mut buf);
             buf
         });
         let t_err = std::thread::spawn(move || {
             use std::io::Read;
             let mut buf = String::new();
-            let _ = (&mut &err).read_to_string(&mut buf);
+            let _ = err.read_to_string(&mut buf);
             buf
         });
         let kill = |child: &mut std::process::Child| {
@@ -402,7 +402,7 @@ mod tests {
             assert!(s.contains("linux-"));
         }
     }
- 
+
     #[test]
     fn read_installed_version_parses_json() {
         let dir = std::env::temp_dir().join(format!("dsh-node-test-{}", std::process::id()));
