@@ -14,6 +14,8 @@ const PKG = "@deepseek-ai/dsh";
 const DEFAULT_REGISTRY = "https://registry.npmjs.org";
 const DEFAULT_MIRROR = "https://registry.npmmirror.com";
 const INSTALLED_FILE = ".installed.json";
+// 宿主给一次 install 的总超时是 30 分钟（node.rs INSTALLER_UPDATE_TIMEOUT），降级重装只在预算内才尝试
+const RETRY_BUDGET_MS = 15 * 60 * 1000;
 
 
 function parseArgs(argv) {
@@ -202,18 +204,81 @@ function sweepStaleStaging(parent, keepPid) {
   }
 }
 
-function fetchTo(target, registry, versionSpec) {
+const NATIVE_SCRIPT_HINT = /Failed to load prebuilt binary|rebuilding from source|cnoke/i;
+const TOOLCHAIN_HINT = /node-gyp|gyp ERR|Python|Visual Studio|MSBUILD|CMake/i;
+const NETWORK_HINT = /ETIMEDOUT|ECONNRESET|ENOTFOUND|EAI_AGAIN|ECONNREFUSED|ENETUNREACH|ERR_SOCKET|socket hang up|notarget|fetch failed/i;
+const LOCK_HINT = /EPERM|EBUSY|EACCES|ENOTEMPTY/;
+
+function classifyInstallFailure(output) {
+  const t = String(output || "");
+  if (NATIVE_SCRIPT_HINT.test(t)) return "native-prebuilt";
+  if (TOOLCHAIN_HINT.test(t)) return "build-toolchain";
+  if (NETWORK_HINT.test(t)) return "network";
+  if (LOCK_HINT.test(t)) return "lock";
+  return "unknown";
+}
+
+// 只有原生脚本编译失败才值得再无障碍（--ignore-scripts）装一次；网络/占用类重装也没用
+function retryWithoutScripts(kind) {
+  return kind === "native-prebuilt" || kind === "build-toolchain";
+}
+
+// 多源报错时原生类失败更可操作（能靠降级重装绕开），优先保留它，别被网络错误盖掉
+function pickInstallFailure(prevKind, raw) {
+  const kind = classifyInstallFailure(raw);
+  if (raw && !retryWithoutScripts(prevKind)) return { kind, detail: raw };
+  return { kind: prevKind, detail: null };
+}
+
+function installFailureMessage(kind) {
+  switch (kind) {
+    case "native-prebuilt":
+      return "新版本的原生组件未就绪（本机加载失败），已保留当前版本，请稍后重试。";
+    case "build-toolchain":
+      return "新版本包含需要编译的原生依赖，本机缺少 Python/VS 构建工具链，无法安装该版本。";
+    case "network":
+      return "新版本下载失败（网络或更新源不可用），已保留当前版本，请稍后重试。";
+    case "lock":
+      return `新版本没有装好，不影响现在使用。${lockedHint()}`;
+    default:
+      return "新版本下载失败，已保留当前版本。";
+  }
+}
+
+function logTail(text, n) {
+  return String(text || "").trim().split(/\r?\n/).slice(-n).join("\n");
+}
+
+// 失败细节落盘到 <runtime 同级>/logs/dsh-update-install.log（设置页「打开日志目录」可见），并回显到 stderr 供宿主日志收集
+function recordInstallFailure(target, output, summary) {
+  const text = String(output || "").trim();
+  const tail = text ? logTail(text, 60).slice(0, 4000) : "";
+  try {
+    const dir = join(dirname(target), "logs");
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, "dsh-update-install.log"), `[${new Date().toISOString()}] ${summary}\n${text}\n`, "utf8");
+  } catch {  }
+  if (tail) log("npm output:\n" + tail);
+  return tail;
+}
+
+// 只用 npm 11/12 都认的开关；脚本门槛靠 --ignore-scripts，不依赖 npm 12 才有的 allow-scripts 配置
+function installArgs(stage, registry, spec, ignoreScripts) {
+  const args = ["install", spec, "--prefix", stage, "--registry", registry, "--no-audit", "--no-fund", "--no-update-notifier", "--loglevel=warn"];
+  if (ignoreScripts) args.push("--ignore-scripts", "--prefer-online");
+  return args;
+}
+
+function fetchTo(target, registry, versionSpec, opts = {}) {
   const parent = dirname(target);
   const stage = join(parent, ".dsh-runtime-staging-" + process.pid);
   rmSync(stage, { recursive: true, force: true });
   sweepStaleStaging(parent, process.pid);
   mkdirSync(stage, { recursive: true });
   const spec = versionSpec ? `${PKG}@${versionSpec}` : PKG;
-  const res = runNpm(
-    ["install", spec, "--prefix", stage, "--registry", registry, "--no-audit", "--no-fund", "--no-update-notifier", "--loglevel=error"],
-    { timeout: 1_800_000 });
+  const res = runNpm(installArgs(stage, registry, spec, !!opts.ignoreScripts), { timeout: 1_800_000 });
   if (res.status !== 0) {
-    rmSync(stage, { recursive: true, force: true }); 
+    rmSync(stage, { recursive: true, force: true });
     const detail = (res.stderr || res.stdout || "").trim();
     throw Object.assign(new Error(detail), { kind: "install" });
   }
@@ -223,7 +288,71 @@ function fetchTo(target, registry, versionSpec) {
     throw Object.assign(new Error(`manifest missing after install: ${manifest}`), { kind: "install" });
   }
   const version = JSON.parse(readFileSync(manifest, "utf8")).version;
-  return { version, stage };
+  return { version, stage, ignoreScripts: !!opts.ignoreScripts };
+}
+
+// koffi 的 install 脚本（cnoke --prebuild）会在预编译包误判时转源码编译，是下载失败的主要来源；
+// 跳过全部脚本后，只补跑确实需要且安全的两个包，避免 Windows 缺 conpty.dll、非 Windows 缺可执行位
+const NEEDED_SCRIPT_PACKAGES = ["node-pty", "@deepseek-ai/dsh-subprocess-local"];
+
+function runNeededScripts(stage) {
+  const nm = join(stage, "node_modules");
+  const present = NEEDED_SCRIPT_PACKAGES.filter((n) => existsSync(join(nm, ...n.split("/"))));
+  if (!present.length) return;
+  const res = runNpm(
+    ["rebuild", ...present, "--prefix", stage, "--no-audit", "--no-fund", "--no-update-notifier", "--loglevel=warn"],
+    { timeout: 600_000 });
+  if (res.status !== 0) {
+    log("rebuild of needed packages failed (continuing): " + logTail((res.stderr || res.stdout || "").trim(), 20));
+  }
+}
+
+const NATIVE_PROBE = `
+const path = require("node:path");
+const dir = process.argv[1];
+const out = (o) => console.log(JSON.stringify(o));
+try {
+  const koffi = require(dir);
+  const want = require(path.join(dir, "package.json")).version;
+  if (koffi.version !== want) {
+    out({ ok: false, why: "版本不匹配：" + koffi.version + " != " + want });
+    process.exit(0);
+  }
+  const lib = process.platform === "win32" ? "kernel32.dll" : process.platform === "darwin" ? "libSystem.B.dylib" : "libc.so.6";
+  const fn = process.platform === "win32"
+    ? koffi.load(lib).func("GetTickCount", "int", [])
+    : koffi.load(lib).func("getpid", "int", []);
+  fn();
+  out({ ok: true, version: want });
+} catch (e) {
+  out({ ok: false, why: String((e && e.message) || e) });
+}
+`;
+
+function probeKoffi(stage) {
+  const dir = join(stage, "node_modules", "koffi");
+  if (!existsSync(dir)) return { ok: true, skipped: true };
+  const res = spawnSync(process.execPath, ["-e", NATIVE_PROBE, dir], { encoding: "utf8", timeout: 60_000, windowsHide: true });
+  const line = (res.stdout || "").trim().split(/\r?\n/).filter(Boolean).pop();
+  if (!line) return { ok: false, why: `原生探测进程异常退出（status ${res.status}）` };
+  try {
+    return JSON.parse(line);
+  } catch {
+    return { ok: false, why: "原生探测输出无法解析：" + line.slice(0, 200) };
+  }
+}
+
+// 换入前验证原生组件真能加载并调用：上游 koffi 预编译包在部分 Windows 机器上调用即崩，
+// 探测放在子进程里，崩溃只让本次更新放弃，不会污染当前运行时
+function verifyNative(stage) {
+  const problems = [];
+  const k = probeKoffi(stage);
+  if (!k.ok) problems.push(`koffi ${k.why}`);
+  const pty = join(stage, "node_modules", "node-pty");
+  if (existsSync(pty) && !existsSync(join(pty, "prebuilds", `${process.platform}-${process.arch}`)) && !existsSync(join(pty, "build", "Release"))) {
+    problems.push("node-pty 缺少预编译模块");
+  }
+  return { ok: problems.length === 0, why: problems.join("；") };
 }
 
 
@@ -568,24 +697,47 @@ async function main() {
       }
 
       
-      let fetched = null, usedSource = null, rawDetail = "";
-      for (const r of registries) {
-        try {
-          fetched = fetchTo(target, r.url, follow);
-          usedSource = r.label;
-          break;
-        } catch (e) {
-          const raw = String((e && e.message) || "");
-          if (raw) rawDetail = raw;
-          if (/Python|node-gyp|gyp ERR|Visual Studio|MSBUILD/i.test(raw)) break;
+      let fetched = null, usedSource = null, rawDetail = "", failKind = "unknown";
+      const startedAt = Date.now();
+      for (const ignoreScripts of [false, true]) {
+        for (const r of registries) {
+          try {
+            fetched = fetchTo(target, r.url, follow, { ignoreScripts });
+            usedSource = r.label;
+            break;
+          } catch (e) {
+            const picked = pickInstallFailure(failKind, String((e && e.message) || ""));
+            failKind = picked.kind;
+            if (picked.detail) rawDetail = picked.detail;
+          }
         }
+        if (fetched) break;
+        if (!retryWithoutScripts(failKind)) break;
+        if (Date.now() - startedAt > RETRY_BUDGET_MS) {
+          log("install already took too long; keeping this failure instead of retrying");
+          break;
+        }
+        log(`install failed (${failKind}); retrying with --ignore-scripts`);
       }
       if (!fetched) {
-        const needToolchain = /Python|node-gyp|gyp ERR|Visual Studio|MSBUILD/i.test(rawDetail);
-        const message = needToolchain
-          ? "新版本包含需要编译的原生依赖，本机缺少 Python/VS 构建工具链，无法安装该版本。"
-          : "新版本下载失败，已保留当前版本。";
-        out({ ok: false, error: { kind: "install", message, detail: rawDetail.slice(0, 600) } });
+        recordInstallFailure(target, rawDetail, `install failed: ${failKind}`);
+        out({ ok: false, error: { kind: "install", message: installFailureMessage(failKind), detail: rawDetail.slice(0, 600) } });
+        process.exit(1);
+      }
+      if (fetched.ignoreScripts) runNeededScripts(fetched.stage);
+
+      const native = verifyNative(fetched.stage);
+      if (!native.ok) {
+        rmSync(fetched.stage, { recursive: true, force: true });
+        recordInstallFailure(target, native.why, "native verification failed");
+        out({
+          ok: false,
+          error: {
+            kind: "integrity",
+            message: `新版本的原生组件未就绪（${native.why}），已保留当前版本，请稍后重试。`,
+            detail: String(native.why).slice(0, 600),
+          },
+        });
         process.exit(1);
       }
 
@@ -689,4 +841,6 @@ export {
   restoreBackup, copyTree, copyTreeFallback, smokeTest, readInstalled, writeInstalled,
   compareVersions, splitVersions, splitTags, pickTarget,
   replaceDir, swapStaging, retryRename, retriable, cleanRuntimeLeftovers, copyBaseline,
+  classifyInstallFailure, installFailureMessage, retryWithoutScripts, pickInstallFailure,
+  logTail, installArgs, recordInstallFailure, runNeededScripts, probeKoffi, verifyNative,
 };

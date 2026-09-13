@@ -119,6 +119,11 @@ fn apply_swap(
             match node::run_swap(node, installer, runtime, &staging) {
                 Ok(out) => {
                     let sw = node::parse_installer_output(&out);
+                    if !sw.ok {
+                        if let Some(d) = sw.detail.as_deref() {
+                            log::warn!("dsh swap failed: {d}");
+                        }
+                    }
                     let new_version = sw.version.clone();
                     let message = if sw.ok && sw.action == "updated" {
                         format!("已更新到 {}", new_version.clone().unwrap_or_default())
@@ -269,6 +274,9 @@ async fn check_update_flow(app: AppHandle) -> Result<DshUpdateStatus, String> {
             Ok(out) => {
                 let r = node::parse_installer_output(&out);
                 if !r.ok {
+                    if let Some(d) = r.detail.as_deref() {
+                        log::warn!("dsh check failed: {d}");
+                    }
                     DshUpdateStatus {
                         ok: false,
                         update_available: false,
@@ -371,6 +379,7 @@ async fn apply_update_flow(app: AppHandle) -> Result<DshUpdateStatus, String> {
                 return status;
             }
             Err(e) => {
+                log::warn!("dsh update runner failed: {e}");
                 let status = DshUpdateStatus {
                     ok: false,
                     update_available: false,
@@ -385,6 +394,14 @@ async fn apply_update_flow(app: AppHandle) -> Result<DshUpdateStatus, String> {
             }
         };
         if !u.ok {
+            let mut message = u.message.clone().unwrap_or_else(|| "更新失败，已保留当前版本。".into());
+            if let Some(d) = u.detail.as_deref() {
+                log::warn!("dsh update failed: {d}");
+                if !message.ends_with('。') {
+                    message.push('。');
+                }
+                message.push_str("详情见日志目录。");
+            }
             let status = DshUpdateStatus {
                 ok: false,
                 update_available: false,
@@ -392,7 +409,7 @@ async fn apply_update_flow(app: AppHandle) -> Result<DshUpdateStatus, String> {
                 latest: u.version.clone(),
                 prerelease: u.prerelease.clone(),
                 pre_available: u.pre_available,
-                message: u.message.unwrap_or_else(|| "更新失败，已保留当前版本。".into()),
+                message,
             };
             notify_dsh_update(&app2, false, &status.message);
             state.set_dsh_update(status.clone());

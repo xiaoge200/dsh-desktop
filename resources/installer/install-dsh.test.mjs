@@ -23,6 +23,8 @@ const INSTALLER = fileURLToPath(new URL("./install-dsh.mjs", import.meta.url));
 const {
   restoreBackup, copyTreeFallback, compareVersions, splitVersions, splitTags, pickTarget,
   replaceDir, retriable, cleanRuntimeLeftovers,
+  classifyInstallFailure, installFailureMessage, retryWithoutScripts, pickInstallFailure,
+  logTail, installArgs, probeKoffi, verifyNative,
 } = await import("./install-dsh.mjs");
 
 function scratch(name) {
@@ -329,5 +331,100 @@ test("replaceDir keepOld 保留 .old 供 smoke 后回滚", async () => {
   assert.equal(readFileSync(join(target, "mark.txt"), "utf8"), "new");
   assert.ok(existsSync(target + ".old"), ".old 应保留");
   assert.equal(readFileSync(join(target + ".old", "mark.txt"), "utf8"), "old");
+  rmSync(root, { recursive: true, force: true });
+});
+
+test("classifyInstallFailure 区分原生预编译/编译工具链/网络/占用", () => {
+  const cnoke = [
+    "npm error code 1",
+    "npm error command failed",
+    "npm error command C:\\node.exe ./cnoke.cjs -P . -D src/koffi --prebuild --release",
+    "Failed to load prebuilt binary, rebuilding from source",
+    "CMake Error: Could not create named generator Visual Studio 17 2022",
+  ].join("\n");
+  assert.equal(classifyInstallFailure(cnoke), "native-prebuilt");
+
+  const gyp = "npm error gyp ERR! find Python\ngyp ERR! find VS - missing any VC++ toolset";
+  assert.equal(classifyInstallFailure(gyp), "build-toolchain");
+
+  assert.equal(classifyInstallFailure("npm error code ETIMEDOUT\nnpm error network request to https://registry.npmjs.org failed"), "network");
+  assert.equal(classifyInstallFailure("npm error code EPERM\nnpm error syscall rename"), "lock");
+  assert.equal(classifyInstallFailure(""), "unknown");
+  assert.equal(classifyInstallFailure(null), "unknown");
+});
+
+test("retryWithoutScripts 只对会转源码编译的失败降级重装", () => {
+  assert.ok(retryWithoutScripts("native-prebuilt"));
+  assert.ok(retryWithoutScripts("build-toolchain"));
+  assert.ok(!retryWithoutScripts("network"));
+  assert.ok(!retryWithoutScripts("lock"));
+  assert.ok(!retryWithoutScripts("unknown"));
+});
+
+test("pickInstallFailure 原生类失败优先于网络错误保留", () => {
+  assert.deepEqual(pickInstallFailure("unknown", "npm error code ETIMEDOUT"), {
+    kind: "network", detail: "npm error code ETIMEDOUT",
+  });
+  const native = "Failed to load prebuilt binary, rebuilding from source";
+  assert.deepEqual(pickInstallFailure("network", native), { kind: "native-prebuilt", detail: native });
+  const kept = pickInstallFailure("native-prebuilt", "npm error code ETIMEDOUT");
+  assert.equal(kept.kind, "native-prebuilt");
+  assert.equal(kept.detail, null);
+  assert.equal(pickInstallFailure("unknown", "").kind, "unknown");
+});
+
+test("installFailureMessage 每类都有白话说明且指向已保留旧版本", () => {
+  for (const kind of ["native-prebuilt", "build-toolchain", "network", "lock", "unknown"]) {
+    const m = installFailureMessage(kind);
+    assert.ok(m && !/undefined/.test(m), kind);
+  }
+  assert.notEqual(installFailureMessage("native-prebuilt"), installFailureMessage("build-toolchain"));
+  assert.match(installFailureMessage("network"), /网络|更新源/);
+});
+
+test("installArgs 降级轮才带 --ignore-scripts，且保留 warn 级线索", () => {
+  const normal = installArgs("C:/s", "https://registry.npmjs.org", "@deepseek-ai/dsh@1.0.0", false);
+  assert.ok(!normal.includes("--ignore-scripts"));
+  assert.ok(normal.includes("--loglevel=warn"), "需保留 SKIPPING OPTIONAL DEPENDENCY 等 warn 线索");
+  assert.equal(normal[0], "install");
+
+  const fallback = installArgs("C:/s", "https://registry.npmjs.org", "@deepseek-ai/dsh@1.0.0", true);
+  assert.ok(fallback.includes("--ignore-scripts"));
+  assert.ok(fallback.includes("--prefer-online"));
+});
+
+test("logTail 取末尾若干行", () => {
+  assert.equal(logTail("a\nb\nc\nd", 2), "c\nd");
+  assert.equal(logTail("  only  ", 5), "only");
+  assert.equal(logTail("", 3), "");
+});
+
+test("probeKoffi 对缺 koffi 的树跳过，对版本不匹配的树判失败", () => {
+  const empty = scratch("probe-empty");
+  assert.equal(probeKoffi(empty).ok, true, "没有 koffi 的树不应拖垮更新");
+
+  const bad = scratch("probe-mismatch");
+  const kdir = join(bad, "node_modules", "koffi");
+  mkdirSync(kdir, { recursive: true });
+  writeFileSync(join(kdir, "package.json"), JSON.stringify({ name: "koffi", version: "9.9.9", main: "index.js" }));
+  writeFileSync(join(kdir, "index.js"), "module.exports = { version: '1.0.0' };");
+  const r = probeKoffi(bad);
+  assert.equal(r.ok, false);
+  assert.match(r.why, /版本不匹配/);
+
+  rmSync(empty, { recursive: true, force: true });
+  rmSync(bad, { recursive: true, force: true });
+});
+
+test("verifyNative 缺 node-pty 预编译模块时拒绝换入", () => {
+  const root = scratch("verify-pty");
+  mkdirSync(join(root, "node_modules", "node-pty"), { recursive: true });
+  const r = verifyNative(root);
+  assert.equal(r.ok, false);
+  assert.match(r.why, /node-pty/);
+
+  mkdirSync(join(root, "node_modules", "node-pty", "prebuilds", `${process.platform}-${process.arch}`), { recursive: true });
+  assert.equal(verifyNative(root).ok, true);
+
   rmSync(root, { recursive: true, force: true });
 });
