@@ -39,13 +39,16 @@ jobs:
           - platform: macos-latest
             args: '--target x86_64-apple-darwin --bundles app,dmg'
             label: macos-x86_64
-          - platform: ubuntu-22.04
-            args: '--bundles appimage,deb,rpm'
-            label: linux-amd64
-          - platform: ubuntu-22.04-arm
-            # AppImage 工具链不支持交叉编译，用官方 ARM64 runner 原生构建
-            args: '--bundles appimage,deb,rpm'
-            label: linux-aarch64
+          # Linux 暂不打包（linuxdeploy 在 dsh 的静态/musl native 模块上失败：
+          # @deepseek-ai/node-addon-system-* 的 bin/landlock-run 无 .dynamic 段、bin/musl/system.node ldd 失败）。
+          # 恢复前需先补 prepare-resources.ps1 的清理列表，并恢复 release job 的 03- 前缀与 glob。
+          # - platform: ubuntu-22.04
+          #   args: '--bundles appimage,deb,rpm'
+          #   label: linux-amd64
+          # - platform: ubuntu-22.04-arm
+          #   # AppImage 工具链不支持交叉编译，用官方 ARM64 runner 原生构建
+          #   args: '--bundles appimage,deb,rpm'
+          #   label: linux-aarch64
 
     runs-on: ${{ matrix.platform }}
     timeout-minutes: 90
@@ -288,7 +291,6 @@ jobs:
 
           - **Windows**：\`*-setup.exe\`（NSIS，免管理员安装）/ \`*-x64.msi\`（MSI）
           - **macOS**：\`*-x64.dmg\`（Intel）/ \`*-aarch64.dmg\`（Apple Silicon）
-          - **Linux**：\`*_amd64.deb\`、\`*_amd64.AppImage\`、\`*_arm64.deb\`、\`*_arm64.AppImage\`
 
           > macOS 安装包在未配置签名/公证前为未签名版本，首次打开请右键 →「打开」。
           GITCLIFF_EOF
@@ -318,7 +320,7 @@ jobs:
           }
           prefix_dir "01-" bundle-windows
           prefix_dir "02-" bundle-macos-aarch64 bundle-macos-x86_64
-          prefix_dir "03-" bundle-linux-amd64 bundle-linux-aarch64
+          # prefix_dir "03-" bundle-linux-amd64 bundle-linux-aarch64
           echo "=== Ordered assets ==="
           ls -la ordered-assets/
 
@@ -351,6 +353,5 @@ jobs:
           files: |
             ordered-assets/01-*
             ordered-assets/02-*
-            ordered-assets/03-*
             ordered-assets/latest.json
           fail_on_unmatched_files: false

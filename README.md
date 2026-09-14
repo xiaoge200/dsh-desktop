@@ -72,7 +72,7 @@ DSH（DeepSeek Harness）是一个**运行在你本地电脑上**的 AI 智能�
 2. 选择最新版本，下载对应系统的安装包：
    - **Windows**：`.msi` / `.exe`（要求 Win10 及以上，无需管理员权限）
    - **macOS**：`.dmg`（要求 macOS 11 及以上）
-   - **Linux**：`.deb` / `.rpm` / `.AppImage`（需 webkit2gtk 运行库）
+   - **Linux**：暂不提供（打包链路待修复）
 3. 双击安装包，一路点「下一步」完成安装
 
 ### 第 2 步：启动

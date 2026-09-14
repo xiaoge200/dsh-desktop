@@ -73,7 +73,7 @@ In short: a zero-friction, desktop version of DSH.
 2. Pick the latest release and download the installer for your platform:
    - **Windows**: `.msi` / `.exe` (Windows 10 or later, no admin rights needed)
    - **macOS**: `.dmg` (macOS 11 or later)
-   - **Linux**: `.deb` / `.rpm` / `.AppImage` (requires the webkit2gtk runtime)
+   - **Linux**: not available yet (packaging pipeline pending)
 3. Double-click the installer and click through the prompts to finish.
 
 ### Step 2: Launch it
