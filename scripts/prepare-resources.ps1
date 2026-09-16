@@ -1,21 +1,12 @@
-
-
-
-
-
-
-
-
-
-
-
-
 param(
   [string]$NodeVer = "v24.9.0",
   [switch]$SkipBaseline,
+  [switch]$SkipPnpm,
   [string]$Registry = "https://registry.npmmirror.com",
   [string]$DshVer = "latest",
-  [string]$NodeBase = "https://registry.npmmirror.com/-/binary/node"
+  [string]$PnpmVer = "11.7.0",
+  [string]$NodeBase = "https://registry.npmmirror.com/-/binary/node",
+  [string]$NodePlat = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -23,25 +14,28 @@ $root = Split-Path -Parent $PSScriptRoot
 
 $tmpRoot = [System.IO.Path]::GetTempPath()
 
-function Get-NodePlatformDir {
-  if ($IsWindows) { return "win-x64" }
-  $arch = (& uname -m) 2>$null
-  if (-not $arch) { $arch = $env:PROCESSOR_ARCHITECTURE }
-  $isArm = $arch -match "arm|aarch64"
-  if ($IsMacOS) {
-    if ($isArm) { return "mac-arm64" }
-    return "mac-x64"
-  }
-  if ($isArm) { return "linux-arm64" }
-  return "linux-x64"
+$platInfo = @{
+  "win-x64"     = @{ distro = "win";    npmOs = "win32";  arch = "x64" }
+  "mac-arm64"   = @{ distro = "darwin"; npmOs = "darwin"; arch = "arm64" }
+  "mac-x64"     = @{ distro = "darwin"; npmOs = "darwin"; arch = "x64" }
+  "linux-arm64" = @{ distro = "linux";  npmOs = "linux";  arch = "arm64" }
+  "linux-x64"   = @{ distro = "linux";  npmOs = "linux";  arch = "x64" }
 }
 
-function Get-LinuxArchitecture {
-  $arch = (& uname -m) 2>$null
-  if (-not $arch) { throw "Unable to determine Linux architecture." }
-  if ($arch -match "aarch64|arm64") { return "arm64" }
-  if ($arch -match "x86_64|amd64") { return "x64" }
-  throw "Unsupported Linux architecture: $arch"
+function Get-NodePlatformDir {
+  if ($env:OS -eq "Windows_NT") { return "win-x64" }
+  $sys = ""
+  try { $sys = "$(& uname -s 2>$null)".Trim() } catch { $sys = "" }
+  if (-not $sys) {
+    if ($IsMacOS) { $sys = "Darwin" } elseif ($IsLinux) { $sys = "Linux" }
+  }
+  $machine = ""
+  try { $machine = "$(& uname -m 2>$null)".Trim() } catch { $machine = "" }
+  if (-not $machine) { $machine = $env:PROCESSOR_ARCHITECTURE }
+  $isArm = $machine -match "arm|aarch64"
+  if ($sys -match "Darwin") { if ($isArm) { return "mac-arm64" } return "mac-x64" }
+  if ($isArm) { return "linux-arm64" }
+  return "linux-x64"
 }
 
 function Remove-IfExists {
@@ -55,47 +49,50 @@ function Remove-IfExists {
   }
 }
 
-$plat = Get-NodePlatformDir
+$plat = if ("$NodePlat".Trim() -ne "") { "$NodePlat".Trim() } else { Get-NodePlatformDir }
+if (-not $platInfo.ContainsKey($plat)) {
+  throw "Unsupported -NodePlat '$plat' (expected one of: $($platInfo.Keys -join ', '))"
+}
+$distro = $platInfo[$plat].distro
+$npmOs = $platInfo[$plat].npmOs
+$arch = $platInfo[$plat].arch
+$nodeIsWindows = $plat -eq "win-x64"
+$nodeExeName = if ($nodeIsWindows) { "node.exe" } else { "node" }
+
 $nodeDir = Join-Path $root "resources\node\$plat"
 
 Write-Host "==> Node: $NodeVer / $plat" -ForegroundColor Cyan
 
-
-
-
-if (-not (Test-Path "$nodeDir\node$(if ($IsWindows) {'.exe'})")) {
-  Write-Host "==> Downloading Node $NodeVer..." -ForegroundColor Cyan
+if (-not (Test-Path (Join-Path $nodeDir $nodeExeName))) {
+  Write-Host "==> Downloading Node $NodeVer ($distro-$arch)..." -ForegroundColor Cyan
   $base = "$NodeBase/$NodeVer"
 
-  if ($IsWindows) {
-    $zip = Join-Path $tmpRoot "node-$NodeVer-win-x64.zip"
-    Invoke-WebRequest -Uri "$base/node-$NodeVer-win-x64.zip" -OutFile $zip -UseBasicParsing
+  if ($nodeIsWindows) {
+    $zip = Join-Path $tmpRoot "node-$NodeVer-$distro-$arch.zip"
+    Invoke-WebRequest -Uri "$base/node-$NodeVer-$distro-$arch.zip" -OutFile $zip -UseBasicParsing
 
-    $extract = Join-Path $tmpRoot "node-$NodeVer-extract"
+    $extract = Join-Path $tmpRoot "node-$NodeVer-$distro-$arch-extract"
     if (Test-Path $extract) { Remove-Item $extract -Recurse -Force }
     Expand-Archive -Path $zip -DestinationPath $extract -Force
 
     New-Item -ItemType Directory -Force -Path $nodeDir | Out-Null
-    $src = "$extract\node-$NodeVer-win-x64"
+    $src = "$extract\node-$NodeVer-$distro-$arch"
     Copy-Item "$src\node.exe" "$nodeDir\node.exe" -Force
     Copy-Item "$src\node_modules" "$nodeDir\node_modules" -Recurse -Force
     Copy-Item "$src\npm*" "$nodeDir\" -Recurse -Force
     Copy-Item "$src\npx*" "$nodeDir\" -Recurse -Force
   } else {
     # Node 官方发行包：darwin-arm64 / darwin-x64 / linux-arm64 / linux-x64
-    $distro = if ($IsMacOS) { "darwin" } else { "linux" }
-    $nodeArch = if ($plat -match "arm64") { "arm64" } else { "x64" }
+    $tar = Join-Path $tmpRoot "node-$NodeVer-$distro-$arch.tar.gz"
+    Invoke-WebRequest -Uri "$base/node-$NodeVer-$distro-$arch.tar.gz" -OutFile $tar -UseBasicParsing
 
-    $tar = Join-Path $tmpRoot "node-$NodeVer-$distro-$nodeArch.tar.gz"
-    Invoke-WebRequest -Uri "$base/node-$NodeVer-$distro-$nodeArch.tar.gz" -OutFile $tar -UseBasicParsing
-
-    $extract = Join-Path $tmpRoot "node-$NodeVer-$distro-$nodeArch-extract"
+    $extract = Join-Path $tmpRoot "node-$NodeVer-$distro-$arch-extract"
     if (Test-Path $extract) { Remove-Item $extract -Recurse -Force }
     New-Item -ItemType Directory -Force -Path $extract | Out-Null
     tar -xzf $tar -C $extract
 
     New-Item -ItemType Directory -Force -Path $nodeDir | Out-Null
-    $src = "$extract\node-$NodeVer-$distro-$nodeArch"
+    $src = "$extract\node-$NodeVer-$distro-$arch"
     Copy-Item "$src\bin\node" "$nodeDir\node" -Force
     Copy-Item "$src\lib" "$nodeDir\lib" -Recurse -Force
   }
@@ -103,6 +100,58 @@ if (-not (Test-Path "$nodeDir\node$(if ($IsWindows) {'.exe'})")) {
   Write-Host "==> Node ready: $nodeDir" -ForegroundColor Green
 } else {
   Write-Host "==> Node already present, skip" -ForegroundColor DarkGray
+}
+
+if ($SkipPnpm) {
+  Write-Host "==> pnpm bundling skipped" -ForegroundColor DarkGray
+} else {
+  $pnpmDir = Join-Path $root "resources\pnpm"
+  $pnpmEntry = Join-Path $pnpmDir "bin\pnpm.mjs"
+
+  if (-not (Test-Path $pnpmEntry)) {
+    Write-Host "==> Bundling pnpm $PnpmVer..." -ForegroundColor Cyan
+
+    $work = Join-Path $tmpRoot "pnpm-bundle-build"
+    if (Test-Path $work) { Remove-Item $work -Recurse -Force }
+    New-Item -ItemType Directory -Force -Path $work | Out-Null
+
+    npm install "pnpm@$PnpmVer" --prefix $work --no-audit --no-fund --no-save --registry $Registry --loglevel=error
+
+    $src = Join-Path $work "node_modules\pnpm"
+    if (-not (Test-Path (Join-Path $src "bin\pnpm.mjs"))) {
+      throw "pnpm package layout unexpected (bin/pnpm.mjs missing): $src"
+    }
+
+    if (Test-Path $pnpmDir) { Remove-Item $pnpmDir -Recurse -Force }
+    New-Item -ItemType Directory -Force -Path $pnpmDir | Out-Null
+    Move-Item $src $pnpmDir -Force
+    Remove-Item $work -Recurse -Force
+
+    Write-Host "==> pnpm ready: $pnpmDir" -ForegroundColor Green
+  } else {
+    Write-Host "==> pnpm already present, skip" -ForegroundColor DarkGray
+  }
+
+  $nodeBin = Join-Path $nodeDir $nodeExeName
+  if (Test-Path $nodeBin) {
+    $nodeVer = ""
+    $nodeRuns = $false
+    try {
+      $nodeVer = "$(& $nodeBin --version 2>&1 | Select-Object -First 1)".Trim()
+      $nodeRuns = $LASTEXITCODE -eq 0
+    } catch {
+      $nodeVer = $_.Exception.Message
+    }
+    if (-not $nodeRuns) {
+      Write-Host "==> pnpm smoke skipped: bundled node ($plat) does not run on this host: $nodeVer" -ForegroundColor Yellow
+    } else {
+      $pnpmVer = & $nodeBin $pnpmEntry --version 2>&1
+      if ($LASTEXITCODE -ne 0) {
+        throw "bundled pnpm failed to run: $pnpmVer"
+      }
+      Write-Host "==> pnpm smoke ok: pnpm $pnpmVer on node $nodeVer" -ForegroundColor Green
+    }
+  }
 }
 
 # ============================================================
@@ -122,7 +171,7 @@ if (-not $SkipBaseline) {
     try {
       # 大依赖树在 CI 上可能触发 npm JavaScript heap OOM
       $env:NODE_OPTIONS = "--max-old-space-size=4096"
-      npm install "@deepseek-ai/dsh@$DshVer" --no-audit --no-fund --registry $Registry --loglevel=error
+      npm install "@deepseek-ai/dsh@$DshVer" --os $npmOs --cpu $arch --no-audit --no-fund --registry $Registry --loglevel=error
     } finally {
       Pop-Location
     }
@@ -136,15 +185,8 @@ if (-not $SkipBaseline) {
     Write-Host "==> Baseline already present, skip" -ForegroundColor DarkGray
   }
 
-  # ==========================================================
-  # Linux native module cleanup
-  #
-  # npm 会安装 optionalDependencies / prebuilds，可能把 x64、arm64、musl 等
-  # 多个平台的 native binary 同时放进 node_modules。linuxdeploy 会扫描 AppDir
-  # 中所有 ELF 文件，因此无关架构/ABI 的文件必须在打包前移除。
-  # ==========================================================
-  if ($IsLinux) {
-    $linuxArch = Get-LinuxArchitecture
+  if ($plat -like "linux-*") {
+    $linuxArch = $arch
     Write-Host ""
     Write-Host "==> Cleaning Linux native modules for $linuxArch..." -ForegroundColor Cyan
 

@@ -72,7 +72,7 @@ In short: a zero-friction, desktop version of DSH.
 1. Open the **Releases** page of this repository: <https://github.com/xiaoge200/dsh-desktop/releases>
 2. Pick the latest release and download the installer for your platform:
    - **Windows**: `.msi` / `.exe` (Windows 10 or later, no admin rights needed)
-   - **macOS**: `.dmg` (macOS 11 or later)
+   - **macOS**: `.dmg` (Apple Silicon / arm64; macOS 11 or later. Intel builds not published yet)
    - **Linux**: not available yet (packaging pipeline pending)
 3. Double-click the installer and click through the prompts to finish.
 
@@ -119,6 +119,18 @@ If your antivirus blocks the app, add the installer or the installation director
 
 **Q: The UI shows in English/Chinese — can I switch it?**
 The interface language follows your system language automatically (Chinese/English); no manual setting is needed.
+
+**Q: The in-app plugin market asks me to set up pnpm (pnpm not found / no permission / executable already exists)?**
+Since 0.1.8 the desktop app bundles pnpm and the market uses it, so nothing needs to be installed
+system-wide. If you hit this on **0.1.7 or earlier**, run the command from the message once in a
+terminal and restart the app:
+
+```bash
+npm i -g pnpm --force        # on Windows, run the terminal as Administrator
+brew install pnpm            # macOS (Homebrew)
+```
+
+Either way the market in the settings window's Plugins tab still works — it uses the bundled npm.
 
 ## 🛠️ Developer Guide (Build from Source)
 

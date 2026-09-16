@@ -4,6 +4,7 @@ mod dsh_update;
 mod logging;
 mod node;
 mod plugins;
+mod pnpm_env;
 mod service;
 mod serviceout;
 mod settings;
@@ -274,6 +275,10 @@ fn boot(app: AppHandle) {
     }
     state.set_runtime_dir(runtime_dir.clone());
     state.set_workspace_dir(workspace_dir);
+
+    if pnpm_env::activate(&resource_dir, &app_data).is_none() {
+        log::warn!("pnpm: no bundled pnpm; the market falls back to a system pnpm");
+    }
 
     state.supervisor.lock().unwrap().set_log_dir(app_data.join("logs"));
 
@@ -577,9 +582,10 @@ fn handle_page_load(
 ) {
     if let tauri::webview::PageLoadEvent::Finished = payload.event() {
         if payload.url().scheme() == "http" && webview.label() == "main" {
-            if let Err(e) = webview.eval(include_str!("../assets/ctx-menu.js")) {
-                log::warn!("ctx script eval failed: {e}");
-            }
+            // 与网页自带的右键菜单冲突，勿启用（托盘与设置里仍有设置/重启服务/退出）
+            // if let Err(e) = webview.eval(include_str!("../assets/ctx-menu.js")) {
+            //     log::warn!("ctx script eval failed: {e}");
+            // }
             if payload.url().host_str() == Some("127.0.0.1") {
                 if let Err(e) = webview.eval(include_str!("../assets/notify-shim.js")) {
                     log::warn!("notify shim eval failed: {e}");

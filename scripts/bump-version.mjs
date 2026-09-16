@@ -40,6 +40,12 @@ for (const rel of ["package.json", "package-lock.json"]) {
     continue;
   }
   json.version = next;
+  // npm 会在 lockfile 里同时写根项目和 packages[""] 的版本；只改前者会让
+  // package-lock.json 永远停在旧版本（此前 = 0.1.5），下次 npm install 又把它
+  // 改回去，diff 里多出一行无关改动。
+  if (json.packages?.[""] && semverOk(String(json.packages[""].version))) {
+    json.packages[""].version = next;
+  }
   writeFileSync(p, JSON.stringify(json, null, 2) + "\n");
 }
 

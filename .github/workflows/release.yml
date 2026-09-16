@@ -4,7 +4,12 @@
 # 架构：build 矩阵只产 artifact（不碰 release）→ release job 按平台加前缀
 #   （01-Win/02-macOS/03-Linux，保证 Releases 页分组顺序）后创建草稿并上传（重跑幂等）；
 #   有签名密钥时重建 latest.json（updater 清单）。
-# macOS：x86_64 在 arm64 runner 交叉编译；MSI：WiX 语言 zh-CN（代码页 936）处理中文 productName。
+# macOS：只发 Apple Silicon（arm64，macos-latest 原生构建）。不再发 Intel/x86_64：
+#   交叉构建产不出可用包——内置 Node 的目录名取自 target 架构（src/node.rs），而 dsh 基线里
+#   koffi / node-pty 的 install 钩子按宿主架构编译，arm64 上烤出的 x86_64 包既缺
+#   node/mac-x64 又缺 x86_64 原生模块。要恢复 Intel 包，必须换回 Intel runner
+#   （如 macos-15-intel）并在该矩阵条目补 nodePlat: mac-x64 / rustTargets: x86_64-apple-darwin。
+# MSI：WiX 语言 zh-CN（代码页 936）处理中文 productName。
 # Secrets（缺失则跳过对应能力）：
 #   TAURI_SIGNING_PRIVATE_KEY(_PASSWORD) — updater 签名，缺失则无 .sig/latest.json
 #   APPLE_* — macOS 签名+公证，缺失则 macOS 产物未签名
@@ -32,16 +37,19 @@ jobs:
         include:
           - platform: windows-latest
             args: '--bundles nsis,msi'
+            nodePlat: win-x64
+            rustTargets: ''
             label: windows
           - platform: macos-latest
             args: '--target aarch64-apple-darwin --bundles app,dmg'
+            nodePlat: mac-arm64
+            rustTargets: aarch64-apple-darwin
             label: macos-aarch64
-          - platform: macos-latest
-            args: '--target x86_64-apple-darwin --bundles app,dmg'
-            label: macos-x86_64
           # Linux 暂不打包（linuxdeploy 在 dsh 的静态/musl native 模块上失败：
           # @deepseek-ai/node-addon-system-* 的 bin/landlock-run 无 .dynamic 段、bin/musl/system.node ldd 失败）。
-          # 恢复前需先补 prepare-resources.ps1 的清理列表，并恢复 release job 的 03- 前缀与 glob。
+          # 恢复前需先补 prepare-resources.ps1 的清理列表，并恢复 release job 的 03- 前缀与 glob；
+          # 每个条目还要补 nodePlat（linux-amd64→linux-x64 / linux-aarch64→linux-arm64）与
+          # rustTargets，否则 resources 会按 runner 宿主架构准备。
           # - platform: ubuntu-22.04
           #   args: '--bundles appimage,deb,rpm'
           #   label: linux-amd64
@@ -68,12 +76,12 @@ jobs:
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.platform == 'macos-latest' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
+          targets: ${{ matrix.rustTargets }}
 
       - name: Rust cache
         uses: swatinem/rust-cache@v2
         with:
-          # 缓存 target 目录（macOS 交叉编译两个 target、Linux 均需要）
+          # 缓存 target 目录（macOS 按 target triple 分目录、Linux 均需要）
           workspaces: './src-tauri -> target'
 
       - name: Install Linux dependencies
@@ -120,10 +128,11 @@ jobs:
       - name: Install frontend dependencies
         run: npm ci
 
-      # 生成不入库的 resources/node + resources/dsh-baseline
-      - name: Prepare bundled resources (Node runtime + dsh baseline)
+      # 生成不入库的 resources/node + resources/pnpm + resources/dsh-baseline
+      # -NodePlat 必须与上面的 --target 架构一致（见文件头 macOS 说明）
+      - name: Prepare bundled resources (Node runtime + pnpm + dsh baseline)
         shell: pwsh
-        run: ./scripts/prepare-resources.ps1 -Registry https://registry.npmjs.org -NodeBase https://nodejs.org/dist
+        run: ./scripts/prepare-resources.ps1 -Registry https://registry.npmjs.org -NodeBase https://nodejs.org/dist -NodePlat ${{ matrix.nodePlat }}
 
       - name: Clean incompatible Linux native modules
         if: startsWith(matrix.platform, 'ubuntu')
@@ -285,16 +294,30 @@ jobs:
           TAG="v${VERSION}"
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
           echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+
+          # Release 正文的「更新内容」取自 CHANGELOG.md 里该版本的一节：找不到该版本时
+          # 回退「未发布」，都没有则写一句「未找到条目」提醒（脚本见 scripts/extract-changelog.mjs）
+          NOTES_FILE="${RUNNER_TEMP:-/tmp}/release-notes.md"
+          node scripts/extract-changelog.mjs "$VERSION" --out "$NOTES_FILE"
+          NOTES="$(cat "$NOTES_FILE")"
+
           cat >> "$GITHUB_OUTPUT" <<EOF
           RELEASE_BODY<<GITCLIFF_EOF
-          ## 本版本由 GitHub Actions 自动构建。
+          ## 更新内容
+
+          $NOTES
+
+          ## 安装包
 
           - **Windows**：\`*-setup.exe\`（NSIS，免管理员安装）/ \`*-x64.msi\`（MSI）
-          - **macOS**：\`*-x64.dmg\`（Intel）/ \`*-aarch64.dmg\`（Apple Silicon）
+          - **macOS**：\`*-aarch64.dmg\`（Apple Silicon；Intel/x86_64 暂不提供）
 
           > macOS 安装包在未配置签名/公证前为未签名版本，首次打开请右键 →「打开」。
           GITCLIFF_EOF
           EOF
+
+          echo "=== release notes (from CHANGELOG.md) ==="
+          cat "$NOTES_FILE"
 
       # v4 不带 name 会按 artifact 名分目录解包到 assets/
       - name: Download build artifacts
@@ -319,7 +342,7 @@ jobs:
             done
           }
           prefix_dir "01-" bundle-windows
-          prefix_dir "02-" bundle-macos-aarch64 bundle-macos-x86_64
+          prefix_dir "02-" bundle-macos-aarch64
           # prefix_dir "03-" bundle-linux-amd64 bundle-linux-aarch64
           echo "=== Ordered assets ==="
           ls -la ordered-assets/

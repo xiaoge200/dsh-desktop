@@ -13,7 +13,7 @@
 | FR-15 高级入口 | ✅ | `--dsh-args` 透传 dsh CLI 参数（实测 --trusted-host 完整到达） |
 | FR-13 卸载数据 | ✅ 核心已满足 | 实测卸载后 %APPDATA% 用户数据完整保留（NSIS per-user 默认行为）；卸载前询问对话框为 P2 增强，需自定义 NSIS 模板（有破坏安装器风险，暂缓） |
 | NFR-10 本地化 | ✅ | i18n 中英双语：boot 页/设置页按 navigator.language，托盘按系统区域设置（Windows GetUserDefaultUILanguage / LANG） |
-| 自动化测试 | ✅ | Rust 单元测试 19 个 + install-dsh.mjs 测试 8 个（含回滚机制测试），CI 已接入 |
+| 自动化测试 | 🟡 | Rust 单测 67 个（`cargo test --lib`）+ `install-dsh.mjs` 8 个 + `scripts/` 发布工具 11 个（`node --test scripts/`，覆盖 CHANGELOG 抽正文）；CI 目前只跑 `scripts/` 那组，另两组待接入 |
 | 更新回滚（R7/R10） | ✅ | update 前备份 `.dsh-runtime-bak`，安装/冒烟失败自动恢复旧版本，成功删备份 |
 | NFR-06 离线降级 | ✅ 优化 | registry 不可达时 HEAD 探测 3s 快速失败（原 npm 长重试 240s+ → 实测 0.1s）；在线路径 3.4s 正常 |
 | NFR-02 冷启动 | ✅ 达标 | 实测二次启动：服务就绪 ~4.5s（含 dsh 服务自身初始化 ~3s），WebView 跳转后用户可交互；首启含基线复制约 60-90s（文档已注明安装场景除外） |
@@ -51,6 +51,15 @@
    - 默认插件：启动后台自动安装 `dshmarket`（dsh-market 市场插件，装进 dsh 网页设置）。
      成功后写 `appData/default-plugin.json` 标记——用户手动移除后不会被自动装回；
      失败静默（下次启动重试），安装后由重启快照提示「重启后生效」。
+   - **市场（dshmarket）要 pnpm，壳自带一个**：市场安装插件走 pnpm，自己探测
+     `pnpm --version`，失败时用 corepack / `npm i -g pnpm` 现场装——macOS 从 Finder
+     启动没有终端 PATH，corepack shim 又会让全局安装以 EEXIST 失败（用户只看到
+     「pnpm 的可执行文件已存在，npm 拒绝覆盖」）。所以构建期把 pnpm 打进
+     `resources/pnpm`（`prepare-resources.ps1`），启动时 `pnpm_env.rs` 在
+     `<appData>/pnpm-home` 生成 `pnpm` / `pnpm.cmd` shim 并**把它插到 `PATH` 最前**：
+     市场（`spawnEnv()` 从继承的 PATH 出发，`toolSearchDirs` 只往后追加候选目录）与
+     `dsh plugin`（内部 `spawnSync("pnpm")`）都用内置版本，与系统工具链无关。
+     不设 `PNPM_HOME`——理由见 §13。
    - 托盘语言：`is_zh_locale()` 在 Windows 上**注册表系统 UI 语言优先**、环境变量回退
      （修复从 Git Bash 启动时 `LANG=en_US` 导致托盘英文、与网页端语言不一致）。
 
@@ -107,9 +116,126 @@
 - 强杀（任务管理器/Stop-Process -Force）无法触发 Rust Drop，残留属操作系统边界；
   下次启动端口自动更换兜底。
 
+### 10. macOS 插件市场卡在「pnpm 的可执行文件已存在」
+- 现象：mac 版网页插件市场锁在「安装插件前需要先配置 pnpm 环境」。同一个根因在不同机器
+  上给出不同提示，取决于现场探测/安装失败成什么样（dshmarket `provisionHint` 五选一）：
+  - `pnpm --version` 失败 + 全局目录已有同名 pnpm → EEXIST「可执行文件已存在…npm 拒绝覆盖」
+  - 同上但 npm 无写权限（Node 装在 `C:\Program Files\nodejs`、macOS 官方 pkg 装到
+    `/usr/local`）→ EPERM「没有权限写入 Node 的安装目录…用管理员/sudo」
+  - 图形/桌面启动没有 npm/corepack → 「找不到 npm/corepack（…不继承终端 PATH）」
+  - 网络受限导致 corepack shim 下不到 pnpm 本体 → 「装 pnpm 时网络失败」
+  Windows 同版本「正常」只是那台机器 PATH 上恰有可用的 pnpm。
+- 原因：市场（dshmarket 插件）装插件走 pnpm，壳体并不提供 pnpm，于是市场自己探测并
+  现场安装。macOS 从 Finder/Dock 启动的应用只有 `/usr/bin:/bin:/usr/sbin:/sbin`
+  的 PATH（不留继承终端 profile），corepack 又已在 npm 全局目录留下同名 shim——
+  `corepack enable pnpm` 装不出能跑的 pnpm，`npm i -g pnpm` 则直接 EEXIST/EPERM，市场
+  于是死循环。
+- 解决：构建期内置 pnpm 到 `resources/pnpm`；启动（`boot()`）时生成
+  `<appData>/pnpm-home/pnpm[.cmd]`，shim 用内置 Node 跑内置 pnpm（Unix 版 chmod 755），
+  并把该目录插到 `PATH` 最前。环境变量是进程级的，服务及其 pnpm/dsh 子进程全部继承，
+  重启用新起的服务也一样。内置 pnpm 可用时 `probePnpm()` 直接成功，市场**根本不会走
+  现场安装**，上面五条提示一条都不会出现。
+- 覆盖边界：注入只作用于壳自己起的服务进程。watchdog 发现端口上有外部服务而自己的子进程
+  已退出时，会重新收编并重启（`service.rs` 的 Takeover 分支），所以市场最终总是跑在带
+  shim PATH 的进程里；启动时若首选端口被外部 `dsh web` 占用则改选空闲端口，也不会复用
+  别人的服务。
+- 验证：`resources/node/win-x64/node.exe resources/pnpm/bin/pnpm.mjs --version` →
+  `11.7.0`；生成的 `pnpm.cmd` 经 `cmd /d /s /c pnpm --version`、`spawnSync("pnpm",
+  {shell:true})`（`dsh plugin` 的调用形态）均为 0；POSIX shim 在 Git Bash 下
+  `pnpm-real --version` 亦返回 11.7.0。中文路径见 §12——当时是手写 shim 验的，
+  漏掉了 `write_shim()` 自己的写法。
+  资源打包：`tauri build`（含 `tauri dev`）会把 `bundle.resources` 复制到 resource_dir，
+  实测 `src-tauri/target/debug/{pnpm,node,dsh-baseline}` 齐全，`bundled_entry()` 在开发态
+  同样能找到 `pnpm/bin/pnpm.mjs`。
+- 已发布版本的处理：0.1.7 及更早没有内置 pnpm，只能在终端按提示装一个
+  （`npm i -g pnpm --force` / `brew install pnpm`）后重启应用；README 的 FAQ 已写明。
+
+### 11. macOS x86_64 包不可用：资源按 runner 架构而不是 target 架构准备
+- 现象：Intel 版 `.app`/`.dmg` 在 Intel Mac 上直接「程序文件不完整，请重新安装」（或即使
+  起来也缺原生模块）。
+- 原因：`prepare-resources.ps1` 原先按 **runner** 架构（`uname -m`）取内置 Node，而
+  `src/node.rs` 按**编译目标**架构找 `node/<mac-arm64|mac-x64>/node`。CI 在 arm64 的
+  `macos-latest` 上交叉编 `--target x86_64-apple-darwin`，于是包里是 `node/mac-arm64`、
+  程序找 `node/mac-x64`。同类错配还在 `resources/dsh-baseline`：`koffi`（install 钩子
+  `cnoke --prebuild`）和 `node-pty`（`scripts/prebuild.js || node-gyp rebuild`）按**宿主**
+  架构编译/拷贝，npm 的 `--os/--cpu` 也覆盖不到它们。
+- 解决：脚本新增 `-NodePlat`（目标平台，取值 win-x64 / mac-arm64 / mac-x64 / linux-arm64 /
+  linux-x64，非法值直接报错），据此决定下载哪个 Node 包与解包方式；宿主侦测改为
+  Windows 走 `$env:OS`、mac/linux 走 `uname`（顺带兼容 PowerShell 5.1，不再依赖
+  `$IsWindows/$IsMacOS`；Windows 上 PATH 里的 Git `uname` 在受限环境会硬失败，不能先调）。
+  发布矩阵把 `-NodePlat` 与 `--target` 绑定；基线安装补 `--os/--cpu`（原生构建无副作用，
+  交叉时至少平台门控的 optionalDependencies 不会装错）。
+- **决定：x86_64 产物下掉，macOS 只发 Apple Silicon。** 交叉构建修不好（见上），而为一个
+  已经发不出来的包维持 Intel runner 不值得——0.1.7 之前的 Intel DMG 本来也起不来，没有
+  实际用户损失。要恢复：矩阵加回一条 `macos-15-intel`（`--target x86_64-apple-darwin` +
+  `nodePlat: mac-x64` + `rustTargets: x86_64-apple-darwin`），release job 的 `prefix_dir`
+  与 Release 正文同步加回；`-NodePlat mac-x64` 的下发分支已就绪。
+- 交叉构建时 pnpm 冒烟会先试 `node --version`：宿主跑不动就只警告跳过（不是 pnpm 的问题），
+  能跑才要求 `pnpm --version` 成功。
+- 验证：默认路径在 Windows 上 `==> pnpm smoke ok: pnpm 11.7.0 on node v24.9.0`（exit 0）；
+  `-NodePlat mac-x64` 会走 darwin-x64 下载分支、`-SkipPnpm` 可跳过、`-NodePlat mac-mips`
+  被校验拒绝（exit 1）；宿主跑不动目标运行时（伪造 `resources/node/mac-x64/node`）时
+  只打印 `pnpm smoke skipped` 并以 0 退出。
+
+### 12. Windows：市场装插件/更新报「系统找不到指定的路径」
+- 现象：Windows 上 `dshmarket` 更新、市场装插件失败，错误里带 `系统找不到指定的路径。`
+  （壳里显示成 GBK 乱码 `ϵͳ�Ҳ���ָ����·����`）与
+  `dsh: pnpm failed in profile directory <profile>`。macOS 同版本正常；Windows 以前
+  「正常」是因为那时没有内置 pnpm，市场走的是用户自己装的系统 pnpm——0.1.8 注入内置
+  pnpm（§10）后才暴露。
+- 原因：`pnpm-home/pnpm.cmd` 是给 **cmd.exe** 读的批处理文件，而驱动它的 Node/pnpm
+  路径由 `write_shim()` 直接拼进文件，两处都不合 cmd.exe 的规矩：
+  1. 路径来自 `resource_dir`（由 exe 路径推导，开发态实测带 `\\?\` 前缀）。
+     cmd.exe 把 `\\?\C:\...` 当 UNC 路径，报 `ERROR_PATH_NOT_FOUND`。
+  2. `std::fs::write` 写的是 UTF-8，cmd.exe 却按**控制台代码页（OEM）**解码批处理：
+     安装目录含中文（默认装在 `C:\software\DSH 工作台\`，见日志）时路径整段变乱码，
+     同样报「系统找不到指定的路径」。内置 Node/pnpm 都在那个目录里，所以不是文件缺失，
+     是 shim 解析不出来。
+- 解决：`write_shim()` 落盘前用 `node::normalize_for_node()` 去掉 `\\?\`（该函数本就是
+  为 Node 子进程写的，这里同样适用）；Windows 落盘改走 `write_script()`，用
+  `GetOEMCP()` + `WideCharToMultiByte(WC_NO_BEST_FIT_CHARS)` 把整份批处理编成控制台
+  代码页再写。代码页表示不了的字符（路径里带 emoji 之类）记一条 warn 后照样写：那种
+  路径本来就没法从批处理里启动，报错比无声失败好。Unix 侧仍是纯文本写入 + chmod 755。
+- 验证：修复前 `cmd /c <appData>/pnpm-home/pnpm.cmd --version` 复现「系统找不到指定的
+  路径。」，修复后同一命令返回 `11.7.0`；单测 `write_shim_strips_verbatim_prefix`、
+  `shim_runs_when_the_install_dir_is_not_ascii`（临时目录名 `café-<pid>`、入口故意传
+  `\\?\` 形式，经 `cmd /c` 真跑内置 Node）各覆盖一条规则，回归时会直接红；另用 GBK 手写
+  shim 指向 `C:\software\DSH 工作台\node\win-x64\node.exe` + 内置 `pnpm.mjs`，实测
+  `11.7.0`（即发行版装中文目录的场景）。
+
+### 13. 更新/装插件报 ERR_PNPM_UNEXPECTED_STORE：不要用 PNPM_HOME 指内置 pnpm
+- 现象：Windows 上 shim 修好后，市场装插件/更新 `dshmarket` 变成
+  `ERR_PNPM_UNEXPECTED_STORE: Unexpected store location`（无 TTY 时也可能表现为
+  `ERR_PNPM_ABORTED_REMOVE_MODULES_DIR_NO_TTY`——pnpm 想删掉 node_modules 重装但没人
+  能确认）。
+- 原因：`activate()` 除了插 PATH 还设了 `PNPM_HOME` 指向 `<appData>/pnpm-home`，而
+  **pnpm 的 store 目录默认就跟着 `PNPM_HOME` 走**（实测：不设时
+  `<LOCALAPPDATA>\pnpm\store\v11`，设了变 `<PNPM_HOME>\store\v11`）。已有 profile 的
+  `node_modules/.modules.yaml` 记着安装时的 store，`pnpm install` 时
+  `checkCompatibility()` 一比不一致就抛错（pnpm 的 `path.relative(modules.storeDir,
+  storeDir) !== ""`）。也就是说：壳一注入 `PNPM_HOME`，用户所有装过的 profile 都会被
+  判成「store 不对」——不仅 Windows，macOS/Linux 同理（那台机器恰好没有旧 profile 才
+  没暴露）。用户自己若设过 `PNPM_HOME`，这个注入还会把它顶掉，影响面更大。
+- 解决：`activate()` 只把 shim 目录插到 `PATH` 最前，不碰 `PNPM_HOME`。查
+  `dshmarket/src/dsh-cli.ts` 的 `spawnEnv()` 可确认 PATH 足够：它从**继承的**
+  `process.env.PATH` 出发，`toolSearchDirs()`（`PNPM_HOME` 只是其中第一项）是往后追加的
+  候选目录，所以 shim 在前即可命中；`dsh plugin` 同样是 PATH 上的裸 `pnpm`。
+- 验证：临时工程里用内置 pnpm 装一个包（记下 store），再加一个依赖后重跑——带
+  `PNPM_HOME` 时 exit 1（store 不符，`ERR_PNPM_ABORTED_REMOVE_MODULES_DIR_NO_TTY`），
+  不带的同一命令 exit 0 正常装上；`pnpm store path` 不设时为
+  `C:\Users\18129\AppData\Local\pnpm\store\v11`，与出问题的 profile 里
+  `.modules.yaml` 记的 `storeDir` 一致（设 `PNPM_HOME` 则变成
+  `<appData>\pnpm-home\store\v11`，正是那个 mismatch）。
+
 ## 运行环境事实
 
-- 内置 Node：24.9.0（含 npm 11.6.0），resources/node/win-x64，约 98MB。
-- 基线 dsh：0.1.1-rc.2（511 包，解压 192MB），resources/dsh-baseline。
-- 安装包（NSIS per-user）：约 47MB，安装后 297MB。
+- 内置 Node：24.9.0（含 npm 11.6.0），`resources/node/<win-x64|mac-arm64|mac-x64|linux-*>`
+  ——程序按编译目标架构找对应目录，CI 每个矩阵条目只准备目标那一个（约 98MB）；目标平台由
+  `prepare-resources.ps1 -NodePlat` 指定。
+- 基线 dsh：0.1.1-rc.2（511 包，解压 192MB），resources/dsh-baseline；含原生模块
+  （koffi / node-pty / sharp / ripgrep），因此必须与目标架构一致地安装。
+- 内置 pnpm：11.7.0（npm 包 `pnpm`，`resources/pnpm`，449 文件 / 解压 17.8MB），只服务
+  网页插件市场与 `dsh plugin`；换版本用 `prepare-resources.ps1 -PnpmVer <ver>`，
+  不需要时 `-SkipPnpm`。
+- 安装包（NSIS per-user）：约 47MB，安装后 297MB（+内置 pnpm 解压后约 18MB）。
 - 服务默认 127.0.0.1:3080，被占用自动换空闲端口（实测 49460/64609）。
