@@ -1,5 +1,38 @@
 # Changelog
 
+## [0.1.8] - 2026-09-16
+
+### 修复
+- macOS 插件市场无法安装插件（报「pnpm 的可执行文件已存在…npm 拒绝覆盖」）：
+  桌面端自带 pnpm（构建期生成 `resources/pnpm`，可在 `prepare-resources.ps1`
+  用 `-PnpmVer` 换版本、`-SkipPnpm` 跳过），启动时把生成的 shim 目录插到 `PATH` 最前，
+  网页插件市场与 `dsh plugin` 直接用内置 pnpm，不再依赖系统 pnpm/corepack
+  （macOS 图形启动没有终端 PATH，corepack shim 还会让 `npm i -g pnpm` 以 EEXIST 失败）。
+  Windows 同样生效，行为不再取决于用户机器上是否恰好装了可用的 pnpm。两处不能想当然：
+  生成的 shim 按 cmd.exe 的规矩写（去掉 exe 路径带的 `\\?\` 前缀、用系统代码页而不是
+  UTF-8 编码），安装目录或用户名含中文（`C:\software\DSH 工作台\`）也能正常调用——否则
+  市场报「系统找不到指定的路径」；**不设 `PNPM_HOME`**——pnpm 的 store 目录默认跟着它走，
+  一设就会把用户已装好的 profile 判成 store 不符，装插件/更新报
+  `ERR_PNPM_UNEXPECTED_STORE`（PATH 已足够让市场与 `dsh plugin` 找到内置 pnpm）
+- macOS Intel（x86_64）包此前实际不可用：resources 按 **runner** 架构（`uname -m`）准备，
+  而程序按编译目标架构找 `node/mac-x64`，在 arm64 runner 上交叉编出的 Intel 包里放的是
+  arm64 内置 Node（dsh 基线里的 koffi / node-pty 也按宿主架构编译，交叉构建补不回来）。
+  现已**停止发布 x86_64 产物，只发 Apple Silicon**；`prepare-resources.ps1` 新增
+  `-NodePlat`（目标平台，非法值报错）并把资源和 `--target` 显式对齐，基线安装补
+  `--os/--cpu`，交叉构建时 pnpm 冒烟在宿主跑不动目标 Node 时只警告不失败（要恢复 Intel
+  包须换回 Intel runner，步骤见 docs/RELEASE.md）
+
+### 移除
+- 网页里自定义的右键菜单（设置/重启服务/退出）：它在捕获阶段 `preventDefault()`
+  掉整个页面的右键，与网页自带的右键菜单冲突。这两个入口在托盘右键与设置窗口里
+  都还在，功能不丢；Rust 命令与权限仍保留，只是不再注入脚本
+
+### 内部
+- 发布正文自动化：Release 的「更新内容」自动取自 `CHANGELOG.md` 对应版本一节
+  （`scripts/extract-changelog.mjs`，附 11 个单测），与 `## 安装包` 清单拼成完整正文；
+  没有该版本条目时回退顶部的「未发布」一节，两者都没有则正文写明「未找到条目」
+  提醒发布者（CI 日志同时告警），不再依赖手写 Release 说明
+
 ## [0.1.7] - 2026-09-14
 
 ### 修复

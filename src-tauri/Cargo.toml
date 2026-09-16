@@ -1,6 +1,6 @@
 [package]
 name = "dsh-desktop"
-version = "0.1.7"
+version = "0.1.8"
 description = "DSH Web desktop client: built-in Node runtime + auto-installed latest dsh package + embedded WebView"
 authors = ["dsh-desktop team"]
 edition = "2021"
@@ -31,7 +31,7 @@ tokio = { version = "1", features = ["time", "macros"] }
 open = "5"
 
 [target.'cfg(windows)'.dependencies]
-winapi = { version = "0.3", features = ["processthreadsapi", "wincon", "handleapi", "synchapi", "winnls", "jobapi2", "tlhelp32", "winnt", "minwindef", "winbase", "winuser", "fileapi", "namedpipeapi"] }
+winapi = { version = "0.3", features = ["processthreadsapi", "wincon", "handleapi", "synchapi", "winnls", "stringapiset", "jobapi2", "tlhelp32", "winnt", "minwindef", "winbase", "winuser", "fileapi", "namedpipeapi"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
