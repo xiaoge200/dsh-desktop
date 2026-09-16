@@ -123,7 +123,6 @@ if ($SkipPnpm) {
     }
 
     if (Test-Path $pnpmDir) { Remove-Item $pnpmDir -Recurse -Force }
-    New-Item -ItemType Directory -Force -Path $pnpmDir | Out-Null
     Move-Item $src $pnpmDir -Force
     Remove-Item $work -Recurse -Force
 
