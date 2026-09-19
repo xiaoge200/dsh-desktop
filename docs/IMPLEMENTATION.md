@@ -274,15 +274,22 @@
   `dsh-pnpm-forwarder`（`src-tauri/src/bin/dsh-pnpm-forwarder.rs`：定位包内 `node` +
   `pnpm.mjs`，原样转发 argv/stdio，找不到包内资源就报 127 并提示重装）。
   `scripts/build-forwarder.mjs` 在 `npm run build` / `npm test` / `tauri build` 之前编好它，
-  并放到 tauri-build 编译期会查的位置（`target/<profile>/<bin>-<triple>[.exe]`、crate 根、
-  `src-tauri/binaries/`；脚本编自己时会临时摘掉 `externalBin`，否则"源必须已存在"的
-  检查会自锁，编完按字节还原配置），随 `bundle.externalBin` 进包；启动时 `install_shim()`
-  把它拷成 `<appData>\pnpm-home\pnpm.exe` 并删除旧版留下的 `pnpm.cmd`（`.EXE` 在 PATHEXT
-  里优先，市场与 `dsh plugin` 的裸 `pnpm` 自然命中）。找不到转发器就退回批处理 shim，
-  开发态与老包仍能工作；macOS 继续用 POSIX shim（sh 按 UTF-8 读，没有这个问题）。
-  两处只有 CI 能暴露的坑：①`Cargo.toml` 多了第二个 bin 后必须写 `default-run = "dsh-desktop"`，
-  否则 tauri CLI 报 `failed to find main binary`（macOS 打包首次实测）；②`native_forwarder()`
-  只在 Windows 分支用，要加 `#[cfg(windows)]`，否则 macOS 编译报 dead_code 警告。
+  产物落到 `resources/dsh-pnpm-forwarder.exe`，作为**普通资源**随包分发
+  （`bundle.resources` 的 `"../resources/dsh-pnpm-forwarder.exe": "dsh-pnpm-forwarder.exe"`）。
+  启动时 `install_shim()` 把它拷成 `<appData>\pnpm-home\pnpm.exe` 并删除旧版留下的
+  `pnpm.cmd`（`.EXE` 在 PATHEXT 里优先，市场与 `dsh plugin` 的裸 `pnpm` 自然命中）；
+  找不到转发器就退回批处理 shim，开发态与老包仍能工作。macOS 继续用 POSIX shim
+  （sh 按 UTF-8 读，没有这个问题）。
+  三条只有真打包/CI 能暴露的坑，都记在这：
+  ① **不要用 `bundle.externalBin`**：给 Windows MSI 用会直接失败——一是 Cargo 多了第二个
+  bin 后 tauri CLI 报 `failed to find main binary`（要补 `default-run`，本方案已不需要），
+  二是 tauri-bundler 会把 sidecar 名字塞进 WiX 标识符，带 `-` 的名字让 `light.exe` 报
+  `failed to bundle project: failed to run ...\light.exe`（上游 tauri#14681，修复 PR #15651
+  未进已发布 bundler）。改走 resources 后两个问题同时消失，NSIS 与 MSI 都能出包。
+  ② `native_forwarder()` 只在 Windows 分支用，要加 `#[cfg(windows)]`，否则 macOS 编译报
+  dead_code 警告。
+  ③ 资源条目要求"编译期已存在"，而它正是本脚本的产物：脚本编自己前把这条资源从配置里
+  摘掉、编完按字节还原（`try/finally` 语义，cargo 失败也不留脏配置）。
 - 仍存的边界：批处理回退路径受控制台代码页限制（§13 末尾的 `café` 用例），
   只有"没有原生转发器"时才会走到。
 - `cargo test --lib` 现状：81 通过，1 失败——即上述 `café` 用例（改动前同样失败，

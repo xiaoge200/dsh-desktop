@@ -17,7 +17,7 @@
   都用包内版本，也不再往用户 Node 安装目录写文件（此前会报
   `corepack enable: EPERM ... \nodejs\pnpm`）
 - Windows 内置 pnpm 改用**原生转发器**（`pnpm.exe`，由 `scripts/build-forwarder.mjs` 构建、
-  tauri externalBin 随包分发）替代生成的 `pnpm.cmd`：批处理由 cmd.exe 按控制台代码页解码，
+  作为普通资源随包分发）替代生成的 `pnpm.cmd`：批处理由 cmd.exe 按控制台代码页解码，
   安装路径含该页表示不了的字符（如 `café`）时会被写坏并报「系统找不到指定的路径」；
   原生转发器把 argv/stdio 原样转给包内 `node` + `pnpm.mjs`，不再经过批处理解析。
   旧版遗留的 `pnpm.cmd` 在启动时删除
@@ -26,7 +26,10 @@
 - `pnpm_env.rs`：新增 `pin_store()` / `recorded_store_dir()` 与 12 个单测（store 钉定 8 个、
   原生转发器 2 个、shim 选择 2 个）；`plugins::profile_dir` 提为 crate 内可见
 - `npm run build` / `npm test` / `tauri build` 都会先跑 `scripts/build-forwarder.mjs`
-  （`--if-missing` 供测试复用），保证 externalBin 源在 `cargo build` 之前就位
+  （`--if-missing` 供测试复用），产物落 `resources/dsh-pnpm-forwarder.exe`
+- 转发器**不走 `bundle.externalBin`**：那条路会让 Windows MSI 构建失败（tauri CLI 找不到
+  主程序；tauri-bundler 把 sidecar 名字塞进 WiX 标识符，带 `-` 就让 `light.exe` 失败，
+  上游 tauri#14681 未修完）。改走 `bundle.resources` 后 NSIS 与 MSI 都能正常出包
 
 ## [0.1.8] - 2026-09-16
 

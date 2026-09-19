@@ -26,9 +26,6 @@ dist-ssr
 # Rust / Tauri
 src-tauri/target/
 src-tauri/gen/schemas/
-# externalBin 源（scripts/build-forwarder.mjs 生成）
-src-tauri/binaries/
-src-tauri/dsh-pnpm-forwarder
 
 # 构建期产物（CI 下载生成，不入库）
 resources/node/

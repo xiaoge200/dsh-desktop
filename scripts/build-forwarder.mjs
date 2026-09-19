@@ -1,21 +1,19 @@
 #!/usr/bin/env node
-// 把内置 pnpm 的原生转发器编出来，并放到 tauri externalBin 找得到的位置。
+// 把内置 pnpm 的原生转发器编出来，放到 resources/ 供 tauri 当普通资源打包。
 //
 // 为什么需要它：Windows 上 `pnpm.cmd` 受控制台代码页限制（cmd.exe 解码批处理用的是
 // 控制台代码页，写文件用的却是 OEM 代码页），安装路径含该页表示不了的字符时会写坏路径，
-// 报「系统找不到指定的路径」。见 docs/IMPLEMENTATION.md §14。
+// 报「系统找不到指定的路径」；批处理还有 PATHEXT/引号等一堆边角。原生转发器把 argv 与
+// stdio 原样转给包内 `node` + `pnpm.mjs`，不经过批处理解析。见 IMPLEMENTATION §14。
 //
-// externalBin 的源路径由 tauri-build 在编译期按**相对模式**查找（实测它要的是 crate 根
-// 与 target/<profile>/ 下的 <bin>-<triple>[.exe]），所以本脚本把同一份产物落三处：
-//   1. target/<profile>/<bin>-<triple>[.exe]  —— tauri-build 校验并拷成 <bin>[.exe]
-//   2. target/<profile>/<bin>[.exe]           —— 兼容不带 triple 的查找
-//   3. src-tauri/<bin>-<triple>[.exe]         —— crate 根兜底（另一条被查的路径）
-// src-tauri/binaries/ 也留一份（tauri CLI 打包时的约定位置）。
-// 因此本步必须在 `cargo build/test` 之前跑；npm run build / test / tauri 都已接上。
+// 为什么走 resources 而不是 bundle.externalBin：externalBin 会让 Windows MSI 构建失败
+// （tauri-bundler 未修 #14681），而启动时本来就要 `install_shim()` 把它拷进
+// `<appData>/pnpm-home/pnpm.exe`，作为普通资源反而更直接——顺带免掉"tauri-build 要求
+// externalBin 源在编译期已存在、而本脚本正是为了产出它"的自锁。
 //
 // 用法：node scripts/build-forwarder.mjs [--release] [--if-missing]
 //   --release    编 release（打包用；默认 debug，够本地编译/测试用）
-//   --if-missing 目标已存在就直接返回（避免每次 npm test 都重新 cargo build）
+//   --if-missing 产物已存在就直接返回（npm test 复用，不重复 cargo build）
 import { spawnSync } from "node:child_process";
 import { copyFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
@@ -42,37 +40,23 @@ const derivedTriple = {
   "linux-x64": "x86_64-unknown-linux-gnu",
   "linux-arm64": "aarch64-unknown-linux-gnu",
 }[`${process.platform}-${process.arch}`];
-const hostTriple = reportedTriple ?? derivedTriple;
-const triple = target ?? hostTriple;
+const triple = target ?? reportedTriple ?? derivedTriple;
 if (!triple) {
   console.error(`无法确定 target triple（${process.platform}-${process.arch}），请设置 DSH_TARGET`);
   process.exit(1);
 }
-const isWindows = triple.includes("windows");
-const exeName = isWindows ? `${binName}.exe` : binName;
+const exeName = triple.includes("windows") ? `${binName}.exe` : binName;
 
 const outDir = join(root, "src-tauri", "target", ...(target ? [target] : []), profileDir);
 const built = join(outDir, exeName);
-const inTarget = [
-  join(outDir, `${binName}-${triple}${isWindows ? ".exe" : ""}`),
-  join(outDir, exeName),
-];
-const inBinaries = join(
-  root,
-  "src-tauri",
-  "binaries",
-  `${binName}-${triple}${isWindows ? ".exe" : ""}`,
-);
-// crate 根也放一份：tauri-build 的 externalBin 查找是相对模式，crate 根与
-// target/<profile>/ 都在它的候选里，两处都备上就不必赌是哪一处。
-const inCrateRoot = join(root, "src-tauri", `${binName}-${triple}${isWindows ? ".exe" : ""}`);
-const outputs = [...inTarget, inBinaries, inCrateRoot];
+// 与 tauri.conf.json 的 bundle.resources 一致：../resources/dsh-pnpm-forwarder.exe
+// 启动时 install_shim() 会把它拷成 <appData>/pnpm-home/pnpm.exe
+const resource = join(root, "resources", exeName);
 
-if (!ifMissing || !outputs.every((p) => existsSync(p))) {
-  // tauri-build 在编译期要求 externalBin 已存在，而这步正是为了产出它——先把
-  // externalBin 从配置里摘掉再编自己，编完原样写回（字节级还原，含行尾）。
-  // 构建失败时故意不还原：tauri.conf.json 会被脚本重新生成，避免留下"配置有、文件没"的
-  // 假象；重新跑 `npm run build-forwarder` 即可。
+if (!ifMissing || !existsSync(resource)) {
+  // tauri-build 在编译期会走一遍 bundle.resources，要求每个条目都已存在——而本脚本
+  // 正是为了产出这个条目。编自己之前先把转发器那条资源从配置里摘掉，编完按字节还原
+  // （try/finally：即使 cargo 失败也不会把配置留在被改过的状态）。
   const original = readFileSync(confPath, "utf8");
   let conf;
   try {
@@ -81,7 +65,17 @@ if (!ifMissing || !outputs.every((p) => existsSync(p))) {
     console.error(`tauri.conf.json 解析失败: ${e.message}`);
     process.exit(1);
   }
-  writeFileSync(confPath, `${JSON.stringify({ ...conf, bundle: { ...conf.bundle, externalBin: undefined } }, null, 2)}\n`);
+  const resources = conf.bundle?.resources;
+  const staged = { ...conf, bundle: { ...conf.bundle } };
+  if (Array.isArray(resources)) {
+    staged.bundle.resources = resources.filter((entry) => !String(entry).includes(binName));
+  } else if (resources && typeof resources === "object") {
+    const kept = Object.fromEntries(
+      Object.entries(resources).filter(([key]) => !key.includes(binName)),
+    );
+    staged.bundle.resources = kept;
+  }
+  writeFileSync(confPath, `${JSON.stringify(staged, null, 2)}\n`);
 
   const cargoArgs = ["build", "--bin", binName, "--manifest-path", manifest];
   if (profileDir === "release") cargoArgs.push("--release");
@@ -90,14 +84,12 @@ if (!ifMissing || !outputs.every((p) => existsSync(p))) {
   writeFileSync(confPath, original);
   if (outcome.error) throw outcome.error;
   if (outcome.status !== 0) process.exit(outcome.status ?? 1);
+  if (!existsSync(built)) {
+    console.error(`编译产物不存在: ${built}`);
+    process.exit(1);
+  }
+  mkdirSync(dirname(resource), { recursive: true });
+  copyFileSync(built, resource);
 }
 
-if (!existsSync(built)) {
-  console.error(`编译产物不存在: ${built}`);
-  process.exit(1);
-}
-for (const out of outputs) {
-  mkdirSync(dirname(out), { recursive: true });
-  copyFileSync(built, out);
-  console.log(`==> pnpm forwarder ready: ${out} (${triple}, ${profileDir})`);
-}
+console.log(`==> pnpm forwarder ready: ${resource} (${triple}, ${profileDir})`);

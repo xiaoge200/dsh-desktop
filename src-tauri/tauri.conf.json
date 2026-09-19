@@ -52,9 +52,9 @@
       "../resources/node": "node/",
       "../resources/installer": "installer/",
       "../resources/dsh-baseline": "dsh-baseline/",
-      "../resources/pnpm": "pnpm/"
+      "../resources/pnpm": "pnpm/",
+      "../resources/dsh-pnpm-forwarder.exe": "dsh-pnpm-forwarder.exe"
     },
-    "externalBin": ["dsh-pnpm-forwarder"],
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",

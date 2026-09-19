@@ -290,8 +290,9 @@ fn install_shim(
     write_shim(dir, node, entry)
 }
 
-/// Launcher shipped as a tauri `externalBin` (macOS puts it in `Contents/MacOS`,
-/// Windows next to the resource dir).
+/// Launcher shipped as a tauri resource (`<resource_dir>/dsh-pnpm-forwarder[.exe]`),
+/// built by `scripts/build-forwarder.mjs` and copied into the shim dir by
+/// `install_shim()`.
 #[cfg(windows)]
 fn native_forwarder(resource_dir: &Path) -> Option<PathBuf> {
     ["dsh-pnpm-forwarder.exe", "dsh-pnpm-forwarder"]
