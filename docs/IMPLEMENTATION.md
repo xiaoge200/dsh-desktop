@@ -280,6 +280,9 @@
   把它拷成 `<appData>\pnpm-home\pnpm.exe` 并删除旧版留下的 `pnpm.cmd`（`.EXE` 在 PATHEXT
   里优先，市场与 `dsh plugin` 的裸 `pnpm` 自然命中）。找不到转发器就退回批处理 shim，
   开发态与老包仍能工作；macOS 继续用 POSIX shim（sh 按 UTF-8 读，没有这个问题）。
+  两处只有 CI 能暴露的坑：①`Cargo.toml` 多了第二个 bin 后必须写 `default-run = "dsh-desktop"`，
+  否则 tauri CLI 报 `failed to find main binary`（macOS 打包首次实测）；②`native_forwarder()`
+  只在 Windows 分支用，要加 `#[cfg(windows)]`，否则 macOS 编译报 dead_code 警告。
 - 仍存的边界：批处理回退路径受控制台代码页限制（§13 末尾的 `café` 用例），
   只有"没有原生转发器"时才会走到。
 - `cargo test --lib` 现状：81 通过，1 失败——即上述 `café` 用例（改动前同样失败，

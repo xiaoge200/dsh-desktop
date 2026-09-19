@@ -4,6 +4,9 @@ version = "0.1.9"
 description = "DSH Web desktop client: built-in Node runtime + auto-installed latest dsh package + embedded WebView"
 authors = ["dsh-desktop team"]
 edition = "2021"
+# 本包有第二个 bin（pnpm 转发器），必须显式指定默认运行目标，否则 tauri CLI
+# 报 "failed to find main binary"（macOS 打包实测）
+default-run = "dsh-desktop"
 
 [lib]
 name = "dsh_desktop_lib"
