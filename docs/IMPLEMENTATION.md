@@ -13,7 +13,7 @@
 | FR-15 高级入口 | ✅ | `--dsh-args` 透传 dsh CLI 参数（实测 --trusted-host 完整到达） |
 | FR-13 卸载数据 | ✅ 核心已满足 | 实测卸载后 %APPDATA% 用户数据完整保留（NSIS per-user 默认行为）；卸载前询问对话框为 P2 增强，需自定义 NSIS 模板（有破坏安装器风险，暂缓） |
 | NFR-10 本地化 | ✅ | i18n 中英双语：boot 页/设置页按 navigator.language，托盘按系统区域设置（Windows GetUserDefaultUILanguage / LANG） |
-| 自动化测试 | 🟡 | Rust 单测 67 个（`cargo test --lib`）+ `install-dsh.mjs` 8 个 + `scripts/` 发布工具 11 个（`node --test scripts/`，覆盖 CHANGELOG 抽正文）；CI 目前只跑 `scripts/` 那组，另两组待接入 |
+| 自动化测试 | 🟡 | Rust 单测 82 个（`cargo test --lib`：store 钉定 8 + 原生转发器 2 + shim 选择 2）+ `install-dsh.mjs` 8 个 + `scripts/` 发布工具 11 个（`node --test scripts/`）；CI 目前只跑 `scripts/` 那组与编译检查，另两组待接入（本机 1 个既有失败：`café` 路径的 shim 用例，见 §13/§14） |
 | 更新回滚（R7/R10） | ✅ | update 前备份 `.dsh-runtime-bak`，安装/冒烟失败自动恢复旧版本，成功删备份 |
 | NFR-06 离线降级 | ✅ 优化 | registry 不可达时 HEAD 探测 3s 快速失败（原 npm 长重试 240s+ → 实测 0.1s）；在线路径 3.4s 正常 |
 | NFR-02 冷启动 | ✅ 达标 | 实测二次启动：服务就绪 ~4.5s（含 dsh 服务自身初始化 ~3s），WebView 跳转后用户可交互；首启含基线复制约 60-90s（文档已注明安装场景除外） |
@@ -59,7 +59,7 @@
      `<appData>/pnpm-home` 生成 `pnpm` / `pnpm.cmd` shim 并**把它插到 `PATH` 最前**：
      市场（`spawnEnv()` 从继承的 PATH 出发，`toolSearchDirs` 只往后追加候选目录）与
      `dsh plugin`（内部 `spawnSync("pnpm")`）都用内置版本，与系统工具链无关。
-     不设 `PNPM_HOME`——理由见 §13。
+     不设 `PNPM_HOME`——store 目录一律由 `pin_store()` 钉死，理由见 §13。
    - 托盘语言：`is_zh_locale()` 在 Windows 上**注册表系统 UI 语言优先**、环境变量回退
      （修复从 Git Bash 启动时 `LANG=en_US` 导致托盘英文、与网页端语言不一致）。
 
@@ -203,29 +203,87 @@
   shim 指向 `C:\software\DSH 工作台\node\win-x64\node.exe` + 内置 `pnpm.mjs`，实测
   `11.7.0`（即发行版装中文目录的场景）。
 
-### 13. 更新/装插件报 ERR_PNPM_UNEXPECTED_STORE：不要用 PNPM_HOME 指内置 pnpm
-- 现象：Windows 上 shim 修好后，市场装插件/更新 `dshmarket` 变成
+### 13. 更新/装插件报 ERR_PNPM_UNEXPECTED_STORE：store 目录必须由壳钉死
+- 现象：Windows 上市场装插件/更新 `dshmarket` 报
   `ERR_PNPM_UNEXPECTED_STORE: Unexpected store location`（无 TTY 时也可能表现为
   `ERR_PNPM_ABORTED_REMOVE_MODULES_DIR_NO_TTY`——pnpm 想删掉 node_modules 重装但没人
-  能确认）。
-- 原因：`activate()` 除了插 PATH 还设了 `PNPM_HOME` 指向 `<appData>/pnpm-home`，而
-  **pnpm 的 store 目录默认就跟着 `PNPM_HOME` 走**（实测：不设时
-  `<LOCALAPPDATA>\pnpm\store\v11`，设了变 `<PNPM_HOME>\store\v11`）。已有 profile 的
-  `node_modules/.modules.yaml` 记着安装时的 store，`pnpm install` 时
-  `checkCompatibility()` 一比不一致就抛错（pnpm 的 `path.relative(modules.storeDir,
-  storeDir) !== ""`）。也就是说：壳一注入 `PNPM_HOME`，用户所有装过的 profile 都会被
-  判成「store 不对」——不仅 Windows，macOS/Linux 同理（那台机器恰好没有旧 profile 才
-  没暴露）。用户自己若设过 `PNPM_HOME`，这个注入还会把它顶掉，影响面更大。
-- 解决：`activate()` 只把 shim 目录插到 `PATH` 最前，不碰 `PNPM_HOME`。查
-  `dshmarket/src/dsh-cli.ts` 的 `spawnEnv()` 可确认 PATH 足够：它从**继承的**
-  `process.env.PATH` 出发，`toolSearchDirs()`（`PNPM_HOME` 只是其中第一项）是往后追加的
-  候选目录，所以 shim 在前即可命中；`dsh plugin` 同样是 PATH 上的裸 `pnpm`。
-- 验证：临时工程里用内置 pnpm 装一个包（记下 store），再加一个依赖后重跑——带
-  `PNPM_HOME` 时 exit 1（store 不符，`ERR_PNPM_ABORTED_REMOVE_MODULES_DIR_NO_TTY`），
-  不带的同一命令 exit 0 正常装上；`pnpm store path` 不设时为
-  `C:\Users\18129\AppData\Local\pnpm\store\v11`，与出问题的 profile 里
-  `.modules.yaml` 记的 `storeDir` 一致（设 `PNPM_HOME` 则变成
-  `<appData>\pnpm-home\store\v11`，正是那个 mismatch）。
+  能确认）。市场日志里典型是成对的 `update-rollback … restoration of the previous build
+  could not be verified` + `update … exit=1`：失败与"回滚验证也失败"是同一个根因（回滚
+  同样拿 pnpm 重装）。**另一台干净安装 0.1.8 的 Windows 机器上首次就撞到它。**
+- 原因（两个，先后叠加）：
+  1. `activate()` 曾设 `PNPM_HOME=<appData>/pnpm-home`，而 **pnpm 的 store 默认跟着
+     `PNPM_HOME` 走**（设了变 `<PNPM_HOME>\store\v11`）。已有 profile 的
+     `node_modules/.modules.yaml` 记着安装时的 store，`pnpm install` 时
+     `checkCompatibility()` 一比不一致就抛错（pnpm 的
+     `path.relative(modules.storeDir, storeDir) !== ""`）：壳一注入 `PNPM_HOME`，用户
+     所有装过的 profile 都被判成"store 不对"。
+  2. **0.1.8 把 PNPM_HOME 去掉只解决了这一半。** 内置 pnpm 11.7.0 **不设任何配置时
+     store 是"项目本地"的 `<profile>/.pnpm-store/v11`**（实测 `pnpm config get
+     store-dir` → `undefined`，`pnpm store path` → `<cwd>\.pnpm-store\v11`），而用户
+     此前用系统 pnpm 装好的 profile 记的是**全局** store
+     `%LOCALAPPDATA%\pnpm\store\v11`。于是"壳改一次注入方式 / 换一版内置 pnpm / 换一台
+     机器"都会让两边对不上——这正是干净机器首次更新就报错的原因：`activate()` 每次启动
+     都生成 shim，但 store 解析取决于当时是谁、在哪、以什么参数跑的 pnpm。
+- 解决：`pnpm_env.rs` 的 `pin_store()` 在每次启动时把 store **钉死**，并写进 profile：
+  1. 先读 profile 的 `node_modules/.modules.yaml` 里的 `storeDir`（绝对路径），**有就
+     原样沿用**——换 store 会让 pnpm 拒绝运行直到整棵 node_modules 重装（GB 级重下），
+     所以连续性优先；
+  2. 没有（全新 profile）才用稳定默认值：Windows `%LOCALAPPDATA%\pnpm\store`、macOS/Linux
+     `$XDG_DATA_HOME/pnpm/store` 或 `~/.local/share/pnpm/store`（绝不用相对路径）；
+  3. 把这个绝对路径写进 profile 的 `pnpm-workspace.yaml` 的 `storeDir:`（逐行 upsert，
+     `allowBuilds` 等其他行原样保留）——这个文件在 profile 目录里，**市场、`dsh plugin`、
+     用户手动敲的 pnpm 都读得到**，与 cwd、PATH、谁启动无关。旧版 pnpm 不认识这个键，
+     但那时它的默认值本来就是全局 store，与 1) 读到的值一致。
+  可用 `DSH_PNPM_STORE_DIR=<绝对路径>` 覆盖（测试与逃生口）。
+- 另：`activate()` 现在同时把**内置 Node 目录**插到 `PATH` 最前（shim 目录之前），于是
+  "没装 node"、"有 node 没 pnpm"、"有 node 也有 pnpm" 三种机器都统一用包内的
+  `node.exe`/`npm.cmd`：市场的 corepack/`npm i -g` 兜底路径不再写用户的 Node 安装目录
+  （`C:\software\nodejs\pnpm` 那种 `EPERM` 就是它），pnpm 自己 spawn 的 `node` 也是包内
+  版本。
+- 验证（内置 pnpm 11.7.0 实测）：
+  - 复现：同一工程 storeA 装包 → 再用 `--config.store-dir=storeB` 跑同一条命令 → exit 1、
+    `ERR_PNPM_UNEXPECTED_STORE`（错误信息里明确写"currently linked from … now wants to
+    use …"）；把 store 指回 storeA → exit 0。
+  - 修复：`pnpm-workspace.yaml` 写 `storeDir` 后，`pnpm store path`（cwd=profile）与
+    `pnpm store path --dir <profile>`（cwd 在别处）都返回该路径；装一个包（`.modules.yaml`
+    记下同一路径），**再跑一次同命令 exit 0 不再报错**。
+  - 单测：`pnpm_env::store_tests` 8 个（沿用旧 store、全新 profile 用绝对默认值、替换陈旧
+    路径且保留 `allowBuilds`、幂等、路径带 `'` 的转义、不可达 profile 报错、默认值在无
+    `LOCALAPPDATA` 时仍为绝对路径、PATH 顺序内置 node 在 shim 之前）。
+- 仍存在的边界（已单测暴露，未修）：`write_script()` 按 `GetOEMCP()` 写 `pnpm.cmd`，但
+  cmd.exe 是按**控制台代码页**解批处理的；目标代码页表示不了的字符（本机单测用 `café`
+  复现，与本次改动无关，改动前同样红）会写坏路径 → 报"系统找不到指定的路径"。中文安装
+  目录（GBK 可表示）不受影响；Windows 已改走原生 `pnpm.exe` 转发器、这条批处理回退路径
+  只在没有转发器时才走到（见 §14）。
+
+### 14. 四种用户机器 / 两种系统的现状与边界
+- 目标矩阵与今天的答案（"包内优先、系统兜底、store 钉死"）：
+  1. **没有 node**：包内 `node.exe` 跑包内 `pnpm.mjs`，PATH 现在同时含内置 Node 目录与
+     shim 目录 → 市场探测、`dsh plugin`、pnpm 自己 spawn 的 `node` 全部命中包内版本；
+  2. **有 node 没有 pnpm**：同上（PATH 最前是包内目录）；即便内置 pnpm 不可用而回落到
+     市场的 corepack/`npm i -g` 兜底，用的也是包内 npm，不会再往
+     `C:\Program Files\nodejs` / `C:\software\nodejs` 写（历史 `EPERM` 的来源）；
+  3. **有 node 也有 pnpm**：PATH 最前仍是包内版本，用户自己那套只在包内资源缺失时才被
+     用到（此时日志有 `pnpm: no bundled pnpm` 警告）；
+  4. Windows/macOS 一致：store 路径与 shim 形态按平台取（Windows
+     `%LOCALAPPDATA%\pnpm\store` + 原生 `pnpm.exe`；macOS `~/.local/share/pnpm/store` +
+     可执行 `pnpm` 脚本，chmod 755）。
+- 权限边界：所有写入都落在用户自己的目录（`<appData>\pnpm-home`、profile 目录、store），
+  不需要管理员；卸载不删用户数据（NSIS per-user）。
+- Windows 路径健壮性（已做）：不再用生成的 `pnpm.cmd` 当主路径，改为**原生转发器**
+  `dsh-pnpm-forwarder`（`src-tauri/src/bin/dsh-pnpm-forwarder.rs`：定位包内 `node` +
+  `pnpm.mjs`，原样转发 argv/stdio，找不到包内资源就报 127 并提示重装）。
+  `scripts/build-forwarder.mjs` 在 `npm run build` / `npm test` / `tauri build` 之前编好它，
+  并放到 tauri-build 编译期会查的位置（`target/<profile>/<bin>-<triple>[.exe]`、crate 根、
+  `src-tauri/binaries/`；脚本编自己时会临时摘掉 `externalBin`，否则"源必须已存在"的
+  检查会自锁，编完按字节还原配置），随 `bundle.externalBin` 进包；启动时 `install_shim()`
+  把它拷成 `<appData>\pnpm-home\pnpm.exe` 并删除旧版留下的 `pnpm.cmd`（`.EXE` 在 PATHEXT
+  里优先，市场与 `dsh plugin` 的裸 `pnpm` 自然命中）。找不到转发器就退回批处理 shim，
+  开发态与老包仍能工作；macOS 继续用 POSIX shim（sh 按 UTF-8 读，没有这个问题）。
+- 仍存的边界：批处理回退路径受控制台代码页限制（§13 末尾的 `café` 用例），
+  只有"没有原生转发器"时才会走到。
+- `cargo test --lib` 现状：81 通过，1 失败——即上述 `café` 用例（改动前同样失败，
+  是这台机器控制台代码页导致的既有问题，不是回归）。
 
 ## 运行环境事实
 

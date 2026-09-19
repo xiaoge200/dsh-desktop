@@ -11,9 +11,10 @@ use tauri::{AppHandle, Manager, State};
 
 use plugin_npm::{registry_flag, run_npm, GIT_TIMEOUT, NPM_TIMEOUT};
 pub(crate) use plugin_profile::dsh_home;
+pub(crate) use plugin_profile::profile_dir;
 use plugin_profile::{
     append_disable_row, bundle_row_patches, dep_keys, ensure_profile, exports_patch,
-    parse_patch_file_opt, profile_dir, read_manifest, read_version, reconcile, resolve_bundle_dir,
+    parse_patch_file_opt, read_manifest, read_version, reconcile, resolve_bundle_dir,
     row_patches, RowPatch, PROFILE_NAME, PROFILE_PATCH_FILENAME, TEMPLATE_BUNDLES,
 };
 use crate::service::{ops_guard, run_exclusive_mutation};

@@ -1,5 +1,33 @@
 # Changelog
 
+## [0.1.9] - 2026-09-19
+
+### 修复
+- 插件市场装插件/更新报 `ERR_PNPM_UNEXPECTED_STORE`（干净安装的机器上首次更新就可能撞到）。
+  根因不止一个：内置 pnpm **11 不设配置时 store 默认是"项目本地"的
+  `<profile>\.pnpm-store`**，而 profile 的 `node_modules/.modules.yaml` 记着安装时的 store
+  ——换一版内置 pnpm、换一种注入方式、换一台机器，两边就会对不上，pnpm 直接拒绝运行
+  （无 TTY 时还会以 `ERR_PNPM_ABORTED_REMOVE_MODULES_DIR_NO_TTY` 出现，表现为"更新失败
+  且回滚无法验证"）。现在启动时把 store **钉死**：优先沿用 profile 里已记录的 `storeDir`
+  （不搬家、不重装），全新 profile 用稳定的绝对路径（Windows `%LOCALAPPDATA%\pnpm\store`，
+  macOS/Linux `~/.local/share/pnpm/store`），并写进 profile 的 `pnpm-workspace.yaml`，
+  市场、`dsh plugin`、用户手动敲的 pnpm 读到的都是同一个值
+- Windows 上把**内置 Node 目录也插到 `PATH` 最前**（此前只有 pnpm shim）：无论用户机器上
+  有没有 node、有没有 pnpm，市场探测、`dsh plugin` 与 pnpm 自己 spawn 的 `node`/`npm`
+  都用包内版本，也不再往用户 Node 安装目录写文件（此前会报
+  `corepack enable: EPERM ... \nodejs\pnpm`）
+- Windows 内置 pnpm 改用**原生转发器**（`pnpm.exe`，由 `scripts/build-forwarder.mjs` 构建、
+  tauri externalBin 随包分发）替代生成的 `pnpm.cmd`：批处理由 cmd.exe 按控制台代码页解码，
+  安装路径含该页表示不了的字符（如 `café`）时会被写坏并报「系统找不到指定的路径」；
+  原生转发器把 argv/stdio 原样转给包内 `node` + `pnpm.mjs`，不再经过批处理解析。
+  旧版遗留的 `pnpm.cmd` 在启动时删除
+
+### 内部
+- `pnpm_env.rs`：新增 `pin_store()` / `recorded_store_dir()` 与 12 个单测（store 钉定 8 个、
+  原生转发器 2 个、shim 选择 2 个）；`plugins::profile_dir` 提为 crate 内可见
+- `npm run build` / `npm test` / `tauri build` 都会先跑 `scripts/build-forwarder.mjs`
+  （`--if-missing` 供测试复用），保证 externalBin 源在 `cargo build` 之前就位
+
 ## [0.1.8] - 2026-09-16
 
 ### 修复

@@ -1,6 +1,6 @@
 [package]
 name = "dsh-desktop"
-version = "0.1.8"
+version = "0.1.9"
 description = "DSH Web desktop client: built-in Node runtime + auto-installed latest dsh package + embedded WebView"
 authors = ["dsh-desktop team"]
 edition = "2021"
@@ -8,6 +8,12 @@ edition = "2021"
 [lib]
 name = "dsh_desktop_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
+
+# 内置 pnpm 的原生转发器（Windows 上装成 pnpm-home/pnpm.exe，替代批处理 shim）。
+# 见 pnpm_env.rs 的 install_shim() 与 docs/IMPLEMENTATION.md §14。
+[[bin]]
+name = "dsh-pnpm-forwarder"
+path = "src/bin/dsh-pnpm-forwarder.rs"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }

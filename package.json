@@ -1,11 +1,14 @@
 {
   "name": "dsh-desktop",
   "private": true,
-  "version": "0.1.8",
+  "version": "0.1.9",
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "tsc && vite build",
+    "build-forwarder": "node scripts/build-forwarder.mjs",
+    "build": "node scripts/build-forwarder.mjs && tsc && vite build",
+    "pretest": "node scripts/build-forwarder.mjs --if-missing",
+    "test": "cd src-tauri && cargo test --lib",
     "preview": "vite preview",
     "tauri": "tauri"
   },

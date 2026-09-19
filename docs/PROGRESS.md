@@ -24,7 +24,7 @@
 | FR-15 | 高级 CLI 入口 | ✅ | `--dsh-args` 透传，实测通过 |
 | FR-16 | 首次使用引导 | ✅ | 白话引导屏，仅首显 |
 | FR-17 | 白话错误体系 | ✅ | 白话 + 一键操作 + 折叠详情，术语屏蔽扫描通过 |
-| FR-18 | 插件管理（安装/移除/启停 + 应用市场） | 🟡 | 30 单测 ✅ + 真实 harness 端到端 ✅（安装→注册→dump-config→启停 HMR 实测）；默认自动安装 dshmarket 市场插件 ✅；网页市场安装用壳自带的 pnpm（shim 目录插到 PATH 最前，不依赖系统 pnpm）✅；设置窗口 GUI 待实机 |
+| FR-18 | 插件管理（安装/移除/启停 + 应用市场） | 🟡 | 30 单测 ✅ + 真实 harness 端到端 ✅（安装→注册→dump-config→启停 HMR 实测）；默认自动安装 dshmarket 市场插件 ✅；市场用壳自带的 pnpm ✅（内置 Node 目录与 pnpm shim 都插到 PATH 最前，Windows 用原生 `pnpm.exe` 转发器，store 由壳钉死避免 `ERR_PNPM_UNEXPECTED_STORE`）；设置窗口 GUI 待实机 |
 
 ## 非功能需求（NFR）
 

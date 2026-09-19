@@ -1,5 +1,21 @@
 use std::path::{Path, PathBuf};
+
 pub const SHIM_DIR_NAME: &str = "pnpm-home";
+/// Overrides the pinned store location (used by tests and as an escape hatch).
+pub const STORE_DIR_ENV: &str = "DSH_PNPM_STORE_DIR";
+/// Store directory name under the per-user data root, e.g. `~/AppData/Local/pnpm/store`.
+const STORE_DIR_NAME: &str = "pnpm/store";
+/// Written into the profile's `pnpm-workspace.yaml`; pnpm reads it for every
+/// invocation in that profile, no matter who launches pnpm.
+const STORE_DIR_KEY: &str = "storeDir";
+
+/// What `activate()` installed into the process environment.
+pub struct PnpmEnv {
+    /// Directory holding the generated `pnpm` / `pnpm.cmd` shim.
+    pub shim_dir: PathBuf,
+    /// Absolute store location pinned into the profile, `None` when unwritable.
+    pub store_dir: Option<PathBuf>,
+}
 
 pub fn bundled_entry(resource_dir: &Path) -> Option<PathBuf> {
     ["pnpm/bin/pnpm.mjs", "pnpm/bin/pnpm.cjs"]
@@ -53,6 +69,130 @@ pub fn with_dir_first(current: &str, dir: &Path, sep: char) -> String {
     parts.join(&sep.to_string())
 }
 
+/// Fixed, per-user store root for the bundled pnpm.
+///
+/// pnpm resolves its store from `store-dir` -> `PNPM_HOME\store` -> (as of
+/// pnpm 11) a project-local `.pnpm-store`, and the resolved path is baked into
+/// every profile's `node_modules/.modules.yaml`. Letting the default decide
+/// means the store follows whoever launched pnpm (and which pnpm version), and
+/// the next install in that profile dies with `ERR_PNPM_UNEXPECTED_STORE`
+/// before it touches a single package.
+fn default_store_root() -> PathBuf {
+    #[cfg(windows)]
+    let root = std::env::var_os("LOCALAPPDATA").map(PathBuf::from);
+    #[cfg(not(windows))]
+    let root = std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|h| h.join(".local/share")));
+    // Always absolute: a relative store path is exactly the pnpm 11 default
+    // that makes the profile's recorded store depend on the working directory.
+    root.unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
+        .join(STORE_DIR_NAME)
+}
+
+/// The store an existing profile was installed from.
+///
+/// pnpm writes `storeDir` into `node_modules/.modules.yaml`. Keeping that value
+/// is what makes the pin safe on machines that already have plugins installed:
+/// re-pointing at a different store makes pnpm refuse to run until the whole
+/// `node_modules` is reinstalled (gigabytes of re-download), so continuity wins
+/// over tidiness.
+pub fn recorded_store_dir(profile: &Path) -> Option<PathBuf> {
+    let text = std::fs::read_to_string(profile.join("node_modules/.modules.yaml")).ok()?;
+    let value = yaml_scalar(&text, STORE_DIR_KEY)?;
+    let path = PathBuf::from(value);
+    path.is_absolute().then_some(path)
+}
+
+/// Read a top-level `key: value` scalar from a small generated YAML file,
+/// unquoting single- or double-quoted values.
+fn yaml_scalar(text: &str, key: &str) -> Option<String> {
+    let prefix = format!("{key}:");
+    for line in text.lines() {
+        let line = line.trim_end_matches('\r');
+        if !line.starts_with(&prefix) {
+            continue;
+        }
+        let raw = line[prefix.len()..].trim();
+        let unquoted = if let Some(v) = raw.strip_prefix('\'').and_then(|v| v.strip_suffix('\'')) {
+            // YAML escapes a literal quote by doubling it.
+            v.replace("''", "'")
+        } else if let Some(v) = raw.strip_prefix('"').and_then(|v| v.strip_suffix('"')) {
+            v.to_string()
+        } else {
+            raw.to_string()
+        };
+        if !unquoted.is_empty() {
+            return Some(unquoted);
+        }
+    }
+    None
+}
+
+/// Set `storeDir` in a profile's `pnpm-workspace.yaml`, preserving every other
+/// line byte for byte (that file is also where pnpm records `allowBuilds`).
+fn set_workspace_store_dir(path: &Path, store: &Path) -> Result<bool, String> {
+    let value = store.to_string_lossy().replace('\'', "''");
+    let line = format!("{STORE_DIR_KEY}: '{value}'");
+    let existing = std::fs::read_to_string(path).unwrap_or_default();
+    if yaml_scalar(&existing, STORE_DIR_KEY).as_deref() == Some(value.as_str()) {
+        return Ok(false);
+    }
+    let mut lines: Vec<String> = existing.lines().map(|l| l.to_string()).collect();
+    let at = lines.iter().position(|l| {
+        let l = l.trim_end_matches('\r');
+        l.starts_with(&format!("{STORE_DIR_KEY}:")) || l.starts_with(&format!("{STORE_DIR_KEY} :"))
+    });
+    match at {
+        Some(at) => lines[at] = line,
+        None => {
+            lines.insert(0, line);
+            lines.insert(1, String::new());
+        }
+    }
+    let mut text = lines.join("\n");
+    while text.ends_with('\n') {
+        text.pop();
+    }
+    text.push('\n');
+    std::fs::write(path, text).map_err(|e| format!("写入 {} 失败: {e}", path.display()))?;
+    Ok(true)
+}
+
+/// Pin the bundled pnpm to one store for this profile and report the choice.
+///
+/// Called on every boot: it reads the store the profile is already linked
+/// against, writes that exact path back as `storeDir` (upgrading profiles
+/// installed by an older pnpm to the global location), and never moves an
+/// existing installation to a different store.
+pub fn pin_store(profile: &Path) -> Result<PathBuf, String> {
+    let override_dir = std::env::var_os(STORE_DIR_ENV)
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute());
+    pin_store_with(profile, override_dir.as_deref())
+}
+
+/// `pin_store` with the override passed in, so the choice is testable without
+/// racing other tests over process-wide environment variables.
+fn pin_store_with(profile: &Path, override_dir: Option<&Path>) -> Result<PathBuf, String> {
+    if !profile.is_dir() {
+        return Err(format!("profile 目录不存在: {}", profile.display()));
+    }
+    let store = override_dir
+        .map(Path::to_path_buf)
+        .or_else(|| recorded_store_dir(profile))
+        .unwrap_or_else(default_store_root);
+    let path = profile.join("pnpm-workspace.yaml");
+    if set_workspace_store_dir(&path, &store)? {
+        log::info!(
+            "pnpm: pinned store for profile {} -> {}",
+            profile.display(),
+            store.display()
+        );
+    }
+    Ok(store)
+}
+
 #[cfg(windows)]
 fn write_script(path: &Path, text: &str) -> std::io::Result<()> {
     use winapi::um::stringapiset::WideCharToMultiByte;
@@ -102,14 +242,16 @@ pub fn write_shim(dir: &Path, node: &Path, entry: &Path) -> Result<PathBuf, Stri
     #[cfg(windows)]
     let file = {
         let path = dir.join("pnpm.cmd");
-        write_script(&path, &cmd_shim(&node, &entry)).map_err(|e| format!("写入 pnpm.cmd 失败: {e}"))?;
+        write_script(&path, &cmd_shim(&node, &entry))
+            .map_err(|e| format!("写入 pnpm.cmd 失败: {e}"))?;
         path
     };
     #[cfg(unix)]
     let file = {
         use std::os::unix::fs::PermissionsExt;
         let path = dir.join("pnpm");
-        write_script(&path, &posix_shim(&node, &entry)).map_err(|e| format!("写入 pnpm 失败: {e}"))?;
+        write_script(&path, &posix_shim(&node, &entry))
+            .map_err(|e| format!("写入 pnpm 失败: {e}"))?;
         let mut perms = std::fs::metadata(&path)
             .map_err(|e| format!("读取 pnpm 权限失败: {e}"))?
             .permissions();
@@ -120,7 +262,42 @@ pub fn write_shim(dir: &Path, node: &Path, entry: &Path) -> Result<PathBuf, Stri
     Ok(file)
 }
 
-pub fn activate(resource_dir: &Path, app_data: &Path) -> Option<PathBuf> {
+/// Install the shim that makes a bare `pnpm` resolve to the bundled pair.
+///
+/// Prefers the native launcher (`pnpm.exe`, copied from the bundled resources):
+/// a batch file is decoded by cmd.exe with the console code page while it is
+/// written with the OEM code page, so an install path outside that page gets
+/// corrupted silently. The generated `.cmd` stays as the fallback for builds
+/// that carry no launcher yet, and is removed once the launcher is in place so
+/// nothing can pick the fragile one.
+fn install_shim(
+    dir: &Path,
+    resource_dir: &Path,
+    node: &Path,
+    entry: &Path,
+) -> Result<PathBuf, String> {
+    #[cfg(windows)]
+    {
+        if let Some(bin) = native_forwarder(resource_dir) {
+            let path = dir.join("pnpm.exe");
+            std::fs::create_dir_all(dir).map_err(|e| format!("创建 pnpm 目录失败: {e}"))?;
+            std::fs::copy(&bin, &path).map_err(|e| format!("写入 pnpm.exe 失败: {e}"))?;
+            let _ = std::fs::remove_file(dir.join("pnpm.cmd"));
+            return Ok(path);
+        }
+    }
+    let _ = resource_dir;
+    write_shim(dir, node, entry)
+}
+
+fn native_forwarder(resource_dir: &Path) -> Option<PathBuf> {
+    ["dsh-pnpm-forwarder.exe", "dsh-pnpm-forwarder"]
+        .iter()
+        .map(|name| resource_dir.join(name))
+        .find(|p| p.is_file())
+}
+
+pub fn activate(resource_dir: &Path, app_data: &Path) -> Option<PnpmEnv> {
     let entry = bundled_entry(resource_dir)?;
     let node = match crate::node::resolve_node(resource_dir) {
         Ok(p) => p,
@@ -130,24 +307,42 @@ pub fn activate(resource_dir: &Path, app_data: &Path) -> Option<PathBuf> {
         }
     };
     let dir = shim_dir(app_data);
-    if let Err(e) = write_shim(&dir, &node, &entry) {
+    if let Err(e) = install_shim(&dir, resource_dir, &node, &entry) {
         log::warn!("pnpm: shim not written, market keeps system pnpm: {e}");
         return None;
     }
 
+    // Bundled node first: the market's pnpm calls `node`/`npm` through .cmd
+    // shims (cmd.exe resolves those against PATH *and* the current directory),
+    // so this decides which runtime, npm and pnpm the user actually gets. It
+    // also covers a machine whose system Node lives where npm cannot write.
     let sep = if cfg!(windows) { ';' } else { ':' };
-    let current = std::env::var("PATH").unwrap_or_default();
-    std::env::set_var("PATH", with_dir_first(&current, &dir, sep));
-    log::info!(
-        "pnpm: bundled pnpm active ({}) for the plugin market",
-        dir.display()
-    );
-    Some(dir)
+    let mut path = with_dir_first(&std::env::var("PATH").unwrap_or_default(), &dir, sep);
+    if let Some(node_dir) = node.parent() {
+        path = with_dir_first(&path, node_dir, sep);
+    }
+    std::env::set_var("PATH", &path);
+
+    // Pinned every boot: the store path is recorded inside the profile, so it
+    // has to stay identical across shell builds and pnpm versions.
+    let store_dir = match pin_store(&crate::plugins::profile_dir(&crate::plugins::dsh_home())) {
+        Ok(p) => Some(p),
+        Err(e) => {
+            log::warn!("pnpm: store not pinned, the market may hit ERR_PNPM_UNEXPECTED_STORE: {e}");
+            None
+        }
+    };
+
+    Some(PnpmEnv {
+        shim_dir: dir,
+        store_dir,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
 
     fn temp(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("dsh-pnpm-{name}-{}", std::process::id()));
@@ -188,7 +383,10 @@ mod tests {
             "/opt/pnpm-home:/usr/bin:/bin"
         );
         // Empty and trailing entries are dropped.
-        assert_eq!(with_dir_first(":/usr/bin:", &dir, ':'), "/opt/pnpm-home:/usr/bin");
+        assert_eq!(
+            with_dir_first(":/usr/bin:", &dir, ':'),
+            "/opt/pnpm-home:/usr/bin"
+        );
         assert_eq!(with_dir_first("", &dir, ':'), "/opt/pnpm-home");
         // Windows separator.
         assert_eq!(
@@ -304,5 +502,294 @@ mod tests {
             String::from_utf8_lossy(&out.stderr),
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn install_shim_prefers_the_native_forwarder_and_drops_the_cmd() {
+        let root = temp("native");
+        let res = root.join("res");
+        let dir = root.join("pnpm-home");
+        std::fs::create_dir_all(&res).unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(res.join("dsh-pnpm-forwarder.exe"), b"launcher-stub").unwrap();
+        // A stale batch shim from an older build must not survive next to it.
+        std::fs::write(dir.join("pnpm.cmd"), "@echo off\r\n").unwrap();
+
+        let chosen = install_shim(
+            &dir,
+            &res,
+            Path::new(r"C:\bundle\node\node.exe"),
+            Path::new(r"C:\bundle\pnpm\bin\pnpm.mjs"),
+        )
+        .unwrap();
+        assert_eq!(chosen, dir.join("pnpm.exe"));
+        assert_eq!(std::fs::read(&chosen).unwrap(), b"launcher-stub");
+        assert!(!dir.join("pnpm.cmd").exists(), "stale .cmd must be removed");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn install_shim_falls_back_to_the_batch_shim_without_a_launcher() {
+        let root = temp("fallback");
+        let res = root.join("res");
+        let dir = root.join("pnpm-home");
+        std::fs::create_dir_all(&res).unwrap();
+
+        let chosen = install_shim(
+            &dir,
+            &res,
+            Path::new(r"C:\bundle\node\node.exe"),
+            Path::new(r"C:\bundle\pnpm\bin\pnpm.mjs"),
+        )
+        .unwrap();
+        assert_eq!(chosen.file_name().unwrap(), "pnpm.cmd");
+        assert!(!dir.join("pnpm.exe").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The launcher next to the test binary (`target/<profile>/`), as built by
+    /// `scripts/build-forwarder.mjs`. Skipped when it was not built.
+    fn forwarder_exe() -> Option<PathBuf> {
+        let name = if cfg!(windows) {
+            "dsh-pnpm-forwarder.exe"
+        } else {
+            "dsh-pnpm-forwarder"
+        };
+        let dir = std::env::current_exe().ok()?.parent()?.to_path_buf();
+        let path = dir.join(name);
+        path.is_file().then_some(path)
+    }
+
+    /// End-to-end for the shipped launcher: with no resource root given it finds
+    /// the bundled pair next to itself (the installed layout) and forwards argv
+    /// and stdio verbatim, with no code page involved. Skipped when the dev tree
+    /// has no bundled runtime, and when the launcher was not built.
+    #[test]
+    fn native_forwarder_runs_the_bundled_pair_next_to_itself() {
+        let Some(exe) = forwarder_exe() else {
+            return;
+        };
+        let res = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let node = res.join(crate::node::node_rel_path());
+        if !node.is_file() || bundled_entry(res).is_none() {
+            return;
+        }
+
+        let out = std::process::Command::new(exe)
+            .arg("--version")
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "exit={:?} stderr={:?}",
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(stdout.trim().starts_with("11."), "stdout={stdout:?}");
+    }
+
+    /// A launcher that cannot find the bundled pair must fail loudly (127) with
+    /// an actionable message instead of resolving a system pnpm by accident.
+    #[test]
+    fn native_forwarder_refuses_when_the_bundle_is_missing() {
+        let Some(exe) = forwarder_exe() else {
+            return;
+        };
+        let root = temp("forwarder-missing");
+        let out = std::process::Command::new(exe)
+            .arg("--version")
+            .env("DSH_PNPM_ROOT", &root)
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(127));
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains("not found"), "stderr={stderr:?}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+#[cfg(test)]
+mod store_tests {
+    use super::*;
+    use std::path::Path;
+
+    fn temp(name: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("dsh-pnpm-store-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn profile(root: &Path) -> PathBuf {
+        let dir = root.join("profile");
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn read_workspace(dir: &Path) -> String {
+        std::fs::read_to_string(dir.join("pnpm-workspace.yaml")).unwrap()
+    }
+
+    #[test]
+    fn yaml_scalar_handles_quoting_and_blank_keys() {
+        let text = "storeDir: 'C:\\Users\\me\\AppData\\Local\\pnpm\\store'\n";
+        assert_eq!(
+            yaml_scalar(text, "storeDir").as_deref(),
+            Some(r"C:\Users\me\AppData\Local\pnpm\store")
+        );
+        assert_eq!(yaml_scalar("storeDir:\n", "storeDir"), None);
+        assert_eq!(yaml_scalar("other: 1\n", "storeDir"), None);
+        assert_eq!(
+            yaml_scalar("\"storeDir\": \"\"\n", "storeDir"),
+            None,
+            "empty value is not a store"
+        );
+    }
+
+    #[test]
+    fn recorded_store_dir_reads_only_absolute_paths() {
+        let root = temp("recorded");
+        let prof = profile(&root);
+        std::fs::create_dir_all(prof.join("node_modules")).unwrap();
+        std::fs::write(
+            prof.join("node_modules/.modules.yaml"),
+            "virtualStoreDir: 'C:\\p\\node_modules\\.pnpm'\nstoreDir: 'C:\\registered\\store\\v11'\n",
+        )
+        .unwrap();
+        assert_eq!(
+            recorded_store_dir(&prof),
+            Some(PathBuf::from(r"C:\registered\store\v11"))
+        );
+
+        std::fs::write(
+            prof.join("node_modules/.modules.yaml"),
+            "storeDir: .pnpm-store/v11\n",
+        )
+        .unwrap();
+        assert_eq!(
+            recorded_store_dir(&prof),
+            None,
+            "a relative store path is what pnpm 11 defaults to; not usable as a pin"
+        );
+
+        std::fs::remove_file(prof.join("node_modules/.modules.yaml")).unwrap();
+        assert_eq!(recorded_store_dir(&prof), None);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn pin_uses_per_user_store_on_a_fresh_profile() {
+        let root = temp("fresh");
+        let prof = profile(&root);
+        let store = pin_store_with(&prof, None).unwrap();
+        assert!(store.is_absolute(), "{store:?}");
+        assert!(store.to_string_lossy().ends_with("pnpm/store"), "{store:?}");
+        assert_eq!(
+            read_workspace(&prof),
+            format!("storeDir: '{}'\n", store.display())
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn pin_keeps_the_store_the_profile_is_already_linked_to() {
+        let root = temp("keep");
+        let prof = profile(&root);
+        std::fs::create_dir_all(prof.join("node_modules")).unwrap();
+        std::fs::write(
+            prof.join("node_modules/.modules.yaml"),
+            "storeDir: 'C:\\Users\\me\\AppData\\Local\\pnpm\\store\\v11'\n",
+        )
+        .unwrap();
+        let store = pin_store_with(&prof, None).unwrap();
+        assert_eq!(
+            store,
+            PathBuf::from(r"C:\Users\me\AppData\Local\pnpm\store\v11")
+        );
+        assert!(read_workspace(&prof).contains(r"C:\Users\me\AppData\Local\pnpm\store\v11"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn pin_replaces_a_stale_path_and_keeps_every_other_line() {
+        let root = temp("stale");
+        let prof = profile(&root);
+        let original = "packages:\n  - .\n\nnodeLinker: hoisted\nstoreDir: 'C:\\old\\store'\nallowBuilds:\n  node-pty: true\n";
+        std::fs::write(prof.join("pnpm-workspace.yaml"), original).unwrap();
+        let store = pin_store_with(&prof, None).unwrap();
+        let text = read_workspace(&prof);
+        assert!(!text.contains(r"C:\old\store"), "{text}");
+        assert!(text.contains("nodeLinker: hoisted"), "{text}");
+        assert!(text.contains("allowBuilds:"), "{text}");
+        assert!(
+            text.contains(&format!("storeDir: '{}'", store.display())),
+            "{text}"
+        );
+
+        // Idempotent: a second boot rewrites nothing.
+        let before = read_workspace(&prof);
+        pin_store_with(&prof, None).unwrap();
+        assert_eq!(read_workspace(&prof), before);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn pin_honours_the_override_and_survives_a_quote_in_the_path() {
+        let root = temp("quote");
+        let prof = profile(&root);
+        let odd = root.join("it's/store");
+        let store = pin_store_with(&prof, Some(&odd)).unwrap();
+        assert_eq!(store, odd);
+        let text = read_workspace(&prof);
+        assert!(text.contains("it''s/store"), "{text}");
+        assert_eq!(
+            yaml_scalar(&text, STORE_DIR_KEY).as_deref(),
+            Some(odd.to_string_lossy().as_ref())
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn pin_reports_profiles_it_cannot_reach() {
+        let root = temp("missing");
+        let err = pin_store_with(&root.join("not-created-yet"), None).unwrap_err();
+        assert!(err.contains("profile"), "{err}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn default_store_root_is_absolute_with_or_without_a_user_data_dir() {
+        let home = temp("home");
+        std::env::set_var("LOCALAPPDATA", &home);
+        assert_eq!(default_store_root(), home.join("pnpm").join("store"));
+        #[cfg(windows)]
+        {
+            // No LOCALAPPDATA (service accounts): still absolute, never the
+            // relative project-local default that pnpm 11 would pick.
+            std::env::remove_var("LOCALAPPDATA");
+            assert!(
+                default_store_root().is_absolute(),
+                "{:?}",
+                default_store_root()
+            );
+            assert!(default_store_root().ends_with(Path::new("pnpm").join("store")));
+        }
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn path_puts_the_bundled_node_ahead_of_the_shim() {
+        let node_dir = PathBuf::from(r"C:\bundle\node\win-x64");
+        let shim = PathBuf::from(r"C:\appdata\pnpm-home");
+        let path = with_dir_first(&format!(r"C:\Windows;{}", shim.display()), &shim, ';');
+        let path = with_dir_first(&path, &node_dir, ';');
+        assert_eq!(
+            path,
+            format!(r"{};{};C:\Windows", node_dir.display(), shim.display())
+        );
     }
 }

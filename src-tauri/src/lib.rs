@@ -276,8 +276,16 @@ fn boot(app: AppHandle) {
     state.set_runtime_dir(runtime_dir.clone());
     state.set_workspace_dir(workspace_dir);
 
-    if pnpm_env::activate(&resource_dir, &app_data).is_none() {
-        log::warn!("pnpm: no bundled pnpm; the market falls back to a system pnpm");
+    match pnpm_env::activate(&resource_dir, &app_data) {
+        Some(env) => log::info!(
+            "pnpm: bundled pnpm active (shim {}), store {}",
+            env.shim_dir.display(),
+            env.store_dir
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "(profile not created yet)".into())
+        ),
+        None => log::warn!("pnpm: no bundled pnpm; the market falls back to a system pnpm"),
     }
 
     state.supervisor.lock().unwrap().set_log_dir(app_data.join("logs"));
