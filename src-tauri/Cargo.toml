@@ -4,6 +4,9 @@ version = "0.1.9"
 description = "DSH Web desktop client: built-in Node runtime + auto-installed latest dsh package + embedded WebView"
 authors = ["dsh-desktop team"]
 edition = "2021"
+# 本包有两个 bin（壳 + pnpm 原生转发器）。显式声明主程序，避免 tauri CLI /
+# cargo run 在"哪个是主程序"上含糊（externalBin 时代它曾直接报 failed to find main binary）。
+default-run = "dsh-desktop"
 
 [lib]
 name = "dsh_desktop_lib"
