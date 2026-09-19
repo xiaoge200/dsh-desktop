@@ -5,8 +5,8 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build-forwarder": "node scripts/build-forwarder.mjs",
-    "build": "node scripts/build-forwarder.mjs && tsc && vite build",
+    "build-forwarder": "node scripts/build-forwarder.mjs --release",
+    "build": "node scripts/build-forwarder.mjs --release && tsc && vite build",
     "pretest": "node scripts/build-forwarder.mjs --if-missing",
     "test": "cd src-tauri && cargo test --lib",
     "preview": "vite preview",

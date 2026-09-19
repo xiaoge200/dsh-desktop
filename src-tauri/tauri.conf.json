@@ -53,7 +53,7 @@
       "../resources/installer": "installer/",
       "../resources/dsh-baseline": "dsh-baseline/",
       "../resources/pnpm": "pnpm/",
-      "../resources/dsh-pnpm-forwarder.exe": "dsh-pnpm-forwarder.exe"
+      "../resources/binaries": "binaries/"
     },
     "icon": [
       "icons/32x32.png",

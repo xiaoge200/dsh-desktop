@@ -290,15 +290,19 @@ fn install_shim(
     write_shim(dir, node, entry)
 }
 
-/// Launcher shipped as a tauri resource (`<resource_dir>/dsh-pnpm-forwarder[.exe]`),
-/// built by `scripts/build-forwarder.mjs` and copied into the shim dir by
-/// `install_shim()`.
+/// The launcher shipped in `<resource_dir>/binaries/dsh-pnpm-forwarder[.exe]`, built by
+/// `scripts/build-forwarder.mjs` into `resources/binaries/`. The other two locations are
+/// fallbacks for earlier layouts.
 #[cfg(windows)]
 fn native_forwarder(resource_dir: &Path) -> Option<PathBuf> {
-    ["dsh-pnpm-forwarder.exe", "dsh-pnpm-forwarder"]
-        .iter()
-        .map(|name| resource_dir.join(name))
-        .find(|p| p.is_file())
+    [
+        "binaries/dsh-pnpm-forwarder.exe",
+        "pnpm/dsh-pnpm-forwarder.exe",
+        "dsh-pnpm-forwarder.exe",
+    ]
+    .iter()
+    .map(|rel| resource_dir.join(rel))
+    .find(|p| p.is_file())
 }
 
 pub fn activate(resource_dir: &Path, app_data: &Path) -> Option<PnpmEnv> {
@@ -508,16 +512,22 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The stub launcher is picked up from `binaries/` (where
+    /// `scripts/build-forwarder.mjs` writes it), and a stale `.cmd` beside it is
+    /// cleared so nothing can pick the fragile one.
     #[cfg(windows)]
     #[test]
     fn install_shim_prefers_the_native_forwarder_and_drops_the_cmd() {
         let root = temp("native");
         let res = root.join("res");
         let dir = root.join("pnpm-home");
-        std::fs::create_dir_all(&res).unwrap();
+        std::fs::create_dir_all(res.join("binaries")).unwrap();
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(res.join("dsh-pnpm-forwarder.exe"), b"launcher-stub").unwrap();
-        // A stale batch shim from an older build must not survive next to it.
+        std::fs::write(
+            res.join("binaries/dsh-pnpm-forwarder.exe"),
+            b"launcher-stub",
+        )
+        .unwrap();
         std::fs::write(dir.join("pnpm.cmd"), "@echo off\r\n").unwrap();
 
         let chosen = install_shim(
@@ -553,17 +563,28 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// The launcher next to the test binary (`target/<profile>/`), as built by
-    /// `scripts/build-forwarder.mjs`. Skipped when it was not built.
+    /// The launcher built by `scripts/build-forwarder.mjs`: `resources/binaries/` for
+    /// packaging, `target/<profile>/binaries/` for dev runs. Skipped when not built.
     fn forwarder_exe() -> Option<PathBuf> {
         let name = if cfg!(windows) {
             "dsh-pnpm-forwarder.exe"
         } else {
             "dsh-pnpm-forwarder"
         };
-        let dir = std::env::current_exe().ok()?.parent()?.to_path_buf();
-        let path = dir.join(name);
-        path.is_file().then_some(path)
+        let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut candidates = vec![manifest
+            .join("..")
+            .join("resources")
+            .join("binaries")
+            .join(name)];
+        if let Some(dir) = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(Path::to_path_buf))
+        {
+            candidates.push(dir.join(name));
+            candidates.push(dir.join("binaries").join(name));
+        }
+        candidates.into_iter().find(|p| p.is_file())
     }
 
     /// End-to-end for the shipped launcher: with no resource root given it finds
@@ -597,18 +618,32 @@ mod tests {
 
     /// A launcher that cannot find the bundled pair must fail loudly (127) with
     /// an actionable message instead of resolving a system pnpm by accident.
+    ///
+    /// The launcher is copied into a scratch hierarchy (`<root>/binaries/`) so the
+    /// "walk up from myself" search has nothing to find in every candidate: the
+    /// override, its own directory and that directory's parent.
     #[test]
     fn native_forwarder_refuses_when_the_bundle_is_missing() {
         let Some(exe) = forwarder_exe() else {
             return;
         };
         let root = temp("forwarder-missing");
-        let out = std::process::Command::new(exe)
+        let dir = root.join("resources/binaries");
+        std::fs::create_dir_all(&dir).unwrap();
+        let placed = dir.join(exe.file_name().unwrap());
+        std::fs::copy(&exe, &placed).unwrap();
+
+        let out = std::process::Command::new(&placed)
             .arg("--version")
-            .env("DSH_PNPM_ROOT", &root)
+            .env("DSH_PNPM_ROOT", root.join("nowhere"))
             .output()
             .unwrap();
-        assert_eq!(out.status.code(), Some(127));
+        assert_eq!(
+            out.status.code(),
+            Some(127),
+            "stderr={:?}",
+            String::from_utf8_lossy(&out.stderr)
+        );
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert!(stderr.contains("not found"), "stderr={stderr:?}");
         let _ = std::fs::remove_dir_all(&root);

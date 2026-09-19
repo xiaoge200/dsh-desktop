@@ -25,11 +25,15 @@
 ### 内部
 - `pnpm_env.rs`：新增 `pin_store()` / `recorded_store_dir()` 与 12 个单测（store 钉定 8 个、
   原生转发器 2 个、shim 选择 2 个）；`plugins::profile_dir` 提为 crate 内可见
-- `npm run build` / `npm test` / `tauri build` 都会先跑 `scripts/build-forwarder.mjs`
-  （`--if-missing` 供测试复用），产物落 `resources/dsh-pnpm-forwarder.exe`
-- 转发器**不走 `bundle.externalBin`**：那条路会让 Windows MSI 构建失败（tauri CLI 找不到
-  主程序；tauri-bundler 把 sidecar 名字塞进 WiX 标识符，带 `-` 就让 `light.exe` 失败，
-  上游 tauri#14681 未修完）。改走 `bundle.resources` 后 NSIS 与 MSI 都能正常出包
+- 转发器由 `scripts/build-forwarder.mjs` 用 **rustc 单文件编译**（不经 cargo，避开构建锁与
+  顺序依赖）产出 `resources/binaries/dsh-pnpm-forwarder[.exe]`，随 `bundle.resources` 进包；
+  `npm run build` / `npm test` / `tauri build` 都会先跑它（`--if-missing` 供测试复用），
+  开发态另拷一份到 `target/<profile>/binaries/`
+- 两次打包失败换来的两条硬约束（详见 IMPLEMENTATION §14）：**不要用 `bundle.externalBin`**
+  （Windows MSI 会因 WiX 标识符里的 `-` 让 `light.exe` 失败，上游 tauri#14681 未修完；
+  另加 Cargo 多 bin 后 tauri CLI 找不到主程序）；**资源产物不能放资源根目录**（tauri-build
+  在编译期就会校验条目存在，release 时前端构建产物还没就位就报 `resource path ... doesn't
+  exist`），放 `prepare-resources.ps1` 提前生成的目录下才稳
 
 ## [0.1.8] - 2026-09-16
 

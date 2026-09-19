@@ -31,6 +31,8 @@ src-tauri/gen/schemas/
 resources/node/
 resources/dsh-baseline/
 resources/pnpm/
+# 转发器（scripts/build-forwarder.mjs 生成）与它的编译模式标记
+resources/binaries/.dsh-forwarder-stamp
 
 # 签名密钥（绝不提交私钥）
 *.key
